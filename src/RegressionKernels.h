@@ -71,15 +71,15 @@ extern __constant__ ChannelInfo g_ChannelInfo[NTC_MAX_CHANNELS];
 
 // Computes the address (offset into the textureData array for one mip) for a given pixel in the texture data.
 // See the comment to PitchLinearImageSlice structure for the texture data layout explanation.
-inline __device__ int GetPixelBaseAddress(int x, int y, int width, int numChannels)
+inline __device__ uint64_t GetPixelBaseAddress(int x, int y, int width, int numChannels)
 {
-    return y * width * numChannels + x * 2;
+    return uint64_t(y) * uint64_t(width) * uint64_t(numChannels) + uint64_t(x) * 2;
 }
 
 // Computes the address (offset into the textureData array for one mip) for a channel in the pixel.
-inline __device__ int GetChannelAddress(int pixelBaseAddress, int channel, int width)
+inline __device__ uint64_t GetChannelAddress(uint64_t pixelBaseAddress, int channel, int width)
 {
-    return pixelBaseAddress + (channel & ~1) * width + (channel & 1);
+    return pixelBaseAddress + uint64_t(channel & ~1) * uint64_t(width) + uint64_t(channel & 1);
 }
 
 // Shifts the 0.0 and 1.0 values slightly outside of the 0-1 range to make sure that
@@ -246,7 +246,7 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
         
         float localLoss = 0;
 
-        const int pixelBaseAddress = GetPixelBaseAddress(x, y, referenceWidth, params.numChannels);
+        const uint64_t pixelBaseAddress = GetPixelBaseAddress(x, y, referenceWidth, params.numChannels);
         
         // If mask channel is enabled, determine if this pixel is masked out and thus irrelevant
         bool isMaskedOut = false;
@@ -388,7 +388,7 @@ __device__ void InferenceKernel(InferenceKernelParams const params)
         // Check whether this texel is inside the reference image
         const bool insideReferenceImage = x >= 0 && x < params.referenceWidth && y >= 0 && y < params.referenceHeight;
         // When attemping to sample outside bounds we simply use the first element in the array
-        const int pixelBaseAddress = insideReferenceImage ? GetPixelBaseAddress(x, y, params.referenceWidth, params.numChannels) : 0;
+        const uint64_t pixelBaseAddress = insideReferenceImage ? GetPixelBaseAddress(x, y, params.referenceWidth, params.numChannels) : 0;
         
         if (params.validChannelMask != 0)
         {

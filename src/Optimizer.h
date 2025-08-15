@@ -67,6 +67,6 @@ constexpr int LOSS_ITEMS_PER_THREAD = 4;
 constexpr int LOSS_ITEMS_PER_GROUP = LOSS_GROUP_SIZE * LOSS_ITEMS_PER_THREAD;
 
 // Computes a sum of the items in 'loss' array on the GPU, outputs it into 'outReducedLoss'
-cudaError_t ReduceLoss(int size, float* __restrict__ loss, DeviceAndHostArray<float>& scratch, float& outReducedLoss);
+cudaError_t ReduceLoss(size_t size, float* __restrict__ loss, DeviceAndHostArray<float>& scratch, float& outReducedLoss);
 
 } // namespace ntc::cuda

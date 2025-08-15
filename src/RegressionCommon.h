@@ -81,8 +81,8 @@ struct InferenceKernelParams
 struct MipInfo
 {
     uint64_t referenceTextureOffset;
-    int latentsOffsetHighRes;
-    int latentsOffsetLowRes;
+    uint64_t latentsOffsetHighRes;
+    uint64_t latentsOffsetLowRes;
 
     float positionScale;
     float positionLod;

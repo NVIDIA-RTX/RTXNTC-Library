@@ -357,10 +357,10 @@ __global__ void LossReductionKernel(
     output[grid.block_rank()] = acc;
 }
 
-cudaError_t ReduceLoss(int size, float* __restrict__ loss, DeviceAndHostArray<float>& scratch, float& outReducedLoss)
+cudaError_t ReduceLoss(size_t size, float* __restrict__ loss, DeviceAndHostArray<float>& scratch, float& outReducedLoss)
 {
     int threadBlockSize = LOSS_GROUP_SIZE;
-    int gridSize = (size + LOSS_ITEMS_PER_GROUP - 1) / LOSS_ITEMS_PER_GROUP;
+    size_t gridSize = (size + LOSS_ITEMS_PER_GROUP - 1) / LOSS_ITEMS_PER_GROUP;
 
     if (size_t(gridSize) > scratch.Length())
         return cudaErrorInvalidValue; // This should not happen, but checking just in case

@@ -56,17 +56,17 @@ public:
 
     uint32_t* GetEncodedLatentsHostPtr(Grid grid, int neuralLod);
 
-    uint32_t GetQuantizedLatentsSize(Grid grid, int neuralLod);
+    size_t GetQuantizedLatentsSize(Grid grid, int neuralLod);
 
     uint32_t* GetGradientMaskDevicePtr(Grid grid, int neuralLod);
 
     DeviceAndHostArray<uint32_t>& GetEncodedLatentsArray();
 
-    int GetLatentOffset(Grid grid, int neuralLod);
+    size_t GetLatentOffset(Grid grid, int neuralLod);
 
-    int GetLatentCount(Grid grid, int neuralLod);
+    size_t GetLatentCount(Grid grid, int neuralLod);
 
-    int GetLatentCount(Grid grid) const;
+    size_t GetLatentCount(Grid grid) const;
 
     int GetNumMipLevels() const;
 
@@ -77,17 +77,17 @@ private:
     int m_highResGridScale = 0;
     int m_highResQuantBits = 0;
     int m_lowResQuantBits = 0;
-    std::array<int, NTC_MAX_MIPS> m_highResLatentCounts {};
-    std::array<int, NTC_MAX_MIPS> m_lowResLatentCounts {};
-    std::array<int, NTC_MAX_MIPS> m_highResLatentOffsets {};
-    std::array<int, NTC_MAX_MIPS> m_lowResLatentOffsets {};
-    std::array<int, NTC_MAX_MIPS> m_highResQuantizedGridOffsets {};
-    std::array<int, NTC_MAX_MIPS> m_lowResQuantizedGridOffsets {};
-    std::array<int, NTC_MAX_MIPS> m_highResMaskOffsets {};
-    std::array<int, NTC_MAX_MIPS> m_lowResMaskOffsets {};
-    int m_totalHighResLatentCount = 0;
-    int m_totalLowResLatentCount = 0;
-    int m_totalLatentCount = 0;
+    std::array<size_t, NTC_MAX_MIPS> m_highResLatentCounts {};
+    std::array<size_t, NTC_MAX_MIPS> m_lowResLatentCounts {};
+    std::array<size_t, NTC_MAX_MIPS> m_highResLatentOffsets {};
+    std::array<size_t, NTC_MAX_MIPS> m_lowResLatentOffsets {};
+    std::array<size_t, NTC_MAX_MIPS> m_highResQuantizedGridOffsets {};
+    std::array<size_t, NTC_MAX_MIPS> m_lowResQuantizedGridOffsets {};
+    std::array<size_t, NTC_MAX_MIPS> m_highResMaskOffsets {};
+    std::array<size_t, NTC_MAX_MIPS> m_lowResMaskOffsets {};
+    size_t m_totalHighResLatentCount = 0;
+    size_t m_totalLowResLatentCount = 0;
+    size_t m_totalLatentCount = 0;
     int m_numNeuralMipLevels = 0;
     
     DeviceArray<half> m_baseLatentsMemory;

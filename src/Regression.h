@@ -30,7 +30,7 @@ bool ValidateKernelSpec(
     int lowResFeatures);
 
 void Regression(
-    int pixelsPerBatch,
+    size_t pixelsPerBatch,
     bool stableTraining,
     MlpDesc const& kernelVersion,
     RegressionKernelParams const& params);

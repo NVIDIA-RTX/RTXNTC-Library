@@ -161,15 +161,22 @@ if (NTC_WITH_CUDA)
         TextureSet.cpp
         TextureSet.h
     )
+
+    source_group("TIN Library" FILES ${tin_sources})
+    source_group("Generated CUDA Kernels" FILES ${kernels})
 endif()
 
-target_sources(libntc PRIVATE 
+set(public_headers
     ${include_directory}/libntc/ntc.h
     ${include_directory}/libntc/wrappers.h
     ${include_directory}/libntc/shaders/BlockCompressConstants.h
     ${include_directory}/libntc/shaders/DecompressConstants.h
     ${include_directory}/libntc/shaders/ImageDifferenceConstants.h
     ${include_directory}/libntc/shaders/InferenceConstants.h
+)
+
+target_sources(libntc PRIVATE 
+    ${public_headers}
     AdaptiveCompressionSession.h
     AdaptiveCompressionSession.cpp
     ChannelInfo.h
@@ -204,6 +211,8 @@ target_sources(libntc PRIVATE
     TextureSetMetadata.cpp
 )
 
+source_group("Public Headers" FILES ${public_headers})
+
 if (NTC_WITH_VULKAN)
     if (TARGET Vulkan-Headers)
         target_link_libraries(libntc PRIVATE Vulkan-Headers)
@@ -226,7 +235,7 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
         Shaders.cpp
     )
 
-    set(shader_sources
+    set(public_shader_headers
         ${include_directory}/libntc/shaders/BlockCompressConstants.h
         ${include_directory}/libntc/shaders/ColorSpaces.hlsli
         ${include_directory}/libntc/shaders/DecompressConstants.h
@@ -234,6 +243,9 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
         ${include_directory}/libntc/shaders/Inference.hlsli
         ${include_directory}/libntc/shaders/InferenceConstants.h
         ${include_directory}/libntc/shaders/InferenceCoopVec.hlsli
+    )
+
+    set(shader_sources
         shaders/BlockCompressCommon.hlsli
         shaders/CompressBC1.hlsl
         shaders/CompressBC2.hlsl
@@ -251,6 +263,9 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
         shaders/Vulkan.hlsli
     )
 
+    source_group("Public Headers" FILES ${public_shader_headers})
+    source_group("Shaders" FILES ${shader_sources})
+
     set(shader_config_file "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Shaders.cfg")
     set(shader_config_file_slang "${CMAKE_CURRENT_SOURCE_DIR}/shaders/SlangShaders.cfg")
     set(shader_config_file_test "${CMAKE_CURRENT_SOURCE_DIR}/shaders/TestShaders.cfg")
@@ -258,7 +273,7 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
 
     add_custom_target(libntc-shaders
         DEPENDS ShaderMake
-        SOURCES ${shader_sources})
+        SOURCES ${shader_sources} ${public_shader_headers})
 
     set_source_files_properties(${shader_sources} PROPERTIES VS_TOOL_OVERRIDE "None") 
 

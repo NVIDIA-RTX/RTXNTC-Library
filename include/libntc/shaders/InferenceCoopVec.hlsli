@@ -72,7 +72,11 @@ NTC_TEMPLATE_FN_3(bool, NtcSampleLatentGrid_FP16, int, NUM_FEATURES, bool, ALL_C
     int a10 = (y1 * neuralMip.sliceWidth + x0) * encoding.numFeatures;
     int a11 = (y1 * neuralMip.sliceWidth + x1) * encoding.numFeatures;
 
+#if __SLANG__
+    [ForceUnroll]
+#else
     [unroll]
+#endif
     for (int i = 0; i < NUM_FEATURES / 4; i++)
     {
         if (i >= encoding.numFeatures / 4)

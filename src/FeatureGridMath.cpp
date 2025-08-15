@@ -30,24 +30,24 @@ size_t FeatureGridMath::CalculateQuantizedLatentsSize(int imageWidth, int imageH
     const int lastNeuralMip = LodToNeuralLod(imageMips - 1, highResGridScale, NTC_MAX_NEURAL_MIPS);
     numNeuralMipLevels = std::min(numNeuralMipLevels, lastNeuralMip + 1);
 
-    int quantizedLatentUintCount = 0;
+    size_t quantizedLatentUintCount = 0;
 
     for (int mip = 0; mip < numNeuralMipLevels; mip++)
     {
-        const int highResLatentCountInThisMip = CalculateNumLatentsInNeuralMip(Grid::HighRes, imageWidth, imageHeight, highResGridScale, mip);
+        const size_t highResLatentCountInThisMip = CalculateNumLatentsInNeuralMip(Grid::HighRes, imageWidth, imageHeight, highResGridScale, mip);
         quantizedLatentUintCount += GetQuantizedLatentSizeUints(highResLatentCountInThisMip * highResFeatures, highResQuantBits);
 
-        const int lowResLatentCountInThisMip = CalculateNumLatentsInNeuralMip(Grid::LowRes, imageWidth, imageHeight, highResGridScale, mip);
+        const size_t lowResLatentCountInThisMip = CalculateNumLatentsInNeuralMip(Grid::LowRes, imageWidth, imageHeight, highResGridScale, mip);
         quantizedLatentUintCount += GetQuantizedLatentSizeUints(lowResLatentCountInThisMip * lowResFeatures, lowResQuantBits);
     }
 
     return quantizedLatentUintCount * sizeof(uint32_t);
 }
 
-int FeatureGridMath::GetQuantizedLatentSizeUints(int num_weights, int quant_bits)
+size_t FeatureGridMath::GetQuantizedLatentSizeUints(size_t num_weights, int quant_bits)
 {
     assert(quant_bits < 32);
-    const int elements_per_uint = 32 / quant_bits;
+    const uint32_t elements_per_uint = 32 / uint32_t(quant_bits);
     return (num_weights + elements_per_uint - 1) / elements_per_uint;
 }
 
@@ -76,11 +76,11 @@ int FeatureGridMath::CalculateNumNeuralMipLevels(int imageWidth, int imageHeight
     return std::max(1, int((1.f + floor(std::log2f(float(minGridSize)))) / float(NeuralMipRatio)));
 }
 
-int FeatureGridMath::CalculateNumLatentsInNeuralMip(Grid grid, int imageWidth, int imageHeight, int highResGridScale, int mip)
+size_t FeatureGridMath::CalculateNumLatentsInNeuralMip(Grid grid, int imageWidth, int imageHeight, int highResGridScale, int mip)
 {
     int mipWidth = GetGridDimension(grid, imageWidth, mip, highResGridScale);
     int mipHeight = GetGridDimension(grid, imageHeight, mip, highResGridScale);
-    return mipWidth * mipHeight;
+    return size_t(mipWidth) * size_t(mipHeight);
 }
 
 }

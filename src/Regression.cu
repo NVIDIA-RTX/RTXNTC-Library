@@ -21,7 +21,7 @@ namespace ntc::cuda
 {
 
 void Regression(
-    int   pixelsPerBatch,
+    size_t   pixelsPerBatch,
     bool  stableTraining,
     MlpDesc const& kernelVersion,
     RegressionKernelParams const& params)

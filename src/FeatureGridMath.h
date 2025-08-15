@@ -31,7 +31,7 @@ public:
     static size_t CalculateQuantizedLatentsSize(int imageWidth, int imageHeight, int imageMips, int highResGridScale,
         int highResFeatures, int lowResFeatures, int highResQuantBits, int lowResQuantBits);
 
-    static int GetQuantizedLatentSizeUints(int num_weights, int quant_bits);
+    static size_t GetQuantizedLatentSizeUints(size_t num_weights, int quant_bits);
 
     static int LodToNeuralLod(int lod, int highResGridScale, int neuralLods);
 
@@ -42,7 +42,7 @@ public:
 protected:
     static int CalculateNumNeuralMipLevels(int imageWidth, int imageHeight, int highResGridScale);
 
-    static int CalculateNumLatentsInNeuralMip(Grid grid, int imageWidth, int imageHeight, int highResGridScale, int mip);
+    static size_t CalculateNumLatentsInNeuralMip(Grid grid, int imageWidth, int imageHeight, int highResGridScale, int mip);
 };
 
 }

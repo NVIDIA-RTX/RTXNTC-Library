@@ -118,7 +118,7 @@ These layout descriptions and names match the InferenceWeightType enum declared 
 namespace ntc
 {
 
-constexpr int c_PixelsPerKPixel = 1024; // Obvious, but literals are worse
+constexpr size_t c_PixelsPerKPixel = 1024; // Obvious, but literals are worse
 
 static const char* NetworkStateToString(TextureSetNetworkState state)
 {
@@ -178,7 +178,7 @@ Status TextureSet::Initialize(const TextureSetFeatures& features)
     m_textureMipOffsets.fill(0);
     for (int mipLevel = 0; mipLevel < m_desc.mips; ++mipLevel)
     {
-        int mipSize = mipWidth * mipHeight;
+        uint64_t mipSize = uint64_t(mipWidth) * uint64_t(mipHeight);
         m_textureMipOffsets[mipLevel] = mipDataOffset;
         mipDataOffset += mipSize;
 
@@ -213,7 +213,7 @@ Status TextureSet::Initialize(const TextureSetFeatures& features)
     int const stagingWidth = features.stagingWidth > 0 ? features.stagingWidth : m_desc.width;
     int const stagingHeight = features.stagingHeight > 0 ? features.stagingHeight : m_desc.height;
     
-    size_t stagingSize = size_t(stagingWidth * stagingHeight) * features.stagingBytesPerPixel;
+    size_t stagingSize = size_t(stagingWidth) * size_t(stagingHeight) * size_t(features.stagingBytesPerPixel);
     if (stagingSize != 0 && !m_textureStaging.Allocate(stagingSize))
     {
         SetErrorMessage("Failed to allocate %zu bytes of device memory for the staging buffer.",
@@ -486,7 +486,7 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape, int networkVersio
     }
     
     // Loss for the CUDA decompression pass
-    size_t const lossLength = (m_desc.width * m_desc.height + LOCAL_PIXELS - 1) / LOCAL_PIXELS * NTC_MAX_CHANNELS;
+    size_t const lossLength = (size_t(m_desc.width) * size_t(m_desc.height) + LOCAL_PIXELS - 1) / LOCAL_PIXELS * NTC_MAX_CHANNELS;
     requiredLossLength = std::max(requiredLossLength, lossLength);
     
     if (!m_loss.Allocate(requiredLossLength))
@@ -1398,7 +1398,7 @@ Status TextureSet::BeginCompression(const CompressionSettings& settings)
 
         // Calculate the PDF for sampling this particular mip level based on its area,
         // clamp at the lower end to make sure the coarsest mips are sampled at all
-        mipPdf[mip] = float(std::max(mipWidth * mipHeight, 512));
+        mipPdf[mip] = float(std::max(size_t(mipWidth) * size_t(mipHeight), size_t(512)));
         pdfSum += mipPdf[mip];
 
         // Advance to the next mip level
@@ -1471,8 +1471,8 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
     const float minLearningRate = 0.f;
     float networkLearningRate = 0.f;
     float gridLearningRate = 0.f;
-    const int pixelsPerBatch = std::min(m_desc.width * m_desc.height,
-        m_compressionSettings.kPixelsPerBatch * c_PixelsPerKPixel);
+    const size_t pixelsPerBatch = std::min(size_t(m_desc.width) * size_t(m_desc.height),
+        size_t(m_compressionSettings.kPixelsPerBatch) * c_PixelsPerKPixel);
     bool const stableTraining = m_compressionSettings.stableTraining;
 
     uint32_t validMask = GetValidChannelMask();
@@ -1573,8 +1573,8 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
 
         if (stableTraining)
         {
-            int const sliceSize = TILE_SIZE_X * TB_SIZE_Y;
-            int gradientSlices = (pixelsPerBatch + sliceSize - 1) / sliceSize;
+            size_t const sliceSize = TILE_SIZE_X * TB_SIZE_Y;
+            size_t gradientSlices = (pixelsPerBatch + sliceSize - 1) / sliceSize;
             int numNetworkParams = m_mlpDesc->GetWeightCount() + m_mlpDesc->GetLayerOutputCount();
 
             cuda::ReduceNetworkGrad(
