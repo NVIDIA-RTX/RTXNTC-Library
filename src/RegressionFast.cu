@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -10,13 +10,14 @@
  * its affiliates is strictly prohibited.
  */
 
-#ifndef NTC_VULKAN_HLSLI
-#define NTC_VULKAN_HLSLI
+#include "RegressionKernels.h"
 
-#ifdef SPIRV
-#define VK_BINDING(reg,dset) [[vk::binding(reg,dset)]]
-#else
-#define VK_BINDING(reg,dset) 
-#endif
+namespace ntc::cuda
+{
 
-#endif // NTC_VULKAN_HLSLI
+__global__ void RegressionKernelFast(RegressionKernelParams params)
+{
+    RegressionKernel<false>(params);
+}
+
+} // namespace ntc::cuda

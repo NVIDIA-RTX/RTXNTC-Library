@@ -15,29 +15,20 @@
 #include "libntc/shaders/ColorSpaces.hlsli"
 #include "libntc/shaders/DecompressConstants.h"
 #include "libntc/shaders/Inference.hlsli"
+#include "libntc/shaders/Bindings.h"
 #include "HashBasedRNG.hlsli"
-#include "Vulkan.hlsli"
+#include "BindingHelpers.hlsli"
 
 #ifdef __cplusplus
 static const NtcDecompressConstants g_Const;
 #else
-VK_BINDING(0, 0) ConstantBuffer<NtcDecompressConstants> g_Const : register(b0);
+NTC_DECLARE_CBUFFER(ConstantBuffer<NtcDecompressConstants> g_Const, NTC_BINDING_DECOMPRESSION_CONSTANT_BUFFER, NTC_BINDING_DECOMPRESSION_INPUT_SPACE);
 #endif
-VK_BINDING(1, 0) ByteAddressBuffer t_InputFile : register(t1);
-VK_BINDING(2, 0) ByteAddressBuffer t_WeightBuffer : register(t2);
-VK_BINDING(0, 1) RWTexture2D<float4> u_Outputs[] : register(u0);
 
-typedef NtcNetworkParams<NETWORK_VERSION> Params;
+NTC_DECLARE_SRV(Texture2DArray t_Latents,         NTC_BINDING_DECOMPRESSION_LATENT_TEXTURE,  NTC_BINDING_DECOMPRESSION_INPUT_SPACE);
+NTC_DECLARE_SRV(ByteAddressBuffer t_WeightBuffer, NTC_BINDING_DECOMPRESSION_WEIGHT_BUFFER,   NTC_BINDING_DECOMPRESSION_INPUT_SPACE);
+NTC_DECLARE_SAMPLER(SamplerState s_LatentSampler, NTC_BINDING_DECOMPRESSION_LATENT_SAMPLER,  NTC_BINDING_DECOMPRESSION_INPUT_SPACE);
+NTC_DECLARE_UAV(RWTexture2D<float4> u_Outputs[],  NTC_BINDING_DECOMPRESSION_OUTPUT_TEXTURES, NTC_BINDING_DECOMPRESSION_OUTPUT_SPACE);
 
-static const int LATENTS_COUNT = Params::HR_FEATURES + Params::LR_FEATURES;
-
-// Normally a margin of 2 latent pixels (one on each side) would be enough for bilinear filtering,
-// but in some cases with odd resolutions, 3 is required.
-static const int PRELOAD_MARGIN = 3;
-
-static const int HR_LATENTS_WIDTH = DECOMPRESS_CS_BLOCK_WIDTH + PRELOAD_MARGIN;
-static const int HR_LATENTS_HEIGHT = DECOMPRESS_CS_BLOCK_HEIGHT + PRELOAD_MARGIN;
-static const int LR_LATENTS_WIDTH = DECOMPRESS_CS_BLOCK_WIDTH / 2 + PRELOAD_MARGIN;
-static const int LR_LATENTS_HEIGHT = DECOMPRESS_CS_BLOCK_HEIGHT / 2 + PRELOAD_MARGIN;
-static const int MAX_INPUT_SIZE = Params::INPUT_CHANNELS > Params::HIDDEN_LAYER_CHANNELS ? Params::INPUT_CHANNELS : Params::HIDDEN_LAYER_CHANNELS;
-static const int MAX_OUTPUT_SIZE = Params::HIDDEN_LAYER_CHANNELS > Params::OUTPUT_CHANNELS ? Params::HIDDEN_LAYER_CHANNELS : Params::OUTPUT_CHANNELS;
+static const int MAX_INPUT_SIZE = (NTC_MLP_INPUT_CHANNELS > NTC_MLP_HIDDEN_CHANNELS) ? NTC_MLP_INPUT_CHANNELS : NTC_MLP_HIDDEN_CHANNELS;
+static const int MAX_OUTPUT_SIZE = (NTC_MLP_HIDDEN_CHANNELS > NTC_MLP_OUTPUT_CHANNELS) ? NTC_MLP_HIDDEN_CHANNELS : NTC_MLP_OUTPUT_CHANNELS;

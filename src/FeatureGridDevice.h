@@ -12,22 +12,25 @@
 
 #pragma once
 
+#include "FeatureGridMath.h"
+#include <cuda_fp16.hpp>
+
 namespace ntc::cuda
 {
 
-template <int MAX_NUM_FEATURES, bool ALL_CORNERS>
 class FeatureGrid
 {
 public:
-    __device__ FeatureGrid(int numFeatures, int width, int height)
+    __device__ FeatureGrid(int numFeatures, int width, int height, size_t latentStride)
         : m_latentWidth(width)
         , m_latentHeight(height)
         , m_numFeatures(numFeatures)
-    { }
+        , m_latentStride(latentStride)
+    {
+    }
 
-    template<int INPUT_CHANNELS>
-    __device__ void Sample(float u, float v, int offset, const half* data, tin::HArray<INPUT_CHANNELS>& outputArray) {
-
+    __device__ void SetupBilinearFilter(float u, float v, int& x0, int& y0, int& x1, int& y1, half weights[4])
+    {
         float x = u * m_latentWidth  - 0.5f;
         float y = v * m_latentHeight - 0.5f;
 
@@ -36,167 +39,132 @@ public:
 
         float dx = x - x_b;
         float dy = y - y_b;
-        float dxn = 1 - dx;
-        float dyn = 1 - dy;
+        float dxn = 1.f - dx;
+        float dyn = 1.f - dy;
 
-        half2 w00 = __float2half2_rn(dxn * dyn);
-        half2 w01 = __float2half2_rn(dx * dyn);
-        half2 w10 = __float2half2_rn(dxn * dy);
-        half2 w11 = __float2half2_rn(dx * dy);
+        weights[0] = half(dxn * dyn);
+        weights[1] = half(dx * dyn);
+        weights[2] = half(dxn * dy);
+        weights[3] = half(dx * dy);
 
-        int x0 = std::max(0, std::min(m_latentWidth - 1, x_b));
-        int y0 = std::max(0, std::min(m_latentHeight - 1, y_b));
-        int x1 = std::max(0, std::min(m_latentWidth - 1, x_b + 1));
-        int y1 = std::max(0, std::min(m_latentHeight - 1, y_b + 1));
+        // Wrap addressing
+        if (x_b < 0) x_b += m_latentWidth;
+        if (y_b < 0) y_b += m_latentHeight;
+        x0 = x_b % m_latentWidth;
+        y0 = y_b % m_latentHeight;
+        x1 = (x_b + 1) % m_latentWidth;
+        y1 = (y_b + 1) % m_latentHeight;
+    }
 
-        int a00 = (y0 * m_latentWidth + x0);
-        int a01 = (y0 * m_latentWidth + x1);
-        int a10 = (y1 * m_latentWidth + x0);
-        int a11 = (y1 * m_latentWidth + x1);
+    __device__ void Sample(float u, float v, const half* __restrict__ features,
+        tin::HArray<NTC_MLP_INPUT_CHANNELS>& outputArray, int arrayOffset)
+    {
+        int x0, y0, x1, y1;
+        half weights[4];
+        SetupBilinearFilter(u, v, x0, y0, x1, y1, weights);
 
-        const half2* l2 = (half2*)data;
-
-#pragma unroll
-        for (int i = 0; i < MAX_NUM_FEATURES / 2; i++)
+        size_t a00 = (size_t(y0) * size_t(m_latentWidth) + size_t(x0)) * FeatureGridMath::FeaturesPerGroup;
+        size_t a01 = (size_t(y0) * size_t(m_latentWidth) + size_t(x1)) * FeatureGridMath::FeaturesPerGroup;
+        size_t a10 = (size_t(y1) * size_t(m_latentWidth) + size_t(x0)) * FeatureGridMath::FeaturesPerGroup;
+        size_t a11 = (size_t(y1) * size_t(m_latentWidth) + size_t(x1)) * FeatureGridMath::FeaturesPerGroup;
+        
+        #pragma unroll
+        for (int featureIndex = 0; featureIndex < NTC_MLP_FEATURES; featureIndex += 2)
         {
-            bool active = i < m_numFeatures / 2;
-            const half2 zero { 0.f, 0.f };
+            if (featureIndex >= m_numFeatures)
+                break;
 
-            half2 x00 = active ? l2[a00] : zero; a00 += (m_latentWidth * m_latentHeight);
-            half2 x01 = active ? l2[a01] : zero; a01 += (m_latentWidth * m_latentHeight);
-            half2 x10 = active ? l2[a10] : zero; a10 += (m_latentWidth * m_latentHeight);
-            half2 x11 = active ? l2[a11] : zero; a11 += (m_latentWidth * m_latentHeight);
+            half2 x00 = *(half2*)(features + a00);
+            half2 x01 = *(half2*)(features + a01);
+            half2 x10 = *(half2*)(features + a10);
+            half2 x11 = *(half2*)(features + a11);
 
-            if constexpr (ALL_CORNERS)
-            {
-                outputArray.set_packed_element(x00 * w00, offset + i);
-                outputArray.set_packed_element(x01 * w01, offset + i + 1 * (MAX_NUM_FEATURES / 2));
-                outputArray.set_packed_element(x10 * w10, offset + i + 2 * (MAX_NUM_FEATURES / 2));
-                outputArray.set_packed_element(x11 * w11, offset + i + 3 * (MAX_NUM_FEATURES / 2));
-            }
-            else
-            {
-                half2 d = x00 * w00 + x01 * w01 + x10 * w10 + x11 * w11;
-                outputArray.set_packed_element(d, offset + i);
-            }
+            half2 d;
+            d.x = x00.x * weights[0] + x01.x * weights[1] + x10.x * weights[2] + x11.x * weights[3];
+            d.y = x00.y * weights[0] + x01.y * weights[1] + x10.y * weights[2] + x11.y * weights[3];
+
+            // Convert from [0,1] to [-1,1], that works better as a network input
+            d.x = d.x * half(2.0f) - half(1.0f);
+            d.y = d.y * half(2.0f) - half(1.0f);
+            
+            outputArray.set_packed_element(d, (arrayOffset + featureIndex) / 2);
+
+            a00 += m_latentStride;
+            a01 += m_latentStride;
+            a10 += m_latentStride;
+            a11 += m_latentStride;
         }
     }
 
-    template<int INPUT_CHANNELS, typename GRID_GRAD_TYPE>
-    __device__ void SampleBackward(float u, float v, int offset, const tin::HArray<INPUT_CHANNELS>& inputArray,
-        GRID_GRAD_TYPE* gradients, uint32_t* gradientMask)
+    __device__ void MarkGradientMask(int x, int y, uint32_t* gradientMask, size_t maskOffsetInBits)
     {
-        float x = u * m_latentWidth  - 0.5f;
-        float y = v * m_latentHeight - 0.5f;
+        size_t bitIndex = y * m_latentWidth + x + maskOffsetInBits;
+        size_t wordIndex = bitIndex >> 5;
+        uint32_t wordMask = 1u << (bitIndex & 31);
 
-        int x_b = floor(x);
-        int y_b = floor(y);
+        atomicOr(gradientMask + wordIndex, wordMask);
+    }
 
-        float dx  = x - x_b;
-        float dy  = y - y_b;
-        float dxn = 1 - dx;
-        float dyn = 1 - dy;
+    template<typename GRID_GRAD_TYPE>
+    __device__ void SampleBackward(float u, float v, 
+        const tin::HArray<NTC_MLP_INPUT_CHANNELS>& outputGradients, int arrayOffset,
+        GRID_GRAD_TYPE* __restrict__ gradients, uint32_t* gradientMask, size_t maskOffsetInBits)
+    {
+        int x0, y0, x1, y1;
+        half weights[4];
+        SetupBilinearFilter(u, v, x0, y0, x1, y1, weights);
 
-        half2 w00 = __float2half2_rn(dxn * dyn);
-        half2 w01 = __float2half2_rn(dx * dyn);
-        half2 w10 = __float2half2_rn(dxn * dy);
-        half2 w11 = __float2half2_rn(dx * dy);
+        MarkGradientMask(x0, y0, gradientMask, maskOffsetInBits);
+        MarkGradientMask(x1, y0, gradientMask, maskOffsetInBits);
+        MarkGradientMask(x0, y1, gradientMask, maskOffsetInBits);
+        MarkGradientMask(x1, y1, gradientMask, maskOffsetInBits);
+        
+        size_t a00 = (size_t(y0) * size_t(m_latentWidth) + size_t(x0)) * FeatureGridMath::FeaturesPerGroup;
+        size_t a01 = (size_t(y0) * size_t(m_latentWidth) + size_t(x1)) * FeatureGridMath::FeaturesPerGroup;
+        size_t a10 = (size_t(y1) * size_t(m_latentWidth) + size_t(x0)) * FeatureGridMath::FeaturesPerGroup;
+        size_t a11 = (size_t(y1) * size_t(m_latentWidth) + size_t(x1)) * FeatureGridMath::FeaturesPerGroup;
 
-        int x0 = max(0, min(m_latentWidth - 1, x_b));
-        int y0 = max(0, min(m_latentHeight - 1, y_b));
-        int x1 = max(0, min(m_latentWidth - 1, x_b + 1));
-        int y1 = max(0, min(m_latentHeight - 1, y_b + 1));
-
-        bool mask = x0 < m_latentWidth && y0 < m_latentHeight;
-
-        int a00 = (y0 * m_latentWidth + x0);
-        int a01 = (y0 * m_latentWidth + x1);
-        int a10 = (y1 * m_latentWidth + x0);
-        int a11 = (y1 * m_latentWidth + x1);
-
-        // Mark the gradient mask for the touched pixels
-        if (mask)
+        #pragma unroll
+        for (int featureIndex = 0; featureIndex < NTC_MLP_FEATURES; featureIndex += 2)
         {
-            atomicOr(gradientMask + (a00 >> 5), 1u << (a00 & 31));
-            atomicOr(gradientMask + (a01 >> 5), 1u << (a01 & 31));
-            atomicOr(gradientMask + (a10 >> 5), 1u << (a10 & 31));
-            atomicOr(gradientMask + (a11 >> 5), 1u << (a11 & 31));
-        }
+            if (featureIndex >= m_numFeatures)
+                break;
 
-#pragma unroll
-        for (int i = 0; i < MAX_NUM_FEATURES / 2; i++)
-        {
-            if (i >= m_numFeatures / 2)
-                mask = false;
-
-            half2 lat00, lat01, lat10, lat11;
-
-            if constexpr (ALL_CORNERS)
-            {
-                lat00 = w00 * inputArray.get_packed_element(offset + i    );
-                lat01 = w01 * inputArray.get_packed_element(offset + i + 1 * (MAX_NUM_FEATURES / 2));
-                lat10 = w10 * inputArray.get_packed_element(offset + i + 2 * (MAX_NUM_FEATURES / 2));
-                lat11 = w11 * inputArray.get_packed_element(offset + i + 3 * (MAX_NUM_FEATURES / 2));
-            } 
-            else
-            {
-                half2 lat = inputArray.get_packed_element(offset + i);
-                lat00 = lat * w00;
-                lat01 = lat * w01;
-                lat10 = lat * w10;
-                lat11 = lat * w11;
-            }
-
+            half2 outputGrad = outputGradients.get_packed_element((arrayOffset + featureIndex) / 2);
+            outputGrad.x *= half(2.0f);
+            outputGrad.y *= half(2.0f);
+            
             if (std::is_same<GRID_GRAD_TYPE, float>::value)
             {
-                auto l2 = (float2*)gradients;
-                float2* x00 = l2 + a00; a00 += (m_latentWidth * m_latentHeight);
-                float2* x01 = l2 + a01; a01 += (m_latentWidth * m_latentHeight);
-                float2* x10 = l2 + a10; a10 += (m_latentWidth * m_latentHeight);
-                float2* x11 = l2 + a11; a11 += (m_latentWidth * m_latentHeight);
-
-                if (mask)
-                {
-                    tin::_atomic_addf(&(x00->x), float(lat00.x));
-                    tin::_atomic_addf(&(x00->y), float(lat00.y));
-
-                    tin::_atomic_addf(&(x01->x), float(lat01.x));
-                    tin::_atomic_addf(&(x01->y), float(lat01.y));
-
-                    tin::_atomic_addf(&(x10->x), float(lat10.x));
-                    tin::_atomic_addf(&(x10->y), float(lat10.y));
-
-                    tin::_atomic_addf(&(x11->x), float(lat11.x));
-                    tin::_atomic_addf(&(x11->y), float(lat11.y));
-                }
+                tin::_atomic_addf((float*)&gradients[a00 + 0], float(outputGrad.x * weights[0]));
+                tin::_atomic_addf((float*)&gradients[a00 + 1], float(outputGrad.y * weights[0]));
+                tin::_atomic_addf((float*)&gradients[a01 + 0], float(outputGrad.x * weights[1]));
+                tin::_atomic_addf((float*)&gradients[a01 + 1], float(outputGrad.y * weights[1]));
+                tin::_atomic_addf((float*)&gradients[a10 + 0], float(outputGrad.x * weights[2]));
+                tin::_atomic_addf((float*)&gradients[a10 + 1], float(outputGrad.y * weights[2]));
+                tin::_atomic_addf((float*)&gradients[a11 + 0], float(outputGrad.x * weights[3]));
+                tin::_atomic_addf((float*)&gradients[a11 + 1], float(outputGrad.y * weights[3]));
             }
             else
             {
-                auto l2 = (half2*)gradients;
-                half2* x00 = l2 + a00; a00 += (m_latentWidth * m_latentHeight);
-                half2* x01 = l2 + a01; a01 += (m_latentWidth * m_latentHeight);
-                half2* x10 = l2 + a10; a10 += (m_latentWidth * m_latentHeight);
-                half2* x11 = l2 + a11; a11 += (m_latentWidth * m_latentHeight);
-
-                if (mask)
-                {
-                    tin::_atomic_addh2(x00, lat00);
-                    tin::_atomic_addh2(x01, lat01);
-                    tin::_atomic_addh2(x10, lat10);
-                    tin::_atomic_addh2(x11, lat11);
-                }
+                tin::_atomic_addh2((half2*)&gradients[a00], half2{outputGrad.x * weights[0], outputGrad.y * weights[0]});
+                tin::_atomic_addh2((half2*)&gradients[a01], half2{outputGrad.x * weights[1], outputGrad.y * weights[1]});
+                tin::_atomic_addh2((half2*)&gradients[a10], half2{outputGrad.x * weights[2], outputGrad.y * weights[2]});
+                tin::_atomic_addh2((half2*)&gradients[a11], half2{outputGrad.x * weights[3], outputGrad.y * weights[3]});
             }
-        }
-    }
 
-    __device__ int size() {
-        return m_latentWidth * m_latentHeight * m_numFeatures;
+            a00 += m_latentStride;
+            a01 += m_latentStride;
+            a10 += m_latentStride;
+            a11 += m_latentStride;
+        }
     }
 
 private:
     int m_latentWidth;
     int m_latentHeight;
     int m_numFeatures;
+    size_t m_latentStride;
 };
 
 } // namespace ntc::cuda

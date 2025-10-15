@@ -13,6 +13,7 @@
 #pragma once
 
 #include "StdTypes.h"
+#include "FeatureGridMath.h"
 #include <array>
 
 struct NtcDecompressConstants;
@@ -34,12 +35,9 @@ namespace json
 
 struct LatentImageDesc
 {
-    StreamRange highResRange;
-    StreamRange lowResRange;
-    int highResWidth = 0;
-    int highResHeight = 0;
-    int lowResWidth = 0;
-    int lowResHeight = 0;
+    StreamRange range;
+    int width = 0;
+    int height = 0;
 };
 
 struct ColorMipDesc
@@ -59,8 +57,6 @@ public:
     
     LatentShape const& GetLatentShape() const override { return m_latentShape; }
 
-    MlpDesc const* GetMlpDesc() const { return m_mlpDesc; }
-    
     ITextureMetadata* AddTexture() override;
     Status RemoveTexture(ITextureMetadata* texture) override;
     void ClearTextureMetadata() override;
@@ -68,8 +64,8 @@ public:
     ITextureMetadata* GetTexture(int textureIndex) override;
     ITextureMetadata const* GetTexture(int textureIndex) const override;
     ColorSpace GetChannelStorageColorSpace(int channel) const override;
-    int GetNetworkVersion() const override;
-    Status GetStreamRangeForLatents(int firstMip, int numMips, StreamRange& outRange) const override;
+    LatentTextureDesc GetLatentTextureDesc() const override;
+    Status GetLatentTextureFootprint(int latentMipLevel, LatentTextureFootprint& outFootprint) const override;
     Status GetFusedMipLevels(int mipLevel, int* pOutFirstFusedMip, int* pOutLastFusedMip) const override;
     int GetNumLatentImages() const override;
     Status GetMipLevelsForLatentImage(int latentImageIndex, int* pOutFirstColorMip, int* pOutLastColorMip) const override;
@@ -86,7 +82,10 @@ public:
 
     Status LoadWeightsFromStream(json::Document const& document, IStream* inputStream);
     
-    void GetWeightOffsets(InferenceWeightType weightType, int weightOffsets[NTC_MLP_LAYERS], int& scaleBiasOffset);
+    void GetWeightOffsets(InferenceWeightType weightType,
+        int weightOffsets[NTC_MLP_LAYERS],
+        int biasOffsets[NTC_MLP_LAYERS],
+        int scaleOffsets[NTC_MLP_LAYERS]) const;
 
     uint64_t GetSourceStreamSize() const { return m_sourceStreamSize; }
 
@@ -94,17 +93,13 @@ public:
 
     uint32_t GetPackedColorSpaces() const;
 
-    void FillNeuralMipConstants(
-        NtcNeuralMipConstants& highResLatents,
-        NtcNeuralMipConstants& lowResLatents,
-        int neuralLod,
-        uint64_t latentBufferOffset);
+    void FillColorMipConstants(NtcColorMipConstants& colorMip, int mipLevel, int firstLatentMipInTexture);
 
-    void FillColorMipConstants(NtcColorMipConstants& colorMip, int mipLevel);
-
-    void FillDecompressionConstants(NtcDecompressConstants& output, InferenceWeightType weightType, int weightOffset,
-        int mipLevel, Rect srcRect, Point dstOffset, OutputTextureDesc const* pOutputTextures, int numOutputTextures,
-        int firstOutputDescriptorIndex, uint64_t latentBufferOffset);
+    void FillDecompressionConstants(
+        NtcDecompressConstants& output,
+        MakeDecompressionComputePassParameters const& params,
+        Rect srcRect,
+        Point dstOffset);
 
     bool ValidateBufferView(uint32_t view, uint64_t minSize, json::Document const& document);
 
@@ -119,10 +114,7 @@ public:
     bool ConvertWeightsForCoopVec(Vector<uint8_t> const& src, Vector<uint8_t>& dst,
         bool useFP8, size_t& outWeightSize, int outWeightOffsets[4]);
 
-    static void FillLatentEncodingConstants(NtcLatentEncodingConstants& encoding,
-        int numFeatures, int quantBits, InferenceWeightType weightType);
-    
-    static Status ValidateLatentShape(LatentShape const& latentShape, int networkVersion);
+    static Status ValidateLatentShape(LatentShape const& latentShape);
 
     static Status ValidateTextureSetDesc(TextureSetDesc const& desc);
 
@@ -138,7 +130,6 @@ protected:
 
     TextureSetDesc m_desc{ };
     LatentShape m_latentShape = LatentShape::Empty();
-    MlpDesc const* m_mlpDesc = nullptr;
     Vector<UniquePtr<TextureMetadata>> m_textureInfos;
 
     uint64_t m_binaryChunkOffset = 0;

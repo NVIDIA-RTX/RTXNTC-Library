@@ -19,7 +19,7 @@ namespace ntc::cuda
 {
 
 void OptimizeNetwork(
-    int    dispatchSize,
+    uint32_t dispatchSize,
     bool   useFloatGradients,
     half* __restrict__ baseWeights,
     half* __restrict__ quantizedWeights,
@@ -43,9 +43,9 @@ void ReduceNetworkGrad(
 
 
 void OptimizeLatentGrid(
-    int         numLatents,
-    int         numFeatures,
-    int         quantizationBits,
+    uint32_t    numPixels,
+    uint32_t    numFeatures,
+    size_t      latentStride,
     bool        useFloatGradients,
     half*       __restrict__ baseWeights,
     half*       __restrict__ quantizedWeights,

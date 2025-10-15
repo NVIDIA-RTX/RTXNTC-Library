@@ -19,52 +19,14 @@
 #include "CudaUtils.h"
 #include <libntc/ntc.h>
 
-// NVCC says "expression has no effect" on the calls to FeatureGrid::Sample and SampleBackward.
-// It also says "variable "u" was set but never used".
-// Since the code actually works, suppress the messages.
-#ifdef __NVCC_DIAG_PRAGMA_SUPPORT__
-#pragma nv_diag_suppress 174
-#pragma nv_diag_suppress 550
-#endif
-
 namespace ntc::cuda
 {
 
+static constexpr float PIXEL_CENTER_OFFSET = 0.5f;
+
 using Activation = tin::ActHGELUClamp;
 
-template<int NETWORK_VERSION>
-struct NTC_PARAMS
-{   
-    static const int INPUT_CHANNELS = 
-        (NETWORK_VERSION == NTC_NETWORK_SMALL) ? NTC_MLP_INPUT_CHANNELS_SMALL :
-        (NETWORK_VERSION == NTC_NETWORK_MEDIUM) ? NTC_MLP_INPUT_CHANNELS_MEDIUM :
-        (NETWORK_VERSION == NTC_NETWORK_LARGE) ? NTC_MLP_INPUT_CHANNELS_LARGE :
-        (NETWORK_VERSION == NTC_NETWORK_XLARGE) ? NTC_MLP_INPUT_CHANNELS_XLARGE :
-        0; // Unsupported value
-
-    static const int HR_FEATURES = 
-        (NETWORK_VERSION == NTC_NETWORK_SMALL) ? NTC_MLP_HR_FEATURES_SMALL :
-        (NETWORK_VERSION == NTC_NETWORK_MEDIUM) ? NTC_MLP_HR_FEATURES_MEDIUM :
-        (NETWORK_VERSION == NTC_NETWORK_LARGE) ? NTC_MLP_HR_FEATURES_LARGE :
-        (NETWORK_VERSION == NTC_NETWORK_XLARGE) ? NTC_MLP_HR_FEATURES_XLARGE :
-        0; // Unsupported value
-
-    static const int LR_FEATURES = NTC_MLP_LR_FEATURES;
-
-    static const int SAMPLED_FEATURES_HR = HR_FEATURES * 4;
-    static const int SAMPLED_FEATURES_LR = LR_FEATURES;
-    static const int SAMPLED_FEATURES_TOTAL = SAMPLED_FEATURES_HR + SAMPLED_FEATURES_LR;
-
-    static const int HIDDEN_LAYER_CHANNELS = NTC_MLP_HIDDEN_CHANNELS;
-
-    static const int OUTPUT_CHANNELS = NTC_MLP_OUTPUT_CHANNELS;
-};
-
-#define REGRESSION_KERNEL_IMPL(NAME, NETWORK_VERSION, STABLE_GRAD) \
-    namespace ntc::cuda { \
-    __global__ void RegressionKernel_##NAME##_stable##STABLE_GRAD(RegressionKernelParams params) \
-    {   RegressionKernel<NETWORK_VERSION, STABLE_GRAD>(params); } }
-
+static const int LATENT_ARRAY_SIZE = NTC_MLP_FEATURES / NTC_FEATURES_PER_LAYER;
 
 extern __constant__ MipInfo g_MipInfo[NTC_MAX_MIPS];
 extern __constant__ ChannelInfo g_ChannelInfo[NTC_MAX_CHANNELS];
@@ -94,36 +56,39 @@ inline __device__ half ExpandMaskChannel(half value)
     return value;
 }
 
-template<int CH>
-__device__ void EncodeSamplePosition(float xf, float yf, float lod, int offset, tin::HArray<CH>& m_i) {
-
-    int idx = offset;
+inline __device__ void EncodeSamplePosition(float xf, float yf, float lod, int offset, tin::HArray<NTC_MLP_INPUT_CHANNELS>& m_i)
+{
+    int idx = offset / 2;
     
 #pragma unroll
-    for (int scale = NTC_MLP_POS_ENC_SCALE; scale > 1; scale >>= 1) {
+    for (int wave = 0; wave < NTC_MLP_POS_ENC_WAVES; ++wave)
+    {
         float2 enc;
-        enc.x = frac(xf / scale) * 4;
-        enc.x = abs(enc.x - 2) - 1;
-        enc.y = frac(yf / scale) * 4;
-        enc.y = abs(enc.y - 2) - 1;
+        enc.x = frac(xf) * 2 - 1;
+        enc.y = frac(yf) * 2 - 1;
 
         m_i.set_packed_element(__float22half2_rn(enc), idx);
         idx++;
 
-        enc.x = frac(xf / scale + 0.25f) * 4;
-        enc.x = abs(enc.x - 2) - 1;
-        enc.y = frac(yf / scale + 0.25f) * 4;
-        enc.y = abs(enc.y - 2) - 1;
+        enc.x = frac(xf + 0.25f) * 2 - 1;
+        enc.y = frac(yf + 0.25f) * 2 - 1;
 
         m_i.set_packed_element(__float22half2_rn(enc), idx);
         idx++;
+
+        xf *= 2.f;
+        yf *= 2.f;
     }
 
     half2 lodh = __float2half2_rn(lod);
     m_i.set_packed_element(lodh, idx);
 }
 
-template<int NETWORK_VERSION, bool STABLE_GRADIENTS>
+// This is the main NTC training kernel.
+// It is implemented as a template to allow easy switching between stable and fast training modes, which differ
+// in the formats used for gradients (float32 vs float16) and in the way network weight gradients are accumulated.
+// The actual kernel instantiations are defined in RegressionFast.cu and RegressionStable.cu - to allow parallel compilation.
+template<bool STABLE_GRADIENTS>
 __device__ void RegressionKernel(RegressionKernelParams const params)
 {
     using GRID_GRAD_TYPE = std::conditional_t<STABLE_GRADIENTS, float, half>;
@@ -134,9 +99,9 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
     using namespace cooperative_groups;
     grid_group grid = this_grid();
     thread_block threadBlock = this_thread_block();
+    const int threadInGroup = threadBlock.thread_rank();
     const auto tile32 = tiled_partition<tin::WarpSize>(threadBlock);
     const int threadInWarp = tile32.thread_rank();
-    const int warpIndex = tile32.meta_group_rank();
     
     HashBasedRNG rng(threadBlock.group_index().x * TB_SIZE_Y + threadBlock.thread_index().y, params.randomSeed);
 
@@ -173,16 +138,15 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
 
     // Shift the base pointers to this mip level
     const half* referenceImage = params.referenceImage + mipInfo.referenceTextureOffset * params.numChannels;
-    const half* highResLatents = params.latents + mipInfo.latentsOffsetHighRes;
-    const half* lowResLatents = params.latents + mipInfo.latentsOffsetLowRes;
-    GRID_GRAD_TYPE* highResLatentGradients = (GRID_GRAD_TYPE*)params.latentGradients + mipInfo.latentsOffsetHighRes;
-    GRID_GRAD_TYPE* lowResLatentGradients = (GRID_GRAD_TYPE*)params.latentGradients + mipInfo.latentsOffsetLowRes;
+    const half* highResLatents = params.latents + mipInfo.highResLatentOffset;
+    const half* lowResLatents = params.latents + mipInfo.lowResLatentOffset;
+    GRID_GRAD_TYPE* highResLatentGradients = (GRID_GRAD_TYPE*)params.latentGradients + mipInfo.highResLatentOffset;
+    GRID_GRAD_TYPE* lowResLatentGradients = (GRID_GRAD_TYPE*)params.latentGradients + mipInfo.lowResLatentOffset;
     NW_GRAD_TYPE* networkGradientsTyped = (NW_GRAD_TYPE*)params.networkGradients;
     
-    using PARAMS = NTC_PARAMS<NETWORK_VERSION>;
-    FeatureGrid<PARAMS::HR_FEATURES, true> highResFeatureGrid(params.highResFeatures, mipInfo.highResLatentWidth, mipInfo.highResLatentHeight);
-    FeatureGrid<PARAMS::LR_FEATURES, false> lowResFeatureGrid(params.lowResFeatures, mipInfo.lowResLatentWidth, mipInfo.lowResLatentHeight);
-    using Network = tin::HMLP<NTC_MLP_LAYERS-2, PARAMS::INPUT_CHANNELS, PARAMS::HIDDEN_LAYER_CHANNELS, PARAMS::OUTPUT_CHANNELS,
+    FeatureGrid highResFeatureGrid(params.numFeatures, mipInfo.highResLatentWidth, mipInfo.highResLatentHeight, params.latentStride);
+    FeatureGrid lowResFeatureGrid(params.numFeatures, mipInfo.lowResLatentWidth, mipInfo.lowResLatentHeight, params.latentStride);
+    using Network = tin::HMLP<NTC_MLP_LAYERS-2, NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS,
         Activation, tin::ActNone, REDUCE_MODE, WARPS_PER_TBLOCK * tin::WarpSize, NW_GRAD_TYPE>;
 
     // Run network
@@ -218,31 +182,29 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
         y = y % referenceHeight;
 
         // Set network input
-        tin::HArray<PARAMS::INPUT_CHANNELS> networkInputsArray(0.f);
+        tin::HArray<NTC_MLP_INPUT_CHANNELS> networkInputsArray(0.f);
 
-        float pixelCenterX = (x + 0.5f);
-        float pixelCenterY = (y + 0.5f);
-        float u = pixelCenterX / float(referenceWidth);
-        float v = pixelCenterY / float(referenceHeight);
+        float u = (float(x) + PIXEL_CENTER_OFFSET) / float(referenceWidth);
+        float v = (float(y) + PIXEL_CENTER_OFFSET) / float(referenceHeight);
 
-        highResFeatureGrid.Sample<PARAMS::INPUT_CHANNELS>(u, v, 0, highResLatents, networkInputsArray);
-        lowResFeatureGrid.Sample<PARAMS::INPUT_CHANNELS>(u, v, PARAMS::SAMPLED_FEATURES_HR / 2, lowResLatents, networkInputsArray);
+        highResFeatureGrid.Sample(u, v, highResLatents, networkInputsArray, 0);
+        lowResFeatureGrid.Sample(u, v, lowResLatents, networkInputsArray, NTC_MLP_FEATURES);
 
-        EncodeSamplePosition<PARAMS::INPUT_CHANNELS>(
+        EncodeSamplePosition(
             float(x) * mipInfo.positionScale,
             float(y) * mipInfo.positionScale,
             mipInfo.positionLod,
-            PARAMS::SAMPLED_FEATURES_TOTAL / 2, networkInputsArray);
-
-        tin::HVector<PARAMS::INPUT_CHANNELS> networkInputsVector(networkInputsArray);
+            NTC_MLP_FEATURES * 2, networkInputsArray);
+        
+        tin::HVector<NTC_MLP_INPUT_CHANNELS> networkInputsVector(networkInputsArray);
 
         // Run network
         auto networkOutputsVector = mlp.forward(networkInputsVector);
 
-        tin::HArray<PARAMS::OUTPUT_CHANNELS> networkOutputsArray(networkOutputsVector);
+        tin::HArray<NTC_MLP_OUTPUT_CHANNELS> networkOutputsArray(networkOutputsVector);
 
         // Compute loss gradient and store l2 loss
-        tin::HArray<PARAMS::OUTPUT_CHANNELS> lossGradientsArray;
+        tin::HArray<NTC_MLP_OUTPUT_CHANNELS> lossGradientsArray;
         
         float localLoss = 0;
 
@@ -258,7 +220,7 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
 
         // Compute loss and loss gradient
 #pragma unroll
-        for (int i = 0; i < PARAMS::OUTPUT_CHANNELS / 2; i++)
+        for (int i = 0; i < NTC_MLP_OUTPUT_CHANNELS / 2; i++)
         {
             half2 outputs = networkOutputsArray.get_packed_element(i);
 
@@ -282,8 +244,8 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
             float scaledNormalization = lossNormalization * params.lossScale;
 
             localLoss += (difference0 * difference0 + difference1 * difference1);
-            float lossGradient0 = 2.f * difference0 * scaledNormalization;
-            float lossGradient1 = 2.f * difference1 * scaledNormalization;
+            float lossGradient0 = 2.f * difference0 * scaledNormalization * g_ChannelInfo[i * 2 + 0].lossFunctionScale;
+            float lossGradient1 = 2.f * difference1 * scaledNormalization * g_ChannelInfo[i * 2 + 1].lossFunctionScale;
 
             // copy loss gradient into a TIN matrix for backprop
             half2 loss_d_h2 = __floats2half2_rn(lossGradient0, lossGradient1);
@@ -299,176 +261,34 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
             lossAccumulator += tin::Reducer<float, WARPS_PER_TBLOCK>::sum(lossReductionShared, localLoss);
         }
 
-        tin::HVector<PARAMS::OUTPUT_CHANNELS> lossGradientsVector(lossGradientsArray);
+        tin::HVector<NTC_MLP_OUTPUT_CHANNELS> lossGradientsVector(lossGradientsArray);
 
         // Backward pass with loss gradients
         uint32_t grad_offset = NW_GRAD_ATOMICS ? 0 : (Y_ITERS * threadBlock.group_index().x + iteration) * Network::num_params();
 
         auto backwardOutputsVector = mlp.backward(lossGradientsVector, grad_offset, grad_offset);
-        tin::HArray<PARAMS::INPUT_CHANNELS> backwardOutputsArray(backwardOutputsVector);
+        tin::HArray<NTC_MLP_INPUT_CHANNELS> backwardOutputsArray(backwardOutputsVector);
 
         // Store latent gradients from backward pass 
-        highResFeatureGrid.SampleBackward<PARAMS::INPUT_CHANNELS>(u, v, 0,
-            backwardOutputsArray, highResLatentGradients, mipInfo.highResGradientMask);
-        lowResFeatureGrid.SampleBackward<PARAMS::INPUT_CHANNELS>(u, v, PARAMS::SAMPLED_FEATURES_HR / 2,
-            backwardOutputsArray, lowResLatentGradients, mipInfo.lowResGradientMask);
+        highResFeatureGrid.template SampleBackward(
+            u, v,
+            backwardOutputsArray, 0,
+            highResLatentGradients,
+            params.gradientMask,
+            mipInfo.highResMaskOffset);
+            
+        lowResFeatureGrid.template SampleBackward(
+            u, v,
+            backwardOutputsArray, NTC_MLP_FEATURES,
+            lowResLatentGradients,
+            params.gradientMask,
+            mipInfo.lowResMaskOffset);
     }
 
     // Store the per-group loss into a buffer
-    if (params.loss != nullptr && threadInWarp == 0 && warpIndex == 0)
+    if (params.loss != nullptr && threadInGroup == 0)
     {
         params.loss[threadBlock.group_index().x] = lossAccumulator * lossNormalization;
-    }
-}
-
-#define INFERENCE_KERNEL_IMPL(NAME, NETWORK_VERSION) \
-    namespace ntc::cuda { \
-    __global__ void InferenceKernel_##NAME(InferenceKernelParams params) \
-    {   InferenceKernel<NETWORK_VERSION>(params); } }
-
-template<int NETWORK_VERSION>
-__device__ void InferenceKernel(InferenceKernelParams const params)
-{
-    using namespace cooperative_groups;
-
-    grid_group grid = this_grid();
-    thread_block threadBlock = this_thread_block();
-
-    const auto tile32 = tiled_partition<tin::WarpSize>(threadBlock);
-    const int threadInWarp = tile32.thread_rank();
-    const int warpIndex = tile32.meta_group_rank();
-
-    int baseX = threadBlock.group_index().x * TILE_SIZE_X;
-    int baseY = threadBlock.group_index().y * TILE_SIZE_Y;
-
-    int x = baseX + threadInWarp;
-    int y = baseY + threadBlock.thread_index().y;
-
-    using PARAMS = NTC_PARAMS<NETWORK_VERSION>;
-    FeatureGrid<PARAMS::HR_FEATURES, true> highResFeatureGrid(params.highResFeatures, params.highResLatentWidth, params.highResLatentHeight);
-    FeatureGrid<PARAMS::LR_FEATURES, false> lowResFeatureGrid(params.lowResFeatures, params.lowResLatentWidth, params.lowResLatentHeight);
-    using Network = tin::HMLP<NTC_MLP_LAYERS-2, PARAMS::INPUT_CHANNELS, PARAMS::HIDDEN_LAYER_CHANNELS, PARAMS::OUTPUT_CHANNELS,
-        Activation, tin::ActNone, tin::ReducerUpdateMode::ATOMIC_ADD, WARPS_PER_TBLOCK * tin::WarpSize, float>;
-
-    // shared memory for loss reduction
-    __shared__ float lossReductionShared[tin::Reducer<float, WARPS_PER_TBLOCK>::sharedmem_size()];
-        
-    float lossAccumulator[PARAMS::OUTPUT_CHANNELS];
-    for (int i = 0; i < PARAMS::OUTPUT_CHANNELS; ++i)
-        lossAccumulator[i] = 0.f;
-
-    for (int iteration = 0; iteration < Y_ITERS; iteration++)
-    {
-        // Set network input
-        tin::HArray<PARAMS::INPUT_CHANNELS> networkInputsArray(0.f);
-
-        // Copy input
-        float pixelCenterX = (x + 0.5f);
-        float pixelCenterY = (y + 0.5f);
-        float u = pixelCenterX / float(params.referenceWidth);
-        float v = pixelCenterY / float(params.referenceHeight);
-
-        highResFeatureGrid.Sample<PARAMS::INPUT_CHANNELS>(u, v, /* offset = */ 0, params.highResLatents, networkInputsArray);
-        lowResFeatureGrid.Sample<PARAMS::INPUT_CHANNELS>(u, v, /* offset = */ PARAMS::SAMPLED_FEATURES_HR / 2, params.lowResLatents, networkInputsArray);
-        
-        EncodeSamplePosition<PARAMS::INPUT_CHANNELS>(float(x) * params.positionScale, float(y) * params.positionScale,
-            params.positionLod, PARAMS::SAMPLED_FEATURES_TOTAL / 2, networkInputsArray);
-
-        tin::HVector<PARAMS::INPUT_CHANNELS> networkInputsVector(networkInputsArray);
-        
-        // Run network
-        // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-        const tin::Quantization quantization = params.useFP8Quantization ? tin::Quantization::FP8 : tin::Quantization::Int8;
-        Network mlp(params.mlpWeights, params.mlpWeights + Network::num_weights(), quantization, tin::Quantization::Int8);
-
-        auto networkOutputsVector = mlp.forward(networkInputsVector);
-        
-        tin::HArray<PARAMS::OUTPUT_CHANNELS> networkOutputArray(networkOutputsVector);
-
-        // Check whether this texel is inside the reference image
-        const bool insideReferenceImage = x >= 0 && x < params.referenceWidth && y >= 0 && y < params.referenceHeight;
-        // When attemping to sample outside bounds we simply use the first element in the array
-        const uint64_t pixelBaseAddress = insideReferenceImage ? GetPixelBaseAddress(x, y, params.referenceWidth, params.numChannels) : 0;
-        
-        if (params.validChannelMask != 0)
-        {
-            bool isMaskedOut = false;
-            if (params.maskChannelIndex >= 0 && params.discardMaskedOutPixels)
-            {
-                const half maskValue = params.referenceImage[GetChannelAddress(pixelBaseAddress, params.maskChannelIndex, params.referenceWidth)];
-                isMaskedOut = maskValue == half(0);
-            }
-
-#pragma unroll
-            for (int i = 0; i < PARAMS::OUTPUT_CHANNELS / 2; i++)
-            {
-                half2 outputs = networkOutputArray.get_packed_element(i);
-                if (IsHalfSpecial(outputs.x)) outputs.x = 0;
-                if (IsHalfSpecial(outputs.y)) outputs.y = 0;
-
-                outputs.x = half(float(outputs.x) * g_ChannelInfo[i * 2 + 0].optimalToLinearScale + g_ChannelInfo[i * 2 + 0].optimalToLinearBias);
-                outputs.y = half(float(outputs.y) * g_ChannelInfo[i * 2 + 1].optimalToLinearScale + g_ChannelInfo[i * 2 + 1].optimalToLinearBias);
-                
-                if (params.maskChannelIndex == i * 2 + 0) outputs.x = max(0.f, min(1.f, outputs.x));
-                if (params.maskChannelIndex == i * 2 + 1) outputs.y = max(0.f, min(1.f, outputs.y));
-
-                const half2 reference = (i * 2 < params.numChannels)
-                    ? *(const half2*)(params.referenceImage + GetChannelAddress(pixelBaseAddress, i * 2, params.referenceWidth))
-                    : half2{0, 0};
-
-                float dx = (float(outputs.x) - float(reference.x)) * float(GetBit(params.validChannelMask, i * 2));
-                float dy = (float(outputs.y) - float(reference.y)) * float(GetBit(params.validChannelMask, i * 2 + 1));
-
-                // For a masked out pixel, zero the loss function on all channels except the mask channel
-                if (isMaskedOut && params.maskChannelIndex != i * 2 + 0) dx = 0;
-                if (isMaskedOut && params.maskChannelIndex != i * 2 + 1) dy = 0;
-
-                if (insideReferenceImage && (i * 2 < params.numChannels))
-                {
-                    *(half2*)(params.outputImage + GetChannelAddress(pixelBaseAddress, i * 2, params.referenceWidth)) = outputs;
-                    
-                    lossAccumulator[i * 2 + 0] += tin::Reducer<float, WARPS_PER_TBLOCK>::sum(lossReductionShared, dx * dx);
-                    lossAccumulator[i * 2 + 1] += tin::Reducer<float, WARPS_PER_TBLOCK>::sum(lossReductionShared, dy * dy);
-                }
-            }
-        }
-        else
-        {
-#pragma unroll
-            for (int i = 0; i < PARAMS::OUTPUT_CHANNELS / 2; i++)
-            {
-                half2 outputs = networkOutputArray.get_packed_element(i);
-                if (IsHalfSpecial(outputs.x)) outputs.x = 0;
-                if (IsHalfSpecial(outputs.y)) outputs.y = 0;
-
-                outputs.x = half(float(outputs.x) * g_ChannelInfo[i * 2 + 0].optimalToLinearScale + g_ChannelInfo[i * 2 + 0].optimalToLinearBias);
-                outputs.y = half(float(outputs.y) * g_ChannelInfo[i * 2 + 1].optimalToLinearScale + g_ChannelInfo[i * 2 + 1].optimalToLinearBias);
-
-                if (insideReferenceImage && (i * 2 < params.numChannels))
-                {
-                    *(half2*)(params.outputImage + GetChannelAddress(pixelBaseAddress, i * 2, params.referenceWidth)) = outputs;
-                }
-            }
-        }
-        
-        // Move on to the next iteration / pixel
-        y += TB_SIZE_Y;
-    }
-
-    if (threadInWarp == 0 && warpIndex == 0)
-    {
-        const int validThreadsInGrid = std::min(grid.dim_blocks().x * TILE_SIZE_X, (unsigned)params.referenceWidth) * 
-                                       std::min(grid.dim_blocks().y * TILE_SIZE_Y, (unsigned)params.referenceHeight);
-
-        const float lossNormalization = 1.f / float(validThreadsInGrid);
-
-        int blockLinearIndex = threadBlock.group_index().y * grid.dim_blocks().x + threadBlock.group_index().x;
-
-        // Write out per-channel loss
-        for (int i = 0; i < PARAMS::OUTPUT_CHANNELS; i++)
-        {
-            params.outputLoss[i * params.lossItemsPerChannel + blockLinearIndex] = lossAccumulator[i] * lossNormalization;
-        }
     }
 }
 

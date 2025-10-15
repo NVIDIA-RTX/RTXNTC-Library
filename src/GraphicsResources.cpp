@@ -20,19 +20,15 @@ namespace ntc
 GraphicsResources::GraphicsResources(ContextParameters const& params)
     : m_allocator(params.pAllocator)
     , m_graphicsApi(params.graphicsApi)
-    , m_dp4aSupported(params.graphicsDeviceSupportsDP4a)
-    , m_float16Supported(params.graphicsDeviceSupportsFloat16)
 {
     if (params.graphicsApi == GraphicsAPI::D3D12)
     {
 #if NTC_WITH_DX12
         m_d3d12Device = static_cast<ID3D12Device*>(params.d3d12Device);
 
-        if (params.enableCooperativeVectorInt8 ||
-            params.enableCooperativeVectorFP8)
+        if (params.enableCooperativeVector)
         {
-            CoopVecWeightConverter::IsDX12CoopVecSupported(this, m_coopVecInt8Supported,
-                m_coopVecFP8Supported);
+            CoopVecWeightConverter::IsDX12CoopVecSupported(this, m_coopVecSupported);
         }
 #endif
     }
@@ -76,19 +72,15 @@ GraphicsResources::GraphicsResources(ContextParameters const& params)
             vkGetPhysicalDeviceProperties(m_vulkanPhysicalDevice, &m_vulkanPhysicalDeviceProperties);
         }
 
-        if (params.enableCooperativeVectorInt8 ||
-            params.enableCooperativeVectorFP8)
+        if (params.enableCooperativeVector)
         {
-            CoopVecWeightConverter::IsVkCoopVecSupported(this, m_coopVecInt8Supported,
-                m_coopVecFP8Supported);
+            CoopVecWeightConverter::IsVkCoopVecSupported(this, m_coopVecSupported);
         }
 #endif
     }
 
-    if (!params.enableCooperativeVectorInt8)
-        m_coopVecInt8Supported = false;
-    if (!params.enableCooperativeVectorFP8)
-        m_coopVecFP8Supported = false;
+    if (!params.enableCooperativeVector)
+        m_coopVecSupported = false;
 }
 
 GraphicsResources::~GraphicsResources()

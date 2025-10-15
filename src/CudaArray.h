@@ -65,6 +65,16 @@ public:
         return m_hostMemory;
     }
     
+    [[nodiscard]] T* HostPtrOffset(size_t offsetInElements)
+    {
+        return m_hostMemory ? m_hostMemory + offsetInElements : nullptr;
+    }
+
+    [[nodiscard]] const T* HostPtrOffset(size_t offsetInElements) const
+    {
+        return m_hostMemory ? m_hostMemory + offsetInElements : nullptr;
+    }
+    
     size_t Length() const
     {
         return m_length;
@@ -133,6 +143,16 @@ public:
     [[nodiscard]] const T* DevicePtr() const
     {
         return m_deviceMemory;
+    }
+
+    [[nodiscard]] T* DevicePtrOffset(size_t offsetInElements)
+    {
+        return m_deviceMemory ? m_deviceMemory + offsetInElements : nullptr;
+    }
+
+    [[nodiscard]] const T* DevicePtrOffset(size_t offsetInElements) const
+    {
+        return m_deviceMemory ? m_deviceMemory + offsetInElements : nullptr;
     }
 
     size_t Length() const

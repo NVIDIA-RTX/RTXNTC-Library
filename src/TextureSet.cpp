@@ -36,8 +36,8 @@ it takes the gradients from the regression kernel and applies them to the base w
 used by the regression kernel. They are produced by the optimizer and at that point are not yet quantized. They become
 quantized on the next step using the `QuantizeNetwork` calls in the final part of the training session.
 
-Both of these arrays contain two copies of weights: the first set at offset 0 that get Int8 quantization, and 
-the second set at offset `m_numNetworkParams` that optionally get the FP8 quantization.
+Both of these arrays contain two copies of weights: the first set at offset 0 that get FP8 quantization, and 
+the second set at offset `m_numNetworkParams` that get the Int8 quantization.
 
 There are two parts in each set of weights: the actual layer weights, and the bias vectors. The layer weights are
 stored in the obscure "MMA" layout that is compatible with the tensor core matrix multiplication operations. Their size
@@ -52,20 +52,12 @@ Before CUDA decompression, these low-precision weights are converted back into F
 
 === Int8 inference ===
 
-There are two flavors of Int8 inference weights: the generic weights that work with any GPU, and the CoopVec specific
-weights. The CoopVec weights are derived from the regular (row-major) weights when the texture set is loaded from disk.
-See `TextureSetMetadata::LoadWeightsFromStream`, `TextureSetMetadata::ConvertWeightsForCoopVec` and
-`CoopVecWeightConverter.cpp`.
+The Int8 inference weights are available in one generic layout that works for DP4a based inference on any GPU.
 
-The generic weights contain three components: the matrix weights, the scale vectors, and the bias vectors. The matrix
+The weights package contains three components: the matrix weights, the scale vectors, and the bias vectors. The matrix
 weights for all layers are stored in Int8 format and densely packed one after another. Then the scale vectors for all
 layers are stored in Float32 format and are densely packed one after another. Finally, the bias vectors for all layers
 are stored in Int32 format and also densely packed.
-
-The CoopVec weights follow the same general layout with the matrix weights followed by scale and bias vectors. But the
-matrix weights are stored in an opaque CoopVec-compatible layout defined by the GPU driver, potentially different for
-various GPUs. This format contains duplicate elements, and normally consumes 2x the space used for regular row-major
-weights.
 
 === FP8 inference ===
 
@@ -73,44 +65,45 @@ Technically, it's hybrid FP8 and Int8 inference: layers 0-2 are using FP8 weight
 weights. This is done to improve the output precision, which is lacking with FP8 because that format cannot even
 represent all integers in the range 0-255.
 
-FP8 weights also come in two flavors, the generic one and the CoopVec specific one. One important difference from Int8
-weights is that the generic weights are only used for storage, and not used by any GPU for inference because there are
-currently no scalar FP8 operations in GPUs.
+FP8 weights come in two flavors, the generic one (with row-major matrices) and the CoopVec specific one. The generic
+weights are only used for storage, and not used by any GPU for inference because there are currently no scalar FP8
+operations in GPUs.  The CoopVec weights are derived from the generic weights when the texture set is loaded from disk.
+See `TextureSetMetadata::LoadWeightsFromStream`, `TextureSetMetadata::ConvertWeightsForCoopVec` and
+`CoopVecWeightConverter.cpp`.
 
-The generic weights contain the same 3 components but in 2 types. They are laid out in the following order:
-- Matrix weights for layers 0-2 using the FP8 type, in row-major layout
-- Matrix weights for layer 3 using the Int8 type, in row-major layout
+The generic weights contain the weight matrices, bias and scale vectors. They are laid out in the following order:
+- Weight matrices for layers 0-2 using the FP8 type, in row-major layout
+- Weight matrices for layer 3 using the Int8 type, in row-major layout
 - Bias vectors for layers 0-2 using the FP16 type
 - Scale vector for layer 3 using the FP32 type
 - Bias vector for layer 3 using the Int32 type
 
-The CoopVec weights follow the same general layout. Similar to Int8, the matrix weights are converted to the CoopVec-
-compatible layout on load, which is normally larger than the dense row-major layout.
+The CoopVec weights follow the same general layout. The matrix weights are converted to the CoopVec-compatible
+layout on load, which is normally larger than the dense row-major layout.
 
 === Important code locations using these layouts ===
 
-                                                 | FP16 | GI8* | GFP8 | CVI8 | CVFP8 |
--------------------------------------------------+------+------+------+------+-------+
-CUDA training and inference                      |      |      |      |      |       |
-    RegressionKernels.h                          |  X   |      |      |      |       |
-Weight quantization and conversion               |      |      |      |      |       |
-    Quantizer.cu                                 |  X   |  X   |  X   |      |       |
-Serialization                                    |      |      |      |      |       |
-    TextureSet::SaveToStream                     |      |  X   |  X   |      |       |
-Deserialization                                  |      |      |      |      |       |
-    TextureSetMetadata::LoadWeightsFromStream    |      |  X   |  X   |      |       |
-CoopVec layout conversion                        |      |      |      |      |       |
-    TextureSetMetadata::ConvertWeightsForCoopVec |      |  X   |  X   |  X   |   X   |
-    CoopVecWeightConverter.cpp                   |      |  X   |  X   |  X   |   X   |
-GAPI decompression                               |      |      |      |      |       |
-    * DecompressINT8.hlsl                        |      |  X   |      |      |       |
-    * DecompressCoopVecInt8.slang                |      |      |      |  X   |       |
-    * DecompressCoopVecFP8.slang                 |      |      |      |      |   X   |
-GAPI inference                                   |      |      |      |      |       |
-    * Inference.hlsli                            |      |  X   |      |      |       |
-    * InferenceCoopVec.hlsli                     |      |      |      |  X   |   X   |
+                                                 | FP16 | GI8* | GFP8 | CVFP8 |
+-------------------------------------------------+------+------+------+-------+
+CUDA training and inference                      |      |      |      |       |
+    RegressionKernels.h                          |  X   |      |      |       |
+Weight quantization and conversion               |      |      |      |       |
+    Quantizer.cu                                 |  X   |  X   |  X   |       |
+Serialization                                    |      |      |      |       |
+    TextureSet::SaveToStream                     |      |  X   |  X   |       |
+Deserialization                                  |      |      |      |       |
+    TextureSetMetadata::LoadWeightsFromStream    |      |  X   |  X   |       |
+CoopVec layout conversion                        |      |      |      |       |
+    TextureSetMetadata::ConvertWeightsForCoopVec |      |  X   |  X   |   X   |
+    CoopVecWeightConverter.cpp                   |      |  X   |  X   |   X   |
+GAPI decompression                               |      |      |      |       |
+    * DecompressINT8.hlsl                        |      |  X   |      |       |
+    * DecompressCoopVecFP8.slang                 |      |      |      |   X   |
+GAPI inference                                   |      |      |      |       |
+    * Inference.hlsli                            |      |  X   |      |       |
+    * InferenceCoopVec.hlsli                     |      |      |      |   X   |
 
-[*] GI8 = GenericInt8, GFP8 = GenericFP8, CVI8 = CoopVecInt8, CVFP8 = CoopVecFP8
+[*] GI8 = GenericInt8, GFP8 = GenericFP8, CVFP8 = CoopVecFP8
 
 These layout descriptions and names match the InferenceWeightType enum declared in ntc.h
 
@@ -252,29 +245,18 @@ Status TextureSet::LoadFromStreamPostHeader(json::Document const& document, uint
     {
         LatentImageDesc const& latentImage = m_latentImages[neuralLod];
 
-        int const highResWidth = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::HighRes,
-            m_desc.width, neuralLod, latentShape.gridSizeScale);
-        int const highResHeight = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::HighRes,
-            m_desc.height, neuralLod, latentShape.gridSizeScale);
-        int const lowResWidth = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::LowRes,
-            m_desc.width, neuralLod, latentShape.gridSizeScale);
-        int const lowResHeight = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::LowRes,
-            m_desc.height, neuralLod, latentShape.gridSizeScale);
+        int const width = FeatureGridMath::GetGridDimension(m_desc.width, neuralLod, latentShape.gridSizeScale);
+        int const height = FeatureGridMath::GetGridDimension(m_desc.height, neuralLod, latentShape.gridSizeScale);
 
-        if (latentImage.highResWidth != highResWidth || latentImage.highResHeight != highResHeight ||
-            latentImage.lowResWidth != lowResWidth || latentImage.lowResHeight != lowResHeight)
+        if (latentImage.width != width || latentImage.height != height)
         {
-            SetErrorMessage("Neural MIP %d dimensions (%dx%d and %dx%d) don't match "
-                "the expected dimensions (%dx%d and %dx%d)",
+            SetErrorMessage("Neural MIP %d dimensions (%dx%d) don't match "
+                "the expected dimensions (%dx%d)",
                 neuralLod,
-                latentImage.highResWidth,
-                latentImage.highResHeight,
-                latentImage.lowResWidth,
-                latentImage.lowResHeight,
-                highResWidth,
-                highResHeight,
-                lowResWidth,
-                lowResHeight);
+                latentImage.width,
+                latentImage.height,
+                width,
+                height);
             return Status::FileUnrecognized;
         }
     }
@@ -293,12 +275,10 @@ Status TextureSet::LoadFromStreamPostHeader(json::Document const& document, uint
         }
     }
     
-    // Reset m_mlpDesc and m_latentShape so that SetLatentShape doesn't exit right away
-    int const networkVersion = m_mlpDesc->networkVersion;
-    m_mlpDesc = nullptr;
+    // Reset m_latentShape so that SetLatentShape doesn't exit right away
     m_latentShape = LatentShape::Empty();
 
-    status = SetLatentShape(latentShape, networkVersion);
+    status = SetLatentShape(latentShape);
     if (status != Status::Ok)
         return status;
 
@@ -328,28 +308,16 @@ Status TextureSet::LoadFromStreamPostHeader(json::Document const& document, uint
         }
 
         memcpy(m_mlpDataFP8.HostPtr(), m_rowMajorWeightDataFP8.data(), m_rowMajorWeightDataFP8.size());
-
-        m_networkHasFP8Weights = true;
-    }
-    else
-    {
-        m_networkHasFP8Weights = false;
     }
     
-    // Grid (latents) data
-
-    for (int i = 0; i < m_featureGrid.GetNumMipLevels(); ++i)
+    // Latents data
+    for (int neuralLod = 0; neuralLod < m_featureGrid.GetNumMipLevels(); ++neuralLod)
     {
-        json::LatentImage const& latentImage = document.latents[i];
-
-        if (!ReadViewFromStream(inputStream, document, latentImage.highResView,
-            m_featureGrid.GetEncodedLatentsHostPtr(FeatureGrid::Grid::HighRes, i),
-            m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::HighRes, i)))
-            return Status::IOError;
-
-        if (!ReadViewFromStream(inputStream, document, latentImage.lowResView,
-            m_featureGrid.GetEncodedLatentsHostPtr(FeatureGrid::Grid::LowRes, i),
-            m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::LowRes, i)))
+        json::LatentImage const& latentImage = document.latents[neuralLod];
+        
+        if (!ReadViewFromStream(inputStream, document, latentImage.view,
+            m_featureGrid.GetEncodedPixelsHostPtr(neuralLod),
+            m_featureGrid.GetEncodedPixelsSize(neuralLod)))
             return Status::IOError;
     }
 
@@ -360,14 +328,21 @@ Status TextureSet::LoadFromStreamPostHeader(json::Document const& document, uint
     return Status::Ok;
 }
 
-Status TextureSet::SetLatentShape(LatentShape const& newShape, int networkVersion)
+static size_t GetDecompressionLossItemsPerChannel(int width, int height)
+{
+    size_t lossItemsPerChannel = (size_t(width) * size_t(height) + LOCAL_PIXELS - 1) / LOCAL_PIXELS;
+    // Round up to a multiple of 4 to satisfy the alignment requirements in ReduceLoss
+    lossItemsPerChannel = (lossItemsPerChannel + 3) & ~3;
+    return lossItemsPerChannel ;
+}
+
+Status TextureSet::SetLatentShape(LatentShape const& newShape)
 {
     // Early out if we already have the same shape
-    if (m_latentShape == newShape &&
-        ((GetNetworkVersion() == networkVersion) || (networkVersion == NTC_NETWORK_UNKNOWN)))
+    if (m_latentShape == newShape)
         return Status::Ok;
 
-    Status status = ValidateLatentShape(newShape, networkVersion);
+    Status status = ValidateLatentShape(newShape);
     if (status != Status::Ok)
         return status;
         
@@ -394,19 +369,12 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape, int networkVersio
     // Early out if the new shape is empty
     if (newShape.IsEmpty())
     {
-        m_mlpDesc = nullptr;
         ClearErrorMessage();
         return Status::Ok;
     }
 
-    if (networkVersion == NTC_NETWORK_UNKNOWN)
-        m_mlpDesc = MlpDesc::PickOptimalConfig(m_latentShape.highResFeatures, m_latentShape.lowResFeatures);
-    else
-        m_mlpDesc = MlpDesc::FromNetworkVersion(networkVersion);
-
     status = m_featureGrid.Initialize(m_desc.width, m_desc.height, m_desc.mips, m_latentShape.gridSizeScale,
-        m_latentShape.highResFeatures, m_latentShape.lowResFeatures, m_latentShape.highResQuantBits,
-        m_latentShape.lowResQuantBits, m_features.enableCompression);
+        m_latentShape.numFeatures, m_features.enableCompression);
 
     if (status != Status::Ok)
     {
@@ -416,7 +384,8 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape, int networkVersio
     }
     
     // Trainable MLP parameters: weights and bias. No scales at training time, they are added during quantization.
-    m_numNetworkParams = m_mlpDesc->GetWeightCount() + m_mlpDesc->GetLayerOutputCount();
+    MlpDesc const& mlpDesc = MlpDesc::Get();
+    m_numNetworkParams = mlpDesc.GetWeightCount() + mlpDesc.GetLayerOutputCount();
 
     if (!m_mlpWeightsQuantized.Allocate(m_numNetworkParams * 2))
     {
@@ -425,8 +394,8 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape, int networkVersio
         return Status::OutOfMemory;
     }
     
-    WeightLayout const* int8WeightLayout = m_context->GetWeightLayout(m_mlpDesc->networkVersion, InferenceWeightType::GenericInt8);
-    WeightLayout const* fp8WeightLayout = m_context->GetWeightLayout(m_mlpDesc->networkVersion, InferenceWeightType::GenericFP8);
+    WeightLayout const* int8WeightLayout = m_context->GetWeightLayout(InferenceWeightType::GenericInt8);
+    WeightLayout const* fp8WeightLayout = m_context->GetWeightLayout(InferenceWeightType::GenericFP8);
     
     if (!m_mlpDataInt8.Allocate(int8WeightLayout->bufferSize))
     {
@@ -486,7 +455,7 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape, int networkVersio
     }
     
     // Loss for the CUDA decompression pass
-    size_t const lossLength = (size_t(m_desc.width) * size_t(m_desc.height) + LOCAL_PIXELS - 1) / LOCAL_PIXELS * NTC_MAX_CHANNELS;
+    size_t const lossLength = GetDecompressionLossItemsPerChannel(m_desc.width, m_desc.height) * NTC_MAX_CHANNELS;
     requiredLossLength = std::max(requiredLossLength, lossLength);
     
     if (!m_loss.Allocate(requiredLossLength))
@@ -505,30 +474,28 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape, int networkVersio
         return Status::OutOfMemory;
     }
 
+    // Fill the latent image dimension cache
+    m_latentImages.clear();
+    for (int neuralLod = 0; neuralLod < m_featureGrid.GetNumMipLevels(); ++neuralLod)
+    {
+        LatentImageDesc& imageDesc = m_latentImages.emplace_back();
+        imageDesc.width = FeatureGridMath::GetGridDimension(m_desc.width, neuralLod, m_latentShape.gridSizeScale);
+        imageDesc.height = FeatureGridMath::GetGridDimension(m_desc.height, neuralLod, m_latentShape.gridSizeScale);
+    }
+
     // Fill the neural LOD indexing cache
     m_colorMips.fill(ColorMipDesc());
     for (int mipLevel = 0; mipLevel < m_desc.mips; ++mipLevel)
     {
         ColorMipDesc& colorMip = m_colorMips[mipLevel];
         colorMip.neuralLod = m_featureGrid.LodToNeuralLod(mipLevel);
-        FeatureGridMath::GetPositionLodAndScale(colorMip.neuralLod, mipLevel,
-            colorMip.positionLod,
-            colorMip.positionScale);
-    }
 
-    // Fill the latent image dimension cache
-    m_latentImages.clear();
-    for (int neuralLod = 0; neuralLod < m_featureGrid.GetNumMipLevels(); ++neuralLod)
-    {
-        LatentImageDesc& imageDesc = m_latentImages.emplace_back();
-        imageDesc.highResWidth = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::HighRes,
-            m_desc.width, neuralLod, m_latentShape.gridSizeScale);
-        imageDesc.highResHeight = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::HighRes,
-            m_desc.height, neuralLod, m_latentShape.gridSizeScale);
-        imageDesc.lowResWidth = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::LowRes,
-            m_desc.width, neuralLod, m_latentShape.gridSizeScale);
-        imageDesc.lowResHeight = FeatureGridMath::GetGridDimension(FeatureGridMath::Grid::LowRes,
-            m_desc.height, neuralLod, m_latentShape.gridSizeScale);
+        int mipWidth = std::max(1, m_desc.width >> mipLevel);
+        int mipHeight = std::max(1, m_desc.height >> mipLevel);
+        float widthScale = float(m_latentImages[colorMip.neuralLod].width) / float(mipWidth);
+        float heightScale = float(m_latentImages[colorMip.neuralLod].height) / float(mipHeight);
+        colorMip.positionScale = 0.5f * std::max(widthScale, heightScale);
+        colorMip.positionLod = std::max(-1.f, std::min(1.f, 0.25f * log2f(colorMip.positionScale)));
     }
 
     ClearErrorMessage();
@@ -552,12 +519,8 @@ uint64_t TextureSet::GetOutputStreamSize()
     size += m_mlpDataInt8.Size();
     size += m_mlpDataFP8.Size();
 
-    // Grids
-    for (int i = 0; i < m_featureGrid.GetNumMipLevels(); ++i)
-    {
-        size += m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::HighRes, i);
-        size += m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::LowRes, i);
-    }
+    // Latents
+    size += m_featureGrid.GetTotalPixelCount() * m_featureGrid.GetNumLayers() * FeatureGridMath::BytesPerLatentPixel;
 
     size = RoundUp4(size);
     
@@ -598,19 +561,17 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     document.numColorMips = m_desc.mips;
 
     document.latentShape = json::LatentShape(m_allocator);
-    document.latentShape->highResFeatures = m_latentShape.highResFeatures;
-    document.latentShape->lowResFeatures = m_latentShape.lowResFeatures;
-    document.latentShape->highResQuantBits = m_latentShape.highResQuantBits;
-    document.latentShape->lowResQuantBits = m_latentShape.lowResQuantBits;
+    document.latentShape->numFeatures = m_latentShape.numFeatures;
     
     document.mlpVersions.reserve(2);
 
-    // Store the int8 MLP in the legacy descriptor for file compatibility with older code.
-    // Note: When moving it to the mlpVersions vector, increase the mlpVersions.reserve(..) parameter to avoid segfaults.
-    document.mlp = json::MLP(m_allocator);
-    json::MLP& mlpInt8 = *document.mlp;
+    json::MLP& mlpInt8 = document.mlpVersions.emplace_back(m_allocator);
     mlpInt8.activation = json::ActivationType::HGELUClamp;
     mlpInt8.weightLayout = json::MatrixLayout::RowMajor;
+
+    json::MLP& mlpFP8 = document.mlpVersions.emplace_back(m_allocator);
+    mlpFP8.activation = json::ActivationType::HGELUClamp;
+    mlpFP8.weightLayout = json::MatrixLayout::RowMajor;
 
     uint64_t binaryChunkSize = 0;
     auto appendView = [&document, &binaryChunkSize](uint64_t size) {
@@ -622,18 +583,20 @@ Status TextureSet::SaveToStream(IStream* outputStream)
         return viewIndex;
     };
 
-    WeightLayout const* weightLayoutInt8 = m_context->GetWeightLayout(m_mlpDesc->networkVersion, InferenceWeightType::GenericInt8);
+    WeightLayout const* weightLayoutInt8 = m_context->GetWeightLayout(InferenceWeightType::GenericInt8);
     assert(weightLayoutInt8);
 
-    WeightLayout const* weightLayoutFP8 = m_context->GetWeightLayout(m_mlpDesc->networkVersion, InferenceWeightType::GenericFP8);
+    WeightLayout const* weightLayoutFP8 = m_context->GetWeightLayout(InferenceWeightType::GenericFP8);
     assert(weightLayoutFP8);
+
+    MlpDesc const& mlpDesc = MlpDesc::Get();
 
     // Fill out the MLP layers - Int8
     for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
     {
         json::MLPLayer& layer = mlpInt8.layers.emplace_back(m_allocator);
-        layer.inputChannels = m_mlpDesc->GetLayerInputChannels(layerIndex);
-        layer.outputChannels = m_mlpDesc->GetLayerOutputChannels(layerIndex);
+        layer.inputChannels = mlpDesc.GetLayerInputChannels(layerIndex);
+        layer.outputChannels = mlpDesc.GetLayerOutputChannels(layerIndex);
         layer.weightType = json::MlpDataType::Int8;
         layer.scaleType = json::MlpDataType::Float32;
         layer.biasType = json::MlpDataType::Int32;
@@ -642,37 +605,30 @@ Status TextureSet::SaveToStream(IStream* outputStream)
         layer.biasView = appendView(weightLayoutInt8->biases[layerIndex].size);
     }
 
-    json::MLP* mlpFP8 = nullptr;
-    if (m_networkHasFP8Weights)
+    // Fill out the MLP layers - FP8
+    // The MLP versions need to be in separate loops to keep view offsets consistent
+    // with the actual writing order below
+    for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
     {
-        mlpFP8 = &document.mlpVersions.emplace_back(m_allocator);
-        mlpFP8->activation = json::ActivationType::HGELUClamp;
-        mlpFP8->weightLayout = json::MatrixLayout::RowMajor;
+        json::MLPLayer& layer = mlpFP8.layers.emplace_back(m_allocator);
+        layer.inputChannels = mlpDesc.GetLayerInputChannels(layerIndex);
+        layer.outputChannels = mlpDesc.GetLayerOutputChannels(layerIndex);
+        layer.weightView = appendView(weightLayoutFP8->weights[layerIndex].size);
 
-        // Fill out the MLP layers - FP8
-        // The MLP versions need to be in separate loops to keep view offsets consistent with the actual writing order below
-        for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
+        if (layerIndex == NTC_MLP_LAYERS - 1)
         {
-            json::MLPLayer& layer = mlpFP8->layers.emplace_back(m_allocator);
-            layer.inputChannels = m_mlpDesc->GetLayerInputChannels(layerIndex);
-            layer.outputChannels = m_mlpDesc->GetLayerOutputChannels(layerIndex);
-            layer.weightView = appendView(weightLayoutFP8->weights[layerIndex].size);
-
-            if (layerIndex == NTC_MLP_LAYERS - 1)
-            {
-                layer.weightType = json::MlpDataType::Int8;
-                layer.scaleType = json::MlpDataType::Float32;
-                layer.biasType = json::MlpDataType::Int32;
-                layer.scaleView = appendView(weightLayoutFP8->scales[layerIndex].size);
-            }
-            else
-            {
-                layer.weightType = json::MlpDataType::FloatE4M3;
-                layer.biasType = json::MlpDataType::Float16;
-            }
-
-            layer.biasView = appendView(weightLayoutFP8->biases[layerIndex].size);
+            layer.weightType = json::MlpDataType::Int8;
+            layer.scaleType = json::MlpDataType::Float32;
+            layer.biasType = json::MlpDataType::Int32;
+            layer.scaleView = appendView(weightLayoutFP8->scales[layerIndex].size);
         }
+        else
+        {
+            layer.weightType = json::MlpDataType::FloatE4M3;
+            layer.biasType = json::MlpDataType::Float16;
+        }
+
+        layer.biasView = appendView(weightLayoutFP8->biases[layerIndex].size);
     }
 
     // Fill out the textures
@@ -717,14 +673,11 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     {
         LatentImageDesc const& src = m_latentImages[neuralLod];
         json::LatentImage& image = document.latents.emplace_back(m_allocator);
-        image.highResWidth = src.highResWidth;
-        image.highResHeight = src.highResHeight;
-        image.lowResWidth = src.lowResWidth;
-        image.lowResHeight = src.lowResHeight;
-        image.highResBitsPerPixel = m_latentShape.highResFeatures * m_latentShape.highResQuantBits;
-        image.lowResBitsPerPixel = m_latentShape.lowResFeatures * m_latentShape.lowResQuantBits;
-        image.highResView = appendView(m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::HighRes, neuralLod));
-        image.lowResView = appendView(m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::LowRes, neuralLod));
+        image.width = src.width;
+        image.height = src.height;
+        image.arraySize = m_featureGrid.GetNumLayers();
+        size_t const pixelsSize = m_featureGrid.GetEncodedPixelsSize(neuralLod);
+        image.view = appendView(pixelsSize);
     }
 
     // Fill out the color MIP descriptors
@@ -810,12 +763,9 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     if (status != Status::Ok)
         return status;
 
-    if (mlpFP8)
-    {
-        status = writeMlpData(*mlpFP8, m_mlpDataFP8, weightLayoutFP8);
-        if (status != Status::Ok)
-            return status;
-    }
+    status = writeMlpData(mlpFP8, m_mlpDataFP8, weightLayoutFP8);
+    if (status != Status::Ok)
+        return status;
     
     // Write the texture BC data
     for (int textureIndex = 0; textureIndex < int(m_textureInfos.size()); ++textureIndex)
@@ -844,18 +794,14 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     {
         json::LatentImage const& image = document.latents[neuralLod];
         
-        validateOffset(image.highResView);
+        validateOffset(image.view);
 
         if (!outputStream->Write(
-            m_featureGrid.GetEncodedLatentsHostPtr(FeatureGrid::Grid::HighRes, neuralLod),
-            m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::HighRes, neuralLod)))
+            m_featureGrid.GetEncodedPixelsHostPtr(neuralLod),
+            m_featureGrid.GetEncodedPixelsSize(neuralLod)))
             return Status::IOError;
-
-        validateOffset(image.lowResView);
-
-        if (!outputStream->Write(
-            m_featureGrid.GetEncodedLatentsHostPtr(FeatureGrid::Grid::LowRes, neuralLod),
-            m_featureGrid.GetQuantizedLatentsSize(FeatureGrid::Grid::LowRes, neuralLod)))
+            
+        if (!PadStreamTo4Bytes(outputStream))
             return Status::IOError;
     }
 
@@ -1271,7 +1217,7 @@ Status TextureSet::GenerateMips()
 
 Status TextureSet::BeginCompression(const CompressionSettings& settings)
 {
-    if (m_latentShape.IsEmpty() || !m_mlpDesc)
+    if (m_latentShape.IsEmpty())
     {
         SetErrorMessage("Latent shape must not be empty.");
         return Status::InvalidState;
@@ -1308,6 +1254,11 @@ Status TextureSet::BeginCompression(const CompressionSettings& settings)
     Status status = ComputeChannelNormalizationParameters(channelInfos);
     if (status != Status::Ok)
         return status;
+    
+    for (int channel = 0; channel < NTC_MAX_CHANNELS; ++channel)
+    {
+        channelInfos[channel].lossFunctionScale = std::max(0.f, settings.lossFunctionScales[channel]);
+    }
 
     CudaRandomGen cudaRng;
     
@@ -1347,31 +1298,35 @@ Status TextureSet::BeginCompression(const CompressionSettings& settings)
     }
 
     // Fill the layers' data with normal distributed random numbers
-    int w_offset = 0;
+    int weightOffset = 0;
+
+    MlpDesc const& mlpDesc = MlpDesc::Get();
     
     for (int i = 0; i < NTC_MLP_LAYERS; i++)
     {
-        int const inputs = m_mlpDesc->GetLayerInputChannels(i);
-        int const outputs = m_mlpDesc->GetLayerOutputChannels(i);
+        int const inputs = mlpDesc.GetLayerInputChannels(i);
+        int const outputs = mlpDesc.GetLayerOutputChannels(i);
         int const layerWeights = inputs * outputs;
 
         float scale = sqrtf(2.f / float(inputs));
-        cudaRng.FillRandomNormalHalf(m_mlpWeightsBase.DevicePtr() + w_offset, layerWeights, scale, 0.f, -1000.f, 1000.f);
-
-        cudaError_t err = cudaMemcpy(m_mlpWeightsQuantized.DevicePtr(), m_mlpWeightsBase.DevicePtr(),
-            m_mlpWeightsBase.Size(), cudaMemcpyDeviceToDevice);
-        if (err != cudaSuccess)
-        {
-            SetCudaErrorMessage("cudaMemcpy", err);
-            return Status::CudaError;
-        }
+        cudaRng.FillRandomNormalHalf(m_mlpWeightsBase.DevicePtr() + weightOffset,
+            layerWeights, scale, 0.f, -1000.f, 1000.f);
         
-        w_offset += layerWeights;
+        weightOffset += layerWeights;
+    }
+
+    // Copy the random weights to the quantized buffer to be used on the first training step
+    cudaError_t err = cudaMemcpy(m_mlpWeightsQuantized.DevicePtr(), m_mlpWeightsBase.DevicePtr(),
+        m_mlpWeightsBase.Size(), cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess)
+    {
+        SetCudaErrorMessage("cudaMemcpy", err);
+        return Status::CudaError;
     }
 
     // Fill out the mip information array before training
-    MipInfo mipInfos[NTC_MAX_MIPS];
-    float mipPdf[NTC_MAX_MIPS];
+    MipInfo mipInfos[NTC_MAX_MIPS]{};
+    float mipPdf[NTC_MAX_MIPS]{};
     float pdfSum = 0.f;
     int mipWidth = m_desc.width;
     int mipHeight = m_desc.height;
@@ -1382,19 +1337,19 @@ Status TextureSet::BeginCompression(const CompressionSettings& settings)
 
         // Texture and latent data offsets
         mipInfos[mip].referenceTextureOffset = m_textureMipOffsets[mip];
-        mipInfos[mip].latentsOffsetHighRes = m_featureGrid.GetLatentOffset(FeatureGrid::Grid::HighRes, colorMip.neuralLod);
-        mipInfos[mip].latentsOffsetLowRes = m_featureGrid.GetLatentOffset(FeatureGrid::Grid::LowRes, colorMip.neuralLod);
+        mipInfos[mip].highResLatentOffset = m_featureGrid.GetLatentOffset(colorMip.neuralLod);
+        mipInfos[mip].lowResLatentOffset = m_featureGrid.GetLatentOffset(colorMip.neuralLod + 1);
+        mipInfos[mip].highResMaskOffset = m_featureGrid.GetMaskOffset(colorMip.neuralLod);
+        mipInfos[mip].lowResMaskOffset = m_featureGrid.GetMaskOffset(colorMip.neuralLod + 1);
 
         mipInfos[mip].neuralLod = colorMip.neuralLod;
         mipInfos[mip].positionLod = colorMip.positionLod;
         mipInfos[mip].positionScale = colorMip.positionScale;
-        mipInfos[mip].highResGradientMask = m_featureGrid.GetGradientMaskDevicePtr(FeatureGrid::Grid::HighRes, colorMip.neuralLod);
-        mipInfos[mip].lowResGradientMask = m_featureGrid.GetGradientMaskDevicePtr(FeatureGrid::Grid::LowRes, colorMip.neuralLod);
 
-        mipInfos[mip].highResLatentWidth = latentImage.highResWidth;
-        mipInfos[mip].highResLatentHeight = latentImage.highResHeight;
-        mipInfos[mip].lowResLatentWidth = latentImage.lowResWidth;
-        mipInfos[mip].lowResLatentHeight = latentImage.lowResHeight;
+        mipInfos[mip].highResLatentWidth = latentImage.width;
+        mipInfos[mip].highResLatentHeight = latentImage.height;
+        mipInfos[mip].lowResLatentWidth = std::max(latentImage.width >> 1, 1);
+        mipInfos[mip].lowResLatentHeight = std::max(latentImage.height >> 1, 1);
 
         // Calculate the PDF for sampling this particular mip level based on its area,
         // clamp at the lower end to make sure the coarsest mips are sampled at all
@@ -1424,7 +1379,6 @@ Status TextureSet::BeginCompression(const CompressionSettings& settings)
     m_lossScale = 256.f;
 
     m_networkState = TextureSetNetworkState::Initialized;
-    m_networkHasFP8Weights = false;
     
     // Invalidate the weight vectors
     m_rowMajorWeightDataInt8.clear();
@@ -1448,8 +1402,6 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
             "must be Initialized or TrainingInProgress.", NetworkStateToString(m_networkState));
         return Status::InvalidState;
     }
-
-    assert(m_mlpDesc != nullptr); // If it's null, BeginCompression will fail and m_networkState will not be valid here
 
     CudaDeviceGuard cudaGuard(m_context);
     if (!cudaGuard.Success())
@@ -1475,6 +1427,8 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         size_t(m_compressionSettings.kPixelsPerBatch) * c_PixelsPerKPixel);
     bool const stableTraining = m_compressionSettings.stableTraining;
 
+    MlpDesc const& mlpDesc = MlpDesc::Get();
+
     uint32_t validMask = GetValidChannelMask();
     
     for (; m_currentStep < finalStepCount; ++m_currentStep)
@@ -1485,31 +1439,31 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         gridLearningRate = cosine_schedule(m_currentStep, minLearningRate,
             m_compressionSettings.gridLearningRate, m_compressionSettings.trainingSteps);
         
-         // Quantize the MLP to FP8 and start refining it after this percentage of steps -- 1.0f means do not use FP8
-        const float quantizeFP8Ratio = m_compressionSettings.trainFP8Weights ? 0.975f : 1.0f;
-        // Quantize the MLP to Int8 and start refining it after this percentage of steps
-        const float quantizeInt8Ratio = quantizeFP8Ratio - 0.025f;
         // Quantize and stop updating the latents after this percentage of steps
-        const float freezeRatio = quantizeInt8Ratio - 0.025f;
+        const float freezeRatio = 0.95f;
+        // Quantize the MLP to FP8 and start refining it after this percentage of steps
+        const float quantizeFP8Ratio = 0.96f;
+        // Quantize the MLP to Int8 and start refining it after this percentage of steps
+        const float quantizeInt8Ratio = 0.98f;
 
         const int freezeLatentsStep = int(float(m_compressionSettings.trainingSteps) * freezeRatio);
-        const int quantizeInt8Step = int(float(m_compressionSettings.trainingSteps) * quantizeInt8Ratio);
         const int quantizeFP8Step = int(float(m_compressionSettings.trainingSteps) * quantizeFP8Ratio);
-        bool quantizeWeightsInt8 = m_currentStep > quantizeInt8Step && m_currentStep <= quantizeFP8Step;
-        bool quantizeWeightsFP8 = m_currentStep > quantizeFP8Step;
+        const int quantizeInt8Step = int(float(m_compressionSettings.trainingSteps) * quantizeInt8Ratio);
+        bool quantizeWeightsFP8 = m_currentStep > quantizeFP8Step && m_currentStep <= quantizeInt8Step;
+        bool quantizeWeightsInt8 = m_currentStep > quantizeInt8Step;
 
-        // Start updating the FP8 weights with a higher learning rate
-        if (quantizeWeightsFP8)
+        // Start updating the Int8 weights with a higher learning rate
+        if (quantizeWeightsInt8)
         {
-            gridLearningRate = cosine_schedule(m_currentStep - quantizeFP8Step, minLearningRate,
-                m_compressionSettings.gridLearningRate, m_compressionSettings.trainingSteps - quantizeFP8Step);
+            gridLearningRate = cosine_schedule(m_currentStep - quantizeInt8Step, minLearningRate,
+                m_compressionSettings.gridLearningRate, m_compressionSettings.trainingSteps - quantizeInt8Step);
         }
 
-        int const networkWeightOffset = quantizeWeightsFP8 ? m_numNetworkParams : 0;
+        int const networkWeightOffset = quantizeWeightsInt8 ? m_numNetworkParams : 0;
 
-        // Before starting the quantized Int8 MLP refining, save the pre-quantization weights to the second part
-        // of the buffer, to be used later for FP8 refining.
-        if (m_currentStep == quantizeInt8Step)
+        // Before starting the quantized FP8 MLP refining, save the pre-quantization weights to the second part
+        // of the buffer, to be used later for Int8 refining.
+        if (m_currentStep == quantizeFP8Step)
         {
             err = cudaMemcpy(m_mlpWeightsBase.DevicePtr() + m_numNetworkParams,
                 m_mlpWeightsBase.DevicePtr(), m_numNetworkParams * sizeof(half), cudaMemcpyDeviceToDevice);
@@ -1530,7 +1484,7 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         if (quantizeWeightsInt8 || quantizeWeightsFP8)
         {
             cuda::QuantizeNetwork(
-                m_mlpDesc,
+                mlpDesc,
                 m_mlpWeightsQuantized.DevicePtr() + networkWeightOffset,
                 /* outputData = */ nullptr, // We don't need the quantized weights and scales mid-training,
                                             // only for the final output
@@ -1550,32 +1504,31 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         params.numChannels = m_desc.channels;
         params.numMips = m_desc.mips;
         params.numNeuralMips = m_featureGrid.GetNumMipLevels();
-        params.highResFeatures = m_latentShape.highResFeatures;
-        params.lowResFeatures = m_latentShape.lowResFeatures;
+        params.numFeatures = m_latentShape.numFeatures;
+        params.latentStride = m_featureGrid.GetLatentStride();
         params.maskChannelIndex = m_maskChannelIndex;
         params.discardMaskedOutPixels = m_discardMaskedOutPixels;
-        params.useFP8Quantization = quantizeWeightsFP8;
+        params.useFP8Quantization = !quantizeWeightsInt8;
         params.validChannelMask = validMask;
         params.randomSeed = intDistribution(m_rng);
         params.lossScale = m_lossScale;
         params.experimentalKnob = m_experimentalKnob;
         params.referenceImage = m_textureData.DevicePtr();
-        params.latents = m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::HighRes, 0);
+        params.latents = m_featureGrid.GetQuantizedLatentsDevicePtr(0);
         params.networkWeights = m_mlpWeightsQuantized.DevicePtr() + networkWeightOffset;
-        params.latentGradients = stableTraining
-                ? (void*)m_featureGrid.GetGradientsDevicePtr<float>(FeatureGrid::Grid::HighRes, 0)
-                : (void*)m_featureGrid.GetGradientsDevicePtr<half>(FeatureGrid::Grid::HighRes, 0);
+        params.latentGradients = m_featureGrid.GetGradientsDevicePtr();
         params.networkGradients = m_weightGradients.DevicePtr();
         params.loss = calculateLoss ? m_loss.DevicePtr() : nullptr;
+        params.gradientMask = m_featureGrid.GetGradientMaskDevicePtr();
 
         // Forward + backprop
-        cuda::Regression(pixelsPerBatch, stableTraining, *m_mlpDesc, params);
+        cuda::Regression(pixelsPerBatch, stableTraining, params);
 
         if (stableTraining)
         {
             size_t const sliceSize = TILE_SIZE_X * TB_SIZE_Y;
             size_t gradientSlices = (pixelsPerBatch + sliceSize - 1) / sliceSize;
-            int numNetworkParams = m_mlpDesc->GetWeightCount() + m_mlpDesc->GetLayerOutputCount();
+            int numNetworkParams = mlpDesc.GetWeightCount() + mlpDesc.GetLayerOutputCount();
 
             cuda::ReduceNetworkGrad(
                 numNetworkParams,
@@ -1602,59 +1555,29 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         if (m_currentStep == freezeLatentsStep)
         {
             cuda::FreezeQuantization(
-                m_featureGrid.GetLatentCount(FeatureGrid::Grid::HighRes),
-                m_latentShape.highResQuantBits,
-                m_featureGrid.GetBaseLatentsDevicePtr(FeatureGrid::Grid::HighRes, 0),
-                m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::HighRes, 0)
-            );
-
-            cuda::FreezeQuantization(
-                m_featureGrid.GetLatentCount(FeatureGrid::Grid::LowRes),
-                m_latentShape.lowResQuantBits,
-                m_featureGrid.GetBaseLatentsDevicePtr(FeatureGrid::Grid::LowRes, 0),
-                m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::LowRes, 0)
+                m_featureGrid.GetTotalPixelCount(),
+                m_latentShape.numFeatures,
+                m_featureGrid.GetBaseLatentsDevicePtr(0),
+                m_featureGrid.GetQuantizedLatentsDevicePtr(0)
             );
         }
         else if (m_currentStep < freezeLatentsStep)
         {
-            for (int neuralLod = 0; neuralLod < m_featureGrid.GetNumMipLevels(); ++neuralLod)
-            {
-                cuda::OptimizeLatentGrid(
-                    m_featureGrid.GetLatentCount(FeatureGrid::Grid::HighRes, neuralLod),
-                    m_latentShape.highResFeatures,
-                    m_latentShape.highResQuantBits,
-                    /* useFloatGradients = */ stableTraining,
-                    m_featureGrid.GetBaseLatentsDevicePtr(FeatureGrid::Grid::HighRes, neuralLod),
-                    m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::HighRes, neuralLod),
-                    stableTraining
-                        ? (void*)m_featureGrid.GetGradientsDevicePtr<float>(FeatureGrid::Grid::HighRes, neuralLod)
-                        : (void*)m_featureGrid.GetGradientsDevicePtr<half>(FeatureGrid::Grid::HighRes, neuralLod),
-                    m_featureGrid.GetMoment1DevicePtr(FeatureGrid::Grid::HighRes, neuralLod),
-                    m_featureGrid.GetMoment2DevicePtr(FeatureGrid::Grid::HighRes, neuralLod),
-                    m_featureGrid.GetGradientMaskDevicePtr(FeatureGrid::Grid::HighRes, neuralLod),
-                    m_lossScale,
-                    float(m_currentStep),
-                    intDistribution(m_rng),
-                    gridLearningRate);
-
-                cuda::OptimizeLatentGrid(
-                    m_featureGrid.GetLatentCount(FeatureGrid::Grid::LowRes, neuralLod),
-                    m_latentShape.lowResFeatures,
-                    m_latentShape.lowResQuantBits,
-                    /* useFloatGradients = */ stableTraining,
-                    m_featureGrid.GetBaseLatentsDevicePtr(FeatureGrid::Grid::LowRes, neuralLod),
-                    m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::LowRes, neuralLod),
-                    stableTraining 
-                        ? (void*)m_featureGrid.GetGradientsDevicePtr<float>(FeatureGrid::Grid::LowRes, neuralLod)
-                        : (void*)m_featureGrid.GetGradientsDevicePtr<half>(FeatureGrid::Grid::LowRes, neuralLod),
-                    m_featureGrid.GetMoment1DevicePtr(FeatureGrid::Grid::LowRes, neuralLod),
-                    m_featureGrid.GetMoment2DevicePtr(FeatureGrid::Grid::LowRes, neuralLod),
-                    m_featureGrid.GetGradientMaskDevicePtr(FeatureGrid::Grid::LowRes, neuralLod),
-                    m_lossScale,
-                    float(m_currentStep),
-                    intDistribution(m_rng),
-                    gridLearningRate);
-            }
+            cuda::OptimizeLatentGrid(
+                m_featureGrid.GetTotalPixelCount(),
+                m_latentShape.numFeatures,
+                m_featureGrid.GetLatentStride(),
+                /* useFloatGradients = */ stableTraining,
+                m_featureGrid.GetBaseLatentsDevicePtr(0),
+                m_featureGrid.GetQuantizedLatentsDevicePtr(0),
+                m_featureGrid.GetGradientsDevicePtr(),
+                m_featureGrid.GetMoment1DevicePtr(),
+                m_featureGrid.GetMoment2DevicePtr(),
+                m_featureGrid.GetGradientMaskDevicePtr(),
+                m_lossScale,
+                float(m_currentStep),
+                intDistribution(m_rng),
+                gridLearningRate);
         }
     }
 
@@ -1742,51 +1665,40 @@ Status TextureSet::FinalizeCompression()
         assert(i < m_latentImages.size());
         LatentImageDesc const& latentImage = m_latentImages[i];
 
-        cuda::QuantizeAndPackLatents(
-            latentImage.highResWidth,
-            latentImage.highResHeight,
-            m_latentShape.highResFeatures,
-            m_latentShape.highResQuantBits,
-            m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::HighRes, i),
-            m_featureGrid.GetEncodedLatentsDevicePtr(FeatureGrid::Grid::HighRes, i));
-
-        cuda::QuantizeAndPackLatents(
-            latentImage.lowResWidth,
-            latentImage.lowResHeight,
-            m_latentShape.lowResFeatures,
-            m_latentShape.lowResQuantBits,
-            m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::LowRes, i),
-            m_featureGrid.GetEncodedLatentsDevicePtr(FeatureGrid::Grid::LowRes, i));
+        cuda::PackLatents(
+            latentImage.width,
+            latentImage.height,
+            m_featureGrid.GetNumLayers(),
+            m_featureGrid.GetLatentStride(),
+            m_featureGrid.GetQuantizedLatentsDevicePtr(i),
+            m_featureGrid.GetEncodedPixelsDevicePtr(i));
     }
 
     // Download the encoded latents from device
-    cudaError_t err = m_featureGrid.GetEncodedLatentsArray().CopyToHost();
+    cudaError_t err = m_featureGrid.GetEncodedPixelsArray().CopyToHost();
     if (err != cudaSuccess)
     {
         SetCudaErrorMessage("cudaMemcpy (QuantizedLatents)", err);
         return Status::CudaError;
     }
 
-    // Quantize and compute int8 weights, scale and bias values
+    MlpDesc const& mlpDesc = MlpDesc::Get();
+
+    // Quantize and compute FP8 weights, scale and bias values
     cuda::QuantizeNetwork(
-        m_mlpDesc,
+        mlpDesc,
         m_mlpWeightsQuantized.DevicePtr(),
+        (int8_t*)m_mlpDataFP8.DevicePtr(),
+        /* useFP8 = */ true
+    );
+
+    // Quantize and compute Int8 weights, scale and bias values
+    cuda::QuantizeNetwork(
+        mlpDesc,
+        m_mlpWeightsQuantized.DevicePtr() + m_numNetworkParams,
         (int8_t*)m_mlpDataInt8.DevicePtr(),
         /* useFP8 = */ false
     );
-
-    if (m_compressionSettings.trainFP8Weights)
-    {
-        // Quantize and compute FP8 weights, scale and bias values
-        cuda::QuantizeNetwork(
-            m_mlpDesc,
-            m_mlpWeightsQuantized.DevicePtr() + m_numNetworkParams,
-            (int8_t*)m_mlpDataFP8.DevicePtr(),
-            /* useFP8 = */ true
-        );
-
-        m_networkHasFP8Weights = true;
-    }
 
     // Download the MLP data from device
     err = m_mlpDataInt8.CopyToHost();
@@ -1798,16 +1710,13 @@ Status TextureSet::FinalizeCompression()
         return Status::CudaError;
     }
 
-    // Copy the Int8 data into the m_rowMajorWeightDataInt8 vector for possible GAPI inference and support queries
+    // Copy the FP8 data into the m_rowMajorWeightDataFP8 vector for possible GAPI inference and support queries
+    m_rowMajorWeightDataFP8.resize(m_mlpDataFP8.Size());
+    memcpy(m_rowMajorWeightDataFP8.data(), m_mlpDataFP8.HostPtr(), m_mlpDataFP8.Size());
+
+    // Copy the Int8 data into the m_rowMajorWeightDataInt8 vector, same reason
     m_rowMajorWeightDataInt8.resize(m_mlpDataInt8.Size());
     memcpy(m_rowMajorWeightDataInt8.data(), m_mlpDataInt8.HostPtr(), m_mlpDataInt8.Size());
-
-    if (m_compressionSettings.trainFP8Weights)
-    {
-        // Copy the FP8 data into the m_rowMajorWeightDataFP8 vector, same reason
-        m_rowMajorWeightDataFP8.resize(m_mlpDataFP8.Size());
-        memcpy(m_rowMajorWeightDataFP8.data(), m_mlpDataFP8.HostPtr(), m_mlpDataFP8.Size());
-    }
 
     m_networkState = TextureSetNetworkState::Complete;
 
@@ -1820,7 +1729,7 @@ void TextureSet::AbortCompression()
     m_networkState = TextureSetNetworkState::Empty;
 }
 
-Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useFP8Weights)
+Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useInt8Weights)
 {
     if (m_networkState != TextureSetNetworkState::TrainingInProgress &&
         m_networkState != TextureSetNetworkState::TrainingFinished &&
@@ -1831,17 +1740,11 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useFP8Weights)
         return Status::InvalidState;
     }
 
-    if (useFP8Weights)
+    if (useInt8Weights)
     {
         if (m_networkState == TextureSetNetworkState::TrainingInProgress)
         {
-            SetErrorMessage("In-progress decompression with FP8 weights is not supported.");
-            return Status::InvalidState;
-        }
-
-        if (!m_networkHasFP8Weights)
-        {
-            SetErrorMessage("Decompression with FP8 weights is not supported because there are no such weights.");
+            SetErrorMessage("In-progress decompression with Int8 weights is not supported.");
             return Status::InvalidState;
         }
     }
@@ -1853,11 +1756,13 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useFP8Weights)
     if (!cudaGuard.Success())
         return Status::CudaError;
         
+    MlpDesc const& mlpDesc = MlpDesc::Get();
+
     if (m_networkState != TextureSetNetworkState::TrainingInProgress &&
         m_networkState != TextureSetNetworkState::TrainingFinished)
     {
         // Upload the encoded latents to device
-        cudaError_t err = m_featureGrid.GetEncodedLatentsArray().CopyToDevice();
+        cudaError_t err = m_featureGrid.GetEncodedPixelsArray().CopyToDevice();
         if (err != cudaSuccess)
         {
             SetCudaErrorMessage("cudaMemcpy (QuantizedLatents)", err);
@@ -1869,21 +1774,13 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useFP8Weights)
         {
             LatentImageDesc const& latentImage = m_latentImages[i];
 
-            cuda::UnpackQuantizedLatents(
-                latentImage.highResWidth,
-                latentImage.highResHeight,
-                m_latentShape.highResFeatures,
-                m_latentShape.highResQuantBits,
-                m_featureGrid.GetEncodedLatentsDevicePtr(FeatureGrid::Grid::HighRes, i),
-                m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::HighRes, i));
-
-            cuda::UnpackQuantizedLatents(
-                latentImage.lowResWidth,
-                latentImage.lowResHeight,
-                m_latentShape.lowResFeatures,
-                m_latentShape.lowResQuantBits,
-                m_featureGrid.GetEncodedLatentsDevicePtr(FeatureGrid::Grid::LowRes, i),
-                m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::LowRes, i));
+            cuda::UnpackLatents(
+                latentImage.width,
+                latentImage.height,
+                m_featureGrid.GetNumLayers(),
+                m_featureGrid.GetLatentStride(),
+                m_featureGrid.GetEncodedPixelsDevicePtr(i),
+                m_featureGrid.GetQuantizedLatentsDevicePtr(i));
         }
 
         // Upload the MLP weights to device
@@ -1904,22 +1801,23 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useFP8Weights)
         // Clear the FP16 weight buffer, mostly for debugging - to avoid using stale values
         cudaMemset(m_mlpWeightsQuantized.DevicePtr(), 0, m_mlpWeightsQuantized.Size());
 
-        // Convert the Int8 weights to FP16 in the MMA layout for CUDA decompression to work
+        // Convert the FP8 weights to FP16 in the MMA layout for CUDA decompression to work
         cuda::ConvertNetworkFromQuantizedToFp16(
-            m_mlpDesc,
+            mlpDesc,
             m_mlpWeightsQuantized.DevicePtr(),
+            (int8_t*)m_mlpDataFP8.DevicePtr(),
+            /* useFP8 = */ true
+        );
+
+        // Convert the Int8 weights to FP16 into the second page of the FP16 MLP data,
+        // in case we want to decompress using those for validation
+        cuda::ConvertNetworkFromQuantizedToFp16(
+            mlpDesc,
+            m_mlpWeightsQuantized.DevicePtr() + m_numNetworkParams,
             (int8_t*)m_mlpDataInt8.DevicePtr(),
             /* useFP8 = */ false
         );
 
-        // Convert the FP8 weights to FP16 into the second page of the FP16 MLP data,
-        // in case we want to decompress using those for validation
-        cuda::ConvertNetworkFromQuantizedToFp16(
-            m_mlpDesc,
-            m_mlpWeightsQuantized.DevicePtr() + m_numNetworkParams,
-            (int8_t*)m_mlpDataFP8.DevicePtr(),
-            /* useFP8 = */ true
-        );
     }
     
     uint32_t validMask = GetValidChannelMask();
@@ -1952,10 +1850,8 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useFP8Weights)
 
         int colorMipWidth = std::max(m_desc.width >> mipLevel, 1);
         int colorMipHeight = std::max(m_desc.height >> mipLevel, 1);
-        int lossItemsPerChannel = (colorMipWidth * colorMipHeight + LOCAL_PIXELS - 1) / LOCAL_PIXELS;
-        // Round up to a multiple of 4 to satisfy the alignment requirements in ReduceLoss
-        lossItemsPerChannel = (lossItemsPerChannel + 3) & ~3;
-        int lossLength = lossItemsPerChannel * NTC_MAX_CHANNELS;
+        size_t const lossItemsPerChannel = GetDecompressionLossItemsPerChannel(colorMipWidth, colorMipHeight);
+        size_t const lossLength = lossItemsPerChannel * NTC_MAX_CHANNELS;
         
         ColorMipDesc const& colorMip = m_colorMips[mipLevel];
 
@@ -1977,26 +1873,26 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useFP8Weights)
         params.numChannels = m_desc.channels;
         params.maskChannelIndex = m_maskChannelIndex;
         params.discardMaskedOutPixels = m_discardMaskedOutPixels;
-        params.useFP8Quantization = useFP8Weights;
+        params.useFP8Quantization = !useInt8Weights;
         params.validChannelMask = validMask;
-        params.highResLatentWidth = latentImage.highResWidth;
-        params.highResLatentHeight = latentImage.highResHeight;
-        params.lowResLatentWidth = latentImage.lowResWidth;
-        params.lowResLatentHeight = latentImage.lowResHeight;
-        params.highResFeatures = m_latentShape.highResFeatures;
-        params.lowResFeatures = m_latentShape.lowResFeatures;
+        params.highResLatentWidth = latentImage.width;
+        params.highResLatentHeight = latentImage.height;
+        params.lowResLatentWidth = std::max(latentImage.width >> 1, 1);
+        params.lowResLatentHeight = std::max(latentImage.height >> 1, 1);
+        params.numFeatures = m_latentShape.numFeatures;
+        params.latentStride = m_featureGrid.GetLatentStride();
         params.positionScale = colorMip.positionScale;
         params.positionLod = colorMip.positionLod;
         params.lossItemsPerChannel = lossItemsPerChannel;
         params.experimentalKnob = m_experimentalKnob;
-        params.highResLatents = m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::HighRes, neuralLod);
-        params.lowResLatents = m_featureGrid.GetQuantizedLatentsDevicePtr(FeatureGrid::Grid::LowRes, neuralLod);
-        params.mlpWeights = m_mlpWeightsQuantized.DevicePtr() + (useFP8Weights ? m_numNetworkParams : 0);
+        params.highResLatents = m_featureGrid.GetQuantizedLatentsDevicePtr(neuralLod);
+        params.lowResLatents = m_featureGrid.GetQuantizedLatentsDevicePtr(neuralLod + 1);
+        params.mlpWeights = m_mlpWeightsQuantized.DevicePtr() + (useInt8Weights ? m_numNetworkParams : 0);
         params.referenceImage = m_textureData.DevicePtr() + textureDataOffset;
         params.outputImage = textureDataOut + textureDataOffset;
         params.outputLoss = m_loss.DevicePtr();
 
-        cuda::Inference(*m_mlpDesc, params);
+        cuda::Inference(params);
 
         if (validChannels > 0)
         {

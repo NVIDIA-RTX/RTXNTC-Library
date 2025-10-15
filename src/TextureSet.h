@@ -55,7 +55,7 @@ public:
     Status LoadFromStreamPostHeader(json::Document const& document, uint64_t binaryChunkOffset,
         uint64_t binaryChunkSize, IStream* inputStream, LatentShape latentShape);
 
-    Status SetLatentShape(LatentShape const& newShape, int networkVersion) override;
+    Status SetLatentShape(LatentShape const& newShape) override;
 
     uint64_t GetOutputStreamSize() override;
 
@@ -89,7 +89,7 @@ public:
 
     void AbortCompression() override;
 
-    Status Decompress(DecompressionStats* pOutStats, bool useFP8Weights) override;
+    Status Decompress(DecompressionStats* pOutStats, bool useInt8Weights) override;
 
     Status SetMaskChannelIndex(int index, bool discardMaskedOutPixels) override;
 
@@ -130,8 +130,7 @@ private:
     std::mt19937 m_rng;
 
     TextureSetNetworkState m_networkState = TextureSetNetworkState::Empty;
-    bool m_networkHasFP8Weights = false;
-
+    
     Status ValidateReadWriteChannelsArgs(int mipLevel, int firstChannel, int numChannels, int width, int height,
         size_t pixelStride, size_t rowPitch, size_t sizeToCopy, ChannelFormat format);
 

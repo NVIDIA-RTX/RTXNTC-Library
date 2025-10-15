@@ -289,27 +289,6 @@ const char* ColorSpaceToString(ColorSpace colorSpace)
     }
 }
 
-const char* NetworkVersionToString(int networkVersion)
-{
-    switch(networkVersion)
-    {
-    case NTC_NETWORK_UNKNOWN:
-        return "NTC_NETWORK_UNKNOWN";
-    case NTC_NETWORK_SMALL:
-        return "NTC_NETWORK_SMALL";
-    case NTC_NETWORK_MEDIUM:
-        return "NTC_NETWORK_MEDIUM";
-    case NTC_NETWORK_LARGE:
-        return "NTC_NETWORK_LARGE";
-    case NTC_NETWORK_XLARGE:
-        return "NTC_NETWORK_XLARGE";
-    default:
-        static char string[16];
-        snprintf(string, sizeof(string), "%d", int(networkVersion));
-        return string;
-    }
-}
-
 const char* InferenceWeightTypeToString(InferenceWeightType weightType)
 {
     switch(weightType)
@@ -320,8 +299,6 @@ const char* InferenceWeightTypeToString(InferenceWeightType weightType)
         return "GenericInt8";
     case InferenceWeightType::GenericFP8:
         return "GenericFP8";
-    case InferenceWeightType::CoopVecInt8:
-        return "CoopVecInt8";
     case InferenceWeightType::CoopVecFP8:
         return "CoopVecFP8";
     default:
@@ -363,7 +340,7 @@ Status EstimateCompressedTextureSetSize(TextureSetDesc const& textureSetDesc,
     if (status != Status::Ok)
         return status;
 
-    status = TextureSetMetadata::ValidateLatentShape(latentShape, NTC_NETWORK_UNKNOWN);
+    status = TextureSetMetadata::ValidateLatentShape(latentShape);
     if (status != Status::Ok)
         return status;
 
@@ -372,17 +349,12 @@ Status EstimateCompressedTextureSetSize(TextureSetDesc const& textureSetDesc,
         textureSetDesc.height,
         textureSetDesc.mips,
         latentShape.gridSizeScale,
-        latentShape.highResFeatures,
-        latentShape.lowResFeatures,
-        latentShape.highResQuantBits,
-        latentShape.lowResQuantBits);
+        latentShape.numFeatures);
 
-    MlpDesc const* mlpDesc = MlpDesc::PickOptimalConfig(latentShape.highResFeatures, latentShape.lowResFeatures);
-    if (!mlpDesc)
-        return Status::InvalidArgument;
+    MlpDesc const& mlpDesc = MlpDesc::Get();
 
     // Int8 per weight, 2x float per output (scale and bias)
-    size_t const mlpSize = mlpDesc->GetWeightCount() + mlpDesc->GetLayerOutputCount() * 2 * sizeof(float);
+    size_t const mlpSize = mlpDesc.GetWeightCount() + mlpDesc.GetLayerOutputCount() * 2 * sizeof(float);
 
     outSize = latentSize + mlpSize;
 
@@ -390,70 +362,39 @@ Status EstimateCompressedTextureSetSize(TextureSetDesc const& textureSetDesc,
 }
 
 // The table of statistically best latent shapes for a set of BPP values.
-// Larger network versions support more latent shapes for each BPP configuraion, so a better choice can be made.
-// Generated using 'tools/find_optimal_configs.py'
 KnownLatentShape const g_KnownLatentShapes[KnownLatentShapeCount] = {
-    //  bpp         small network        medium network       large network        xlarge network
-    //         scale hrf lrf hrq lrq
-    {  0.500f, { { 4,  4,  4, 1, 4 }, { 4,  4,  4, 1, 4 }, { 4,  4,  4, 1, 4 }, { 4,  4,  4, 1, 4 } } },
-    {  0.625f, { { 4,  4, 12, 1, 2 }, { 4,  4, 12, 1, 2 }, { 4,  4, 12, 1, 2 }, { 4,  4, 12, 1, 2 } } },
-    {  0.750f, { { 4,  4,  8, 1, 4 }, { 4,  4,  8, 1, 4 }, { 4,  4,  8, 1, 4 }, { 4,  4,  8, 1, 4 } } },
-    {  0.875f, { { 4,  4, 12, 2, 2 }, { 4,  4, 12, 2, 2 }, { 4,  4, 12, 2, 2 }, { 4,  4, 12, 2, 2 } } },
-    {  1.000f, { { 4,  4,  8, 2, 4 }, { 4,  4,  8, 2, 4 }, { 4,  4,  8, 2, 4 }, { 4,  4,  8, 2, 4 } } },
-    {  1.250f, { { 4,  4, 12, 2, 4 }, { 4,  4, 12, 2, 4 }, { 4,  4, 12, 2, 4 }, { 4,  4, 12, 2, 4 } } },
-    {  1.500f, { { 4,  4, 16, 2, 4 }, { 4,  4, 16, 2, 4 }, { 4,  4, 16, 2, 4 }, { 4,  4, 16, 2, 4 } } },
-    {  1.750f, { { 4,  4, 12, 4, 4 }, { 4,  8, 12, 2, 4 }, { 4,  8, 12, 2, 4 }, { 4,  8, 12, 2, 4 } } },
-    {  2.000f, { { 4,  4, 16, 4, 4 }, { 4,  8, 16, 2, 4 }, { 4,  8, 16, 2, 4 }, { 4,  8, 16, 2, 4 } } },
-    {  2.250f, { { 4,  4, 16, 1, 8 }, { 4,  8,  4, 4, 4 }, { 4, 12, 12, 2, 4 }, { 4, 12, 12, 2, 4 } } },
-    {  2.500f, { { 4,  4, 12, 4, 8 }, { 4,  8,  8, 4, 4 }, { 4, 12, 16, 2, 4 }, { 4, 12, 16, 2, 4 } } },
-    {  3.000f, { { 2,  4,  8, 1, 4 }, { 4,  8, 16, 4, 4 }, { 4,  8, 16, 4, 4 }, { 4, 16, 16, 2, 4 } } },
-    {  3.500f, { { 2,  4, 12, 2, 2 }, { 4,  8, 12, 4, 8 }, { 4, 12,  8, 4, 4 }, { 4, 12,  8, 4, 4 } } },
-    {  4.000f, { { 2,  4,  8, 2, 4 }, { 2,  4,  8, 2, 4 }, { 4, 12, 16, 4, 4 }, { 4, 12, 16, 4, 4 } } },
-    {  4.500f, { { 2,  4,  4, 4, 2 }, { 2,  4,  4, 4, 2 }, { 4, 12, 12, 4, 8 }, { 4, 16,  8, 4, 4 } } },
-    {  5.000f, { { 2,  4, 12, 2, 4 }, { 2,  4, 12, 2, 4 }, { 2,  4, 12, 2, 4 }, { 4, 16, 16, 4, 4 } } },
-    {  6.000f, { { 2,  4, 16, 2, 4 }, { 2,  8,  8, 2, 4 }, { 2,  8,  8, 2, 4 }, { 2,  8,  8, 2, 4 } } },
-    {  7.000f, { { 2,  4, 12, 4, 4 }, { 2,  4, 12, 4, 4 }, { 2,  4, 12, 4, 4 }, { 2,  4, 12, 4, 4 } } },
-    {  8.000f, { { 2,  4, 16, 4, 4 }, { 2,  8, 16, 2, 4 }, { 2,  8, 16, 2, 4 }, { 2,  8, 16, 2, 4 } } },
-    {  9.000f, { { 2,  4, 16, 1, 8 }, { 2,  8,  4, 4, 4 }, { 2, 12, 12, 2, 4 }, { 2, 12, 12, 2, 4 } } },
-    { 10.000f, { { 2,  4, 12, 4, 8 }, { 2,  8,  8, 4, 4 }, { 2, 12, 16, 2, 4 }, { 2, 12, 16, 2, 4 } } },
-    { 12.000f, { { 2,  4, 16, 4, 8 }, { 2,  8, 16, 4, 4 }, { 2,  8, 16, 4, 4 }, { 2,  8, 16, 4, 4 } } },
-    { 14.000f, { { 2,  4, 12, 8, 8 }, { 2,  8, 12, 4, 8 }, { 2, 12,  4, 4, 8 }, { 2, 12,  4, 4, 8 } } },
-    { 16.000f, { { 2,  4, 16, 8, 8 }, { 2,  8, 16, 4, 8 }, { 2, 12, 16, 4, 4 }, { 2, 12, 16, 4, 4 } } },
-    { 18.000f, { { 0,  0,  0, 0, 0 }, { 2,  8,  8, 8, 4 }, { 2, 12, 12, 4, 8 }, { 2, 16,  4, 4, 8 } } },
-    { 20.000f, { { 0,  0,  0, 0, 0 }, { 2,  8, 16, 8, 4 }, { 2, 12, 16, 4, 8 }, { 2, 16,  8, 4, 8 } } },
+    {  1.11f, { 6, 8 } },
+    {  1.67f, { 6, 12 } },
+    {  2.50f, { 4, 8 } },
+    {  3.75f, { 4, 12 } },
+    {  5.00f, { 4, 16 } },
+    {  6.67f, { 3, 12 } },
+    {  10.0f, { 2, 8 } },
+    {  15.0f, { 2, 12 } },
+    {  20.0f, { 2, 16 } }
 };
 
-int GetKnownLatentShapeCount(int networkVersion)
+int GetKnownLatentShapeCount()
 {
-    if (networkVersion == NTC_NETWORK_UNKNOWN)
-        networkVersion = NTC_NETWORK_XLARGE;
-
-    if (networkVersion < NTC_NETWORK_SMALL || networkVersion > NTC_NETWORK_XLARGE)
-        return 0;
-
-    // See g_KnownLatentShapes - the small network doesn't support the 2 highest bpp values
-    if (networkVersion == NTC_NETWORK_SMALL)
-        return KnownLatentShapeCount - 2;
-
     return KnownLatentShapeCount;
 }
 
-Status EnumerateKnownLatentShapes(int index, int networkVersion, float& outBitsPerPixel, LatentShape& outShape)
+Status EnumerateKnownLatentShapes(int index, float& outBitsPerPixel, LatentShape& outShape)
 {
     ClearErrorMessage();
 
-    if (index < 0 || index >= GetKnownLatentShapeCount(networkVersion))
+    if (index < 0 || index >= KnownLatentShapeCount)
     {
-        SetErrorMessage("Invalid index (%d), must be 0-%d.", index, GetKnownLatentShapeCount(networkVersion) - 1);
+        SetErrorMessage("Invalid index (%d), must be 0-%d.", index, KnownLatentShapeCount - 1);
         return Status::OutOfRange;
     }
 
     outBitsPerPixel = g_KnownLatentShapes[index].bitsPerPixel;
-    outShape = g_KnownLatentShapes[index].shapes[networkVersion - NTC_NETWORK_SMALL];
+    outShape = g_KnownLatentShapes[index].shape;
     return Status::Ok;
 }
 
-Status PickLatentShape(float requestedBitsPerPixel, int networkVersion, float& outBitsPerPixel, LatentShape& outShape)
+Status PickLatentShape(float requestedBitsPerPixel, float& outBitsPerPixel, LatentShape& outShape)
 {
     ClearErrorMessage();
 
@@ -462,20 +403,10 @@ Status PickLatentShape(float requestedBitsPerPixel, int networkVersion, float& o
         SetErrorMessage("requestedBitsPerPixel (%f) must be positive.", requestedBitsPerPixel);
         return Status::OutOfRange;
     }
-     
-    if (networkVersion == NTC_NETWORK_UNKNOWN)
-        networkVersion = NTC_NETWORK_XLARGE;
-
-    int const presetCount = GetKnownLatentShapeCount(networkVersion);
-    if (presetCount == 0)
-    {
-        SetErrorMessage("Invalid networkVersion (%d).", networkVersion);
-        return Status::OutOfRange;
-    }
-
+    
     bool found = false;
     float currentDiff = std::numeric_limits<float>::max();
-    for (int index = 0; index < presetCount; ++index)
+    for (int index = 0; index < KnownLatentShapeCount; ++index)
     {
         KnownLatentShape const& shape = g_KnownLatentShapes[index];
         float const diff = fabsf(shape.bitsPerPixel - requestedBitsPerPixel);
@@ -486,7 +417,7 @@ Status PickLatentShape(float requestedBitsPerPixel, int networkVersion, float& o
                 found = true;
                 currentDiff = diff;
                 outBitsPerPixel = shape.bitsPerPixel;
-                outShape = shape.shapes[networkVersion - NTC_NETWORK_SMALL];
+                outShape = shape.shape;
             }
         }
         else if (found)
@@ -507,8 +438,11 @@ Status PickLatentShape(float requestedBitsPerPixel, int networkVersion, float& o
 
 float GetLatentShapeBitsPerPixel(LatentShape const& shape)
 {
-    return (float(shape.highResFeatures * shape.highResQuantBits) + float(shape.lowResFeatures * shape.lowResQuantBits) * 0.25f)
-        / float(shape.gridSizeScale * shape.gridSizeScale);
+    int const numLayers = FeatureGridMath::GetNumLayers(shape.numFeatures);
+    
+    // We use 2 adjacent mip levels of the latent texture together, so the effective rate
+    // is calculated as (BytesPerLatentPixel * 8 bits per byte) * 1.25 = BytesPerLatentPixel * 10
+    return float(numLayers) / float(shape.gridSizeScale * shape.gridSizeScale) * float(FeatureGridMath::BytesPerLatentPixel) * 10.f;
 }
 
 double DecodeImageDifferenceResult(uint64_t value)

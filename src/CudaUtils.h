@@ -45,6 +45,19 @@ inline __device__ float frac(float x)
     return x - floorf(x);
 }
 
+inline __device__ __host__ uint32_t DivRoundUp(size_t i, uint32_t multiple)
+{
+    return uint32_t((i + (multiple - 1)) / multiple);
+}
+
+inline __device__ __host__ dim3 DivRoundUp(dim3 i, dim3 multiple)
+{
+    return dim3(
+        DivRoundUp(i.x, multiple.x),
+        DivRoundUp(i.y, multiple.y),
+        DivRoundUp(i.z, multiple.z));
+}
+
 // Hybrid Log-Gamma encoding and decoding functions.
 // https://en.wikipedia.org/wiki/Hybrid_log%E2%80%93gamma
 class HLG

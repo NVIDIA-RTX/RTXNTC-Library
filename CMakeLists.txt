@@ -33,8 +33,8 @@ project(
 # Version info
 
 set(NTC_VERSION_MAJOR 0)
-set(NTC_VERSION_MINOR 7)
-set(NTC_VERSION_POINT 2)
+set(NTC_VERSION_MINOR 8)
+set(NTC_VERSION_POINT 0)
 
 # Read Git branch name into NTC_VERSION_BRANCH
 execute_process(
@@ -105,5 +105,3 @@ endif()
 
 add_subdirectory(external/rapidjson)
 add_subdirectory(src)
-
-LibNTC_CopyDXCompilerDLLs()

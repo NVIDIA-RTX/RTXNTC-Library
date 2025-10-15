@@ -18,4 +18,5 @@ struct ChannelInfo
     float linearToOptimalBias = 0.f;
     float optimalToLinearScale = 1.f;
     float optimalToLinearBias = 0.f;
+    float lossFunctionScale = 1.f;
 };

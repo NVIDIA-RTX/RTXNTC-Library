@@ -16,12 +16,8 @@
  namespace ntc
  {
     
- static MlpDesc g_Versions[NTC_NETWORK_COUNT] = {
-    { NTC_NETWORK_SMALL,  NTC_MLP_HR_FEATURES_SMALL,  NTC_MLP_LR_FEATURES, NTC_MLP_INPUT_CHANNELS_SMALL  },
-    { NTC_NETWORK_MEDIUM, NTC_MLP_HR_FEATURES_MEDIUM, NTC_MLP_LR_FEATURES, NTC_MLP_INPUT_CHANNELS_MEDIUM },
-    { NTC_NETWORK_LARGE,  NTC_MLP_HR_FEATURES_LARGE,  NTC_MLP_LR_FEATURES, NTC_MLP_INPUT_CHANNELS_LARGE  },
-    { NTC_NETWORK_XLARGE, NTC_MLP_HR_FEATURES_XLARGE, NTC_MLP_LR_FEATURES, NTC_MLP_INPUT_CHANNELS_XLARGE },
-};
+ static MlpDesc g_MlpDesc = 
+    { NTC_MLP_FEATURES,  NTC_MLP_INPUT_CHANNELS };
 
 int MlpDesc::GetHiddenChannels() const
 {
@@ -76,52 +72,9 @@ int MlpDesc::GetLayerOutputChannels(int layer) const
     return 0;
 }
 
-MlpDesc const* MlpDesc::FromNetworkVersion(int networkVersion)
+MlpDesc const& MlpDesc::Get()
 {
-    for (int index = 0; index < NTC_NETWORK_COUNT; ++index)
-    {
-        MlpDesc const& desc = g_Versions[index];
-        if (desc.networkVersion == networkVersion)
-            return &desc;
-    }
-            
-    return nullptr;
+    return g_MlpDesc;
 }
 
-MlpDesc const* MlpDesc::FromFeatureCounts(int highResFeatures, int lowResFeatures)
-{
-    for (int index = 0; index < NTC_NETWORK_COUNT; ++index)
-    {
-        MlpDesc const& desc = g_Versions[index];
-        if (desc.highResFeatures == highResFeatures && desc.lowResFeatures == lowResFeatures)
-            return &desc;
-    }
-            
-    return nullptr;
-}
-
-MlpDesc const* MlpDesc::FromInputChannels(int inputChannels)
-{
-    for (int index = 0; index < NTC_NETWORK_COUNT; ++index)
-    {
-        MlpDesc const& desc = g_Versions[index];
-        if (desc.inputChannels == inputChannels)
-            return &desc;
-    }
-            
-    return nullptr;
-}
-
-MlpDesc const* MlpDesc::PickOptimalConfig(int highResFeatures, int lowResFeatures)
-{
-    for (int index = 0; index < NTC_NETWORK_COUNT; ++index)
-    {
-        MlpDesc const& desc = g_Versions[index];
-        if (desc.highResFeatures >= highResFeatures && desc.lowResFeatures >= lowResFeatures)
-            return &desc;
-    }
-            
-    return nullptr;
-}
-
-}
+} // namespace ntc

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -10,18 +10,14 @@
  * its affiliates is strictly prohibited.
  */
 
-#include <libntc/ntc.h>
+#include "RegressionKernels.h"
 
-namespace ntc
+namespace ntc::cuda
 {
-    
-struct KnownLatentShape
+
+__global__ void RegressionKernelStable(RegressionKernelParams params)
 {
-    float bitsPerPixel = 0.f;
-    LatentShape shape;
-};
-
-constexpr int KnownLatentShapeCount = 9;
-extern KnownLatentShape const g_KnownLatentShapes[KnownLatentShapeCount];
-
+    RegressionKernel<true>(params);
 }
+
+} // namespace ntc::cuda

@@ -95,7 +95,7 @@ void CudaRandomGen::FillRandomNormalHalf(
     float max_value)
 {
     uint32_t threadBlockSize = 128;
-    uint32_t gridSize = (length + threadBlockSize - 1) / threadBlockSize;
+    uint32_t gridSize = DivRoundUp(length, threadBlockSize);
     FillRandomNormalHalfKernel <<< gridSize, threadBlockSize >>> (buffer, length, m_seed, scale, bias, min_value, max_value);
 
     ++m_seed;

@@ -25,47 +25,47 @@ namespace ntc::cuda
 {
 
 void QuantizeNetwork(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ outputData,
     bool useFP8);
 
 void ConvertNetworkFromQuantizedToFp16(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ inputData,
     bool useFP8);
 
 void ExportNetworkIntoRowMajorLayout(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     half* __restrict__ outputData);
 
 void ImportNetworkFromRowMajorLayout(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     half* __restrict__ outputData);
 
 void FreezeQuantization(
-    int    dispatchSize,
-    int    quantizationBits,
+    uint32_t    numPixels,
+    uint32_t    numFeatures,
     half* __restrict__ baseWeights,
     half*  __restrict__ quantizedWeights);
 
-void QuantizeAndPackLatents(
-    int width,
-    int height,
-    int numFeatures,
-    int quantBits,
+void PackLatents(
+    int widthBlocks,
+    int heightBlocks,
+    int numLayers,
+    size_t latentStride,
     const half* __restrict__ w_in,
-    uint32_t* __restrict__ w_packed_out);
+    uint16_t* __restrict__ w_out);
 
-void UnpackQuantizedLatents(
-    int width,
-    int height,
-    int numFeatures,
-    int quantBits,
-    const uint32_t* __restrict__ w_packed_in,
+void UnpackLatents(
+    int widthBlocks,
+    int heightBlocks,
+    int numLayers,
+    size_t latentStride,
+    const uint16_t* __restrict__ w_in,
     half* __restrict__ w_out);
 
 } // namespace ntc::cuda

@@ -20,7 +20,7 @@ class AdaptiveCompressionSession : public IAdaptiveCompressionSession
 public:
     AdaptiveCompressionSession() = default;
 
-    Status Reset(float targetPsnr, float maxBitsPerPixel = 0.f, int networkVersion = NTC_NETWORK_UNKNOWN) override;
+    Status Reset(float targetPsnr, float maxBitsPerPixel = 0.f) override;
     bool Finished() override;
     void GetCurrentPreset(float*  pOutBitsPerPixel, LatentShape* pOutLatentShape) override;
     void Next(float currentPsnr) override;
@@ -38,7 +38,6 @@ private:
     int m_currentRunIndex = 0;
     int m_maxPreset = 0;
     int m_presetCount = 0;
-    int m_networkVersion = 0;
     
     static constexpr int MaxRuns = 16; // Should be never more than 5 but let's be extra sure
     int m_presetHistory[MaxRuns];

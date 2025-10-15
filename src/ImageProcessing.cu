@@ -210,7 +210,7 @@ void ResizeMultichannelImage(
     std::array<ColorSpace, NTC_MAX_CHANNELS> const& channelColorSpaces)
 {
     dim3 threadBlockSize(16, 16, 1);
-    dim3 gridSize((dst.width + threadBlockSize.x - 1) / threadBlockSize.x, (dst.height + threadBlockSize.y - 1) / threadBlockSize.y, 1);
+    dim3 gridSize = DivRoundUp(dim3(dst.width, dst.height, 1), threadBlockSize);
 
     cudaMemcpyToSymbol(g_ChannelColorSpaces, channelColorSpaces.data(), sizeof(ColorSpace) * NTC_MAX_CHANNELS);
 
@@ -271,7 +271,7 @@ void CopyImage(
     bool verticalFlip)
 {
     dim3 threadBlockSize(16, 16, 1);
-    dim3 gridSize((dst.width + threadBlockSize.x - 1) / threadBlockSize.x, (dst.height + threadBlockSize.y - 1) / threadBlockSize.y, 1);
+    dim3 gridSize = DivRoundUp(dim3(dst.width, dst.height, 1), threadBlockSize);
     
     CopyImageKernel <<< gridSize, threadBlockSize >>> (src, dst, useDithering, verticalFlip);
 }
@@ -526,7 +526,7 @@ void CopyImageToSurface(
     bool verticalFlip)
 {
     dim3 threadBlockSize(16, 16, 1);
-    dim3 gridSize((dst.width + threadBlockSize.x - 1) / threadBlockSize.x, (dst.height + threadBlockSize.y - 1) / threadBlockSize.y, 1);
+    dim3 gridSize = DivRoundUp(dim3(dst.width, dst.height, 1), threadBlockSize);
 
     CopyImageToSurfaceKernel <<< gridSize, threadBlockSize >>> (src, dst, useDithering, verticalFlip);
 }
@@ -608,8 +608,8 @@ void CopySurfaceToImage(
     bool verticalFlip)
 {
     dim3 threadBlockSize(16, 16, 1);
-    dim3 gridSize((dst.width + threadBlockSize.x - 1) / threadBlockSize.x, (dst.height + threadBlockSize.y - 1) / threadBlockSize.y, 1);
-
+    dim3 gridSize = DivRoundUp(dim3(dst.width, dst.height, 1), threadBlockSize);
+    
     CopySurfaceToImageKernel <<< gridSize, threadBlockSize >>> (src, dst, verticalFlip);
 }
 
@@ -690,7 +690,7 @@ cudaError_t ComputeMinMaxChannelValues(
     assert(scratchMemory);
 
     dim3 threadBlockSize(ReduceGroupWidth, ReduceGroupHeight, 1);
-    dim3 gridSize((image.width + threadBlockSize.x - 1) / threadBlockSize.x, (image.height + threadBlockSize.y - 1) / threadBlockSize.y, 1);
+    dim3 gridSize = DivRoundUp(dim3(image.width, image.height, 1), threadBlockSize);
     
     InitMinMaxChannelValuesKernel <<< dim3(1), dim3(NTC_MAX_CHANNELS) >>> (scratchMemory, scratchMemory + NTC_MAX_CHANNELS);
 

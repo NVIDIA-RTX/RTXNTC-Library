@@ -14,16 +14,17 @@
 #define BLOCK_COMPRESS_COMMON_HLSLI
 
 #include "libntc/shaders/BlockCompressConstants.h"
-#include "Vulkan.hlsli"
+#include "libntc/shaders/Bindings.h"
+#include "BindingHelpers.hlsli"
 
 #ifdef __cplusplus
 static const NtcBlockCompressConstants g_Const;
 #else
-VK_BINDING(0, 0) ConstantBuffer<NtcBlockCompressConstants> g_Const : register(b0);
+NTC_DECLARE_CBUFFER(ConstantBuffer<NtcBlockCompressConstants> g_Const, NTC_BINDING_BC_CONSTANT_BUFFER, 0);
 #endif
-VK_BINDING(1, 0) Texture2D<float4> t_Input : register(t1);
-VK_BINDING(2, 0) RWTexture2D<OUTPUT_FORMAT> u_Output : register(u2);
-VK_BINDING(3, 0) RWByteAddressBuffer u_AccelerationOutput : register(u3); // Optional - BC7 only
+NTC_DECLARE_SRV(Texture2D<float4> t_Input,                NTC_BINDING_BC_INPUT_TEXTURE, 0);
+NTC_DECLARE_UAV(RWTexture2D<OUTPUT_FORMAT> u_Output,      NTC_BINDING_BC_OUTPUT_TEXTURE, 0);
+NTC_DECLARE_UAV(RWByteAddressBuffer u_AccelerationOutput, NTC_BINDING_BC_ACCELERATION_BUFFER, 0); // Optional - BC7 only
 
 #define PIXELS_PER_BLOCK 16
 

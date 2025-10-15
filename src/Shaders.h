@@ -18,23 +18,18 @@ namespace ntc
 
 enum class InferenceMath
 {
-    Legacy,
-    DP4aNoFloat16,
-    DP4aWithFloat16,
-    CoopVecInt8,
+    DP4a,
     CoopVecFP8
 };
 
-struct MlpDesc;
-
 #if NTC_WITH_PREBUILT_SHADERS
 #if NTC_WITH_DX12
-void GetDecompressDxilShaderBytecode(MlpDesc const* mlpDesc, InferenceMath mathVersion, bool preloadLatents, const void** pOutData, size_t* pOutSize);
+void GetDecompressDxilShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize);
 void GetBlockCompressDxilShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize);
 void GetImageDifferenceDxilShaderBytecode(const void** pOutData, size_t* pOutSize);
 #endif
 #if NTC_WITH_VULKAN
-void GetDecompressSpirvShaderBytecode(MlpDesc const* mlpDesc, InferenceMath mathVersion, bool preloadLatents, const void** pOutData, size_t* pOutSize);
+void GetDecompressSpirvShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize);
 void GetBlockCompressSpirvShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize);
 void GetImageDifferenceSpirvShaderBytecode(const void** pOutData, size_t* pOutSize);
 #endif

@@ -27,8 +27,8 @@ class FeatureGrid : public FeatureGridMath
 public:
     FeatureGrid(IAllocator* allocator);
 
-    Status Initialize(int imageWidth, int imageHeight, int imageMips, int highResGridScale, int highResFeatures, int lowResFeatures,
-        int highResQuantBits, int lowResQuantBits, bool enableCompression);
+    Status Initialize(int imageWidth, int imageHeight, int imageMips, int gridScale, int numFeatures,
+        bool enableCompression);
     
     void Deallocate();
     
@@ -38,64 +38,64 @@ public:
 
     int LodToNeuralLod(int lod) const;
     
-    half* GetBaseLatentsDevicePtr(Grid grid, int neuralLod);
+    half* GetBaseLatentsDevicePtr(int neuralLod);
 
-    half* GetQuantizedLatentsDevicePtr(Grid grid, int neuralLod);
+    half* GetQuantizedLatentsDevicePtr(int neuralLod);
 
-    float* GetMoment1DevicePtr(Grid grid, int neuralLod);
+    float* GetMoment1DevicePtr();
 
-    float* GetMoment2DevicePtr(Grid grid, int neuralLod);
+    float* GetMoment2DevicePtr();
 
-    template<typename TGrad>
-    TGrad* GetGradientsDevicePtr(Grid grid, int neuralLod)
-    {
-        return m_gradientMemory.DevicePtr() ? (TGrad*)m_gradientMemory.DevicePtr() + GetLatentOffset(grid, neuralLod) : nullptr;
-    }
+    void* GetGradientsDevicePtr();
 
-    uint32_t* GetEncodedLatentsDevicePtr(Grid grid, int neuralLod);
+    uint16_t* GetEncodedPixelsDevicePtr(int neuralLod);
 
-    uint32_t* GetEncodedLatentsHostPtr(Grid grid, int neuralLod);
+    uint16_t* GetEncodedPixelsHostPtr(int neuralLod);
 
-    size_t GetQuantizedLatentsSize(Grid grid, int neuralLod);
+    size_t GetEncodedPixelsSize(int neuralLod);
 
-    uint32_t* GetGradientMaskDevicePtr(Grid grid, int neuralLod);
+    uint32_t* GetGradientMaskDevicePtr();
 
-    DeviceAndHostArray<uint32_t>& GetEncodedLatentsArray();
+    DeviceAndHostArray<uint8_t>& GetEncodedPixelsArray();
 
-    size_t GetLatentOffset(Grid grid, int neuralLod);
+    size_t GetLatentOffset(int neuralLod);
 
-    size_t GetLatentCount(Grid grid, int neuralLod);
+    size_t GetMaskOffset(int neuralLod) const;
 
-    size_t GetLatentCount(Grid grid) const;
+    // Returns the total number of latent pixels across all mips, not accounting for layers or features.
+    size_t GetTotalPixelCount() const { return m_totalPixels; }
 
-    int GetNumMipLevels() const;
+    // Stride between groups of features for each pixel, in individual features (half or float).
+    size_t GetLatentStride() const { return m_totalPixels * FeaturesPerGroup; }
+
+    int GetNumLayers() const { return m_numLayers; }
+
+    int GetNumMipLevels() const { return m_numNeuralMipLevels; }
 
 private:
-    
-    int m_highResFeatures = 0;
-    int m_lowResFeatures = 0;
-    int m_highResGridScale = 0;
-    int m_highResQuantBits = 0;
-    int m_lowResQuantBits = 0;
-    std::array<size_t, NTC_MAX_MIPS> m_highResLatentCounts {};
-    std::array<size_t, NTC_MAX_MIPS> m_lowResLatentCounts {};
-    std::array<size_t, NTC_MAX_MIPS> m_highResLatentOffsets {};
-    std::array<size_t, NTC_MAX_MIPS> m_lowResLatentOffsets {};
-    std::array<size_t, NTC_MAX_MIPS> m_highResQuantizedGridOffsets {};
-    std::array<size_t, NTC_MAX_MIPS> m_lowResQuantizedGridOffsets {};
-    std::array<size_t, NTC_MAX_MIPS> m_highResMaskOffsets {};
-    std::array<size_t, NTC_MAX_MIPS> m_lowResMaskOffsets {};
-    size_t m_totalHighResLatentCount = 0;
-    size_t m_totalLowResLatentCount = 0;
-    size_t m_totalLatentCount = 0;
+    int m_numFeatures = 0;
+    int m_numLayers = 0;
+    int m_gridScale = 0;
+
+    std::array<size_t, NTC_MAX_MIPS> m_mipSizesInPixels {};
+    std::array<size_t, NTC_MAX_MIPS> m_mipOffsetsInPixels {};
+    size_t m_totalPixels = 0;
     int m_numNeuralMipLevels = 0;
     
+    // Base, quantized latents and gradients use the NMHW2 layout: features/2, mip, height, width, 2.
+    // The "2" at the end is because we store features as half2, aka FeaturesPerGroup.
     DeviceArray<half> m_baseLatentsMemory;
     DeviceArray<half> m_quantizedLatentsMemory;
-    DeviceAndHostArray<uint32_t> m_encodedLatentsMemory;
     DeviceArray<uint32_t> m_gradientMemory; // declared as uint32_t, used as either float or half depending on 'stableTraining'
     DeviceArray<float> m_moment1Memory;
     DeviceArray<float> m_moment2Memory;
+
+    // Encoded latents use the MNHW layout: mip, layer, height, width.
+    DeviceAndHostArray<uint8_t> m_encodedPixelsMemory;
+
+    // Gradient mask uses the MHW layout: mip, height, width.
+    // Each item is a single bit, tightly packed into uint32_t, with no gaps between rows or mips.
+    // One bit represents whether the corresponding pixel is updated in the current training step.
     DeviceArray<uint32_t> m_gradientMaskMemory;
 };
 

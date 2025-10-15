@@ -12,6 +12,7 @@
 
 #include "StdTypes.h"
 #include <optional>
+#include <functional>
 #include <rapidjson/reader.h>
 #include <rapidjson/writer.h>
 #include <rapidjson/error/en.h>
@@ -178,6 +179,8 @@ template<typename T> class OptionalObjectHandler;
 template<typename T> class ArrayOfObjectHandler;
 template<typename T, int N> class EnumHandler;
 
+typedef bool (*ValidateValueFunc)(void const* parentObject, Field const& parentField,
+    char* outErrorMessage, size_t errorMessageSize);
 
 // A structure that describes one field of a serializable object.
 // Use the type-safe static functions within to construct Field objects.
@@ -213,6 +216,7 @@ struct Field
     bool required = false;
     AbstractObjectHandler const* objectHandler = nullptr;
     AbstractEnumHandler const* enumHandler = nullptr;
+    ValidateValueFunc validateFunc = nullptr;
 
     // bool b;
     template<typename ParentType>
@@ -264,12 +268,13 @@ struct Field
 
     // uint32_t i;
     template<typename ParentType>
-    static constexpr Field UInt(char const* name, uint32_t ParentType::* ptr)
+    static constexpr Field UInt(char const* name, uint32_t ParentType::* ptr, ValidateValueFunc validateFunc = nullptr)
     {
         Field res;
         res.name = name;
         res.type = Type::UInt;
         res.offset = GetMemberOffset(ptr);
+        res.validateFunc = validateFunc;
         res.required = true;
         return res;
     }

@@ -15,185 +15,65 @@
 #include "DecompressCommon.hlsli"
 #include "libntc/shaders/InferenceCoopVec.hlsli"
 
-
-groupshared float16_t4 s_Latents[LATENTS_COUNT / 4][HR_LATENTS_HEIGHT][HR_LATENTS_WIDTH];
-
-groupshared float s_Outputs[DECOMPRESS_CS_BLOCK_HEIGHT * DECOMPRESS_CS_BLOCK_WIDTH * Params::OUTPUT_CHANNELS];
-
-void PreloadLatents<let NUM_FEATURES: int>(
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    float2 colorToNeuralScale,
-    int2 baseLatentPos,
-    int latentOffset,
-    int2 threadIndex)
-{
-    // Rename the threads into a 2D group of a different size, iterate over partitions of that group
-    // if the original group size is smaller.
-    const int groupWidth = int(ceil(float(DECOMPRESS_CS_BLOCK_WIDTH) * colorToNeuralScale.x)) + PRELOAD_MARGIN;
-    const int groupHeight = int(ceil(float(DECOMPRESS_CS_BLOCK_HEIGHT) * colorToNeuralScale.y)) + PRELOAD_MARGIN;
-    int linearThreadIndex = threadIndex.x + threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH;
-    while (linearThreadIndex < groupWidth * groupHeight)
-    {
-        const int2 renamedThreadIdx = int2(linearThreadIndex % groupWidth, linearThreadIndex / groupWidth);
-        const int2 sliceOrigin = int2(neuralMip.sliceLeft, neuralMip.sliceTop);
-        const int2 sliceSize = int2(neuralMip.sliceWidth, neuralMip.sliceHeight);
-        const int2 latentPos = clamp(baseLatentPos + renamedThreadIdx - sliceOrigin, 0, sliceSize - 1);
-        int addr = (latentPos.y * neuralMip.sliceWidth + latentPos.x) * encoding.numFeatures;
-    
-        [unroll]
-        for (int i = 0; i < NUM_FEATURES / 4; i++)
-        {
-            float16_t4 inp = NtcLoadFourInputQuantizedLatents_FP16(t_InputFile, 0, encoding, neuralMip, addr);
-            addr += 4;
-        
-            s_Latents[latentOffset + i][renamedThreadIdx.y][renamedThreadIdx.x] = inp;
-        }
-        linearThreadIndex += DECOMPRESS_CS_BLOCK_WIDTH * DECOMPRESS_CS_BLOCK_HEIGHT;
-    }
-}
-
-void SampleLatentGridShared<let NUM_FEATURES: int, let ALL_CORNERS: bool>(
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    float2 uv,
-    int2 baseLatentPos,
-    int latentOffset,
-    int outputOffset,
-    inout CoopVec<float16_t, Params::INPUT_CHANNELS> outputArray)
-{
-    int2 topLeftPos;
-    float4 weights;
-    NtcSetupLatentBilinearFilter(neuralMip, uv, topLeftPos, weights);
-    float16_t4 iweights = float16_t4(weights);
-    
-    // Shift right the interpolated weights by 8 to undo the 256 factor above
-    const int normalizationShift = 8;
-
-    const int2 sharedPos = topLeftPos - baseLatentPos;
-    
-    [unroll]
-    for (int i = 0; i < NUM_FEATURES / 4; i++)
-    {
-        if (i >= encoding.numFeatures / 4)
-            break;
-
-        const float16_t4 u00 = s_Latents[latentOffset + i][sharedPos.y    ][sharedPos.x    ];
-        const float16_t4 u01 = s_Latents[latentOffset + i][sharedPos.y    ][sharedPos.x + 1];
-        const float16_t4 u10 = s_Latents[latentOffset + i][sharedPos.y + 1][sharedPos.x    ];
-        const float16_t4 u11 = s_Latents[latentOffset + i][sharedPos.y + 1][sharedPos.x + 1];
-
-        const float16_t4 x00 = u00 * iweights.x;
-        const float16_t4 x01 = u01 * iweights.y;
-        const float16_t4 x10 = u10 * iweights.z;
-        const float16_t4 x11 = u11 * iweights.w;
-
-        if (ALL_CORNERS)
-        {
-            // Copy the latents for the 4 pixels into the network inputs.
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 0, x00);
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 1, x01);
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 2, x10);
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 3, x11);
-        }
-        else
-        {
-            // Blend the features of the 4 pixels using integer weights.
-            float16_t4 d = x00 + x01 + x10 + x11;
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4, d);
-        }
-    }
-}
+groupshared float s_Outputs[DECOMPRESS_CS_BLOCK_HEIGHT * DECOMPRESS_CS_BLOCK_WIDTH * NTC_MLP_OUTPUT_CHANNELS];
 
 void DecompressPixel_CoopVec(uint2 globalIndex, uint2 threadIndex)
 {
-    const int2 pixelPosition = int2(globalIndex) + int2(g_Const.gridLeft, g_Const.gridTop);
+    const int2 pixelPosition = int2(globalIndex) + int2(g_Const.srcLeft, g_Const.srcTop);
     const int2 dstPosition = pixelPosition + int2(g_Const.dstLeft - g_Const.srcLeft, g_Const.dstTop - g_Const.srcTop);
     const NtcColorMipConstants colorMip = NtcUnpackColorMipConstants(g_Const.colorMip);
     const float2 colorMipSize = float2(g_Const.imageWidth, g_Const.imageHeight);
-    const NtcNeuralMipConstants highResNeuralMip = NtcUnpackNeuralMipConstants(g_Const.highResNeuralMip);
-    const NtcNeuralMipConstants lowResNeuralMip = NtcUnpackNeuralMipConstants(g_Const.lowResNeuralMip);
 
-#if PRELOAD_LATENTS
-    // Preload the block of latents needed to decompress all pixels in this thread group
-    const float2 highResNeuralMipSize = float2(highResNeuralMip.imageWidth, highResNeuralMip.imageHeight);
-    const float2 lowResNeuralMipSize = float2(lowResNeuralMip.imageWidth, lowResNeuralMip.imageHeight);
-    const float2 highResNeuralScale = highResNeuralMipSize / colorMipSize;
-    const float2 lowResNeuralScale = lowResNeuralMipSize / colorMipSize;
-
-    const float2 groupBase = float2(pixelPosition - threadIndex) + 0.5;
-    const int2 baseHighResLatentPos = int2(floor(groupBase * highResNeuralScale)) - 1;
-    const int2 baseLowResLatentPos = int2(floor(groupBase * lowResNeuralScale)) - 1;
-
-    PreloadLatents<Params::HR_FEATURES>(NtcUnpackLatentEncodingConstants(g_Const.highResEncoding),
-        highResNeuralMip, highResNeuralScale,
-        baseHighResLatentPos, 0, threadIndex);
-    PreloadLatents<Params::LR_FEATURES>(NtcUnpackLatentEncodingConstants(g_Const.lowResEncoding),
-        lowResNeuralMip, lowResNeuralScale,
-        baseLowResLatentPos, Params::HR_FEATURES / 4, threadIndex);
-
-    GroupMemoryBarrierWithGroupSync();
-#endif
-    
-    CoopVec<float16_t, Params::INPUT_CHANNELS> networkInputs;
-
-    int inputOffset = 0;
     const float2 uv = (float2(pixelPosition)+0.5) / float2(g_Const.imageWidth, g_Const.imageHeight);
 
-#if PRELOAD_LATENTS
-    // Sample the latent grids from preloaded data
-    SampleLatentGridShared<Params::HR_FEATURES, true>(NtcUnpackLatentEncodingConstants(g_Const.highResEncoding),
-        highResNeuralMip, uv, baseHighResLatentPos, 0, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_HR;
-
-    SampleLatentGridShared<Params::LR_FEATURES, false>(NtcUnpackLatentEncodingConstants(g_Const.lowResEncoding),
-        lowResNeuralMip, uv, baseLowResLatentPos, Params::HR_FEATURES / 4, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_LR;
-#else
-    NtcSampleLatentGrid_FP16<Params::HR_FEATURES, true>(t_InputFile, 0, NtcUnpackLatentEncodingConstants(g_Const.highResEncoding),
-        highResNeuralMip, uv, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_HR;
-
-    NtcSampleLatentGrid_FP16<Params::LR_FEATURES, false>(t_InputFile, 0, NtcUnpackLatentEncodingConstants(g_Const.lowResEncoding),
-        lowResNeuralMip, uv, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_LR;
-#endif
-
-    // Encode the sample position
-    NtcEncodeSamplePosition_FP16(float2(pixelPosition) * colorMip.positionScale,
-        colorMip.positionLod, inputOffset, networkInputs);
-
-    int scaleBiasOffset = g_Const.networkScaleBiasOffset;
+    CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> networkInputs;
+    NtcPrepareNetworkInputsInternal_FP16(t_Latents, s_LatentSampler,
+        pixelPosition, uv, colorMip, networkInputs);
 
     // Evaluate the MLP layers:
     // Input layer
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput1;
-    NtcEvaluateLayer_CoopVec_FP8<Params::INPUT_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.x, scaleBiasOffset, false, networkInputs, hiddenOutput1);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
-    
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput1;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.x,
+        g_Const.networkBiasOffsets.x,
+        false, networkInputs, hiddenOutput1);
+
     // Hidden layer 1
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput2;
-    NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.y, scaleBiasOffset, false, hiddenOutput1, hiddenOutput2);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
-    
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput2;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.y,
+        g_Const.networkBiasOffsets.y,
+        false, hiddenOutput1, hiddenOutput2);
+
     // Hidden layer 2
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput3;
-    NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.z, scaleBiasOffset, true, hiddenOutput2, hiddenOutput3);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
-    
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput3;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.z,
+        g_Const.networkBiasOffsets.z,
+        true, hiddenOutput2, hiddenOutput3);
+
     // Output layer
-    CoopVec<float, Params::OUTPUT_CHANNELS> networkOutputs;
-    NtcEvaluateOutputLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::OUTPUT_CHANNELS>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.w, scaleBiasOffset, hiddenOutput3, networkOutputs);
+    CoopVec<float, NTC_MLP_OUTPUT_CHANNELS> networkOutputs;
+    NtcEvaluateOutputLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.w,
+        g_Const.networkBiasOffsets.w,
+        g_Const.networkScaleOffsets.w,
+        hiddenOutput3, networkOutputs);
 
     // Store the outputs into shared memory for efficient indexed access later.
     // Note: there is no need for a barrier before or after this store because we're using a dedicated
     // shared memory array, and each thread only reads the data it's written - nothing from other threads.
-    int threadOffset = (threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIndex.x) * Params::OUTPUT_CHANNELS;
+    int threadOffset = (threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIndex.x) * NTC_MLP_OUTPUT_CHANNELS;
+#if __SLANG__
     networkOutputs.store(s_Outputs, threadOffset * sizeof(float));
+#else
+    for (int i = 0; i < NTC_MLP_OUTPUT_CHANNELS; ++i)
+        s_Outputs[threadOffset + i] = networkOutputs[i];
+#endif
     
     HashBasedRNG rng = HashBasedRNG::Create(pixelPosition.x + pixelPosition.y * g_Const.imageWidth, 0);
 

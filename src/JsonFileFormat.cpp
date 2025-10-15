@@ -36,10 +36,7 @@ static auto const BufferViewSchema = MakeObjectSchema("BufferView", {
 static ArrayOfObjectHandler<BufferView> const ArrayOfBufferViewHandler(BufferViewSchema);
 
 static auto const LatentShapeSchema = MakeObjectSchema("LatentShape", {
-    Field::UInt("highResFeatures",  &LatentShape::highResFeatures),
-    Field::UInt("highResQuantBits", &LatentShape::highResQuantBits),
-    Field::UInt("lowResFeatures",   &LatentShape::lowResFeatures),
-    Field::UInt("lowResQuantBits",  &LatentShape::lowResQuantBits),
+    Field::UInt("numFeatures",  &LatentShape::numFeatures),
 });
 
 static OptionalObjectHandler<LatentShape> const OptionalLatentShapeHandler(LatentShapeSchema);
@@ -68,10 +65,9 @@ static auto const MLPLayerSchema = MakeObjectSchema("MLPLayer", {
     Field::UInt("weightView",           &MLPLayer::weightView),
     Field::OptionalUInt("scaleView",    &MLPLayer::scaleView),
     Field::UInt("biasView",             &MLPLayer::biasView),
-    Field::OptionalEnum("weightType",   &MLPLayer::weightType, MlpDataTypeEnum),
-    Field::OptionalEnum("scaleBiasType",&MLPLayer::scaleBiasType, MlpDataTypeEnum),
+    Field::Enum("weightType",           &MLPLayer::weightType, MlpDataTypeEnum),
     Field::OptionalEnum("scaleType",    &MLPLayer::scaleType, MlpDataTypeEnum),
-    Field::OptionalEnum("biasType",     &MLPLayer::biasType, MlpDataTypeEnum),
+    Field::Enum("biasType",             &MLPLayer::biasType, MlpDataTypeEnum),
 });
 
 static ArrayOfObjectHandler<MLPLayer> const ArrayOfMLPLayerHandler(MLPLayerSchema);
@@ -80,11 +76,8 @@ static auto const MLPSchema = MakeObjectSchema("MLP", {
     Field::ArrayOfObject("layers",       &MLP::layers, ArrayOfMLPLayerHandler),
     Field::OptionalEnum("activation",    &MLP::activation, ActivationTypeEnum),
     Field::OptionalEnum("weightLayout",  &MLP::weightLayout, MatrixLayoutEnum),
-    Field::OptionalEnum("weightType",    &MLP::weightType, MlpDataTypeEnum),
-    Field::OptionalEnum("scaleBiasType", &MLP::scaleBiasType, MlpDataTypeEnum),
 });
 
-static OptionalObjectHandler<MLP> const OptionalMLPHandler(MLPSchema);
 static ArrayOfObjectHandler<MLP> const ArrayOfMLPHandler(MLPSchema);
 
 static auto const ChannelFormatEnum = MakeEnumSchema({
@@ -134,14 +127,10 @@ static auto const ChannelSchema = MakeObjectSchema("Channel", {
 static ArrayOfObjectHandler<Channel> const ArrayOfChannelHandler(ChannelSchema);
 
 static auto const LatentImageSchema = MakeObjectSchema("LatentImage", {
-    Field::UInt("highResWidth",          &LatentImage::highResWidth),
-    Field::UInt("highResHeight",         &LatentImage::highResHeight),
-    Field::UInt("lowResWidth",           &LatentImage::lowResWidth),
-    Field::UInt("lowResHeight",          &LatentImage::lowResHeight),
-    Field::UInt("highResBitsPerPixel",   &LatentImage::highResBitsPerPixel),
-    Field::UInt("lowResBitsPerPixel",    &LatentImage::lowResBitsPerPixel),
-    Field::UInt("highResView",           &LatentImage::highResView),
-    Field::UInt("lowResView",            &LatentImage::lowResView),
+    Field::UInt("width",        &LatentImage::width),
+    Field::UInt("height",       &LatentImage::height),
+    Field::UInt("arraySize",    &LatentImage::arraySize),
+    Field::UInt("view",         &LatentImage::view),
 });
 
 static ArrayOfObjectHandler<LatentImage> const ArrayOfLatentImageHandler(LatentImageSchema);
@@ -170,14 +159,16 @@ static auto const ColorMipSchema = MakeObjectSchema("ColorMip", {
 
 static ArrayOfObjectHandler<ColorMip> const ArrayOfColorMipHandler(ColorMipSchema);
 
+static bool ValidateSchemaVersion(void const* parentObject, Field const& parentField,
+    char* outErrorMessage, size_t errorMessageSize);
+
 static auto const DocumentSchema = MakeObjectSchema("Document", {
-    Field::UInt("schemaVersion",         &Document::schemaVersion),
+    Field::UInt("schemaVersion",         &Document::schemaVersion, ValidateSchemaVersion),
     Field::UInt("width",                 &Document::width),
     Field::UInt("height",                &Document::height),
     Field::UInt("numChannels",           &Document::numChannels),
     Field::OptionalUInt("numColorMips",  &Document::numColorMips),
     Field::OptionalObject("latentShape", &Document::latentShape, OptionalLatentShapeHandler),
-    Field::OptionalObject("mlp",         &Document::mlp, OptionalMLPHandler),
     Field::ArrayOfObject("mlpVersions",  &Document::mlpVersions, ArrayOfMLPHandler),
     Field::ArrayOfObject("textures",     &Document::textures, ArrayOfTextureHandler),
     Field::ArrayOfObject("channels",     &Document::channels, ArrayOfChannelHandler),
@@ -196,6 +187,24 @@ bool SerializeDocument(Document const& document, String& outString, String& outE
 bool ParseDocument(Document& outDocument, char* input, String& outErrorMessage)
 {
     return ParseAbstractDocument(&outDocument, DocumentSchema, outDocument.allocator, input, outErrorMessage);
+}
+
+static bool ValidateSchemaVersion(void const* parentObject, Field const& parentField,
+    char* outErrorMessage, size_t errorMessageSize)
+{
+    // Validate the schema version during parsing.
+    // If it's done later, the parsing will likely fail due to missing fields,
+    // the validation code won't run, and the error message will be less clear.
+
+    Document const* document = reinterpret_cast<Document const*>(parentObject);
+    if (document->schemaVersion != Document::SchemaVersion)
+    {
+        snprintf(outErrorMessage, errorMessageSize,
+            "Incompatible file schema version %u, expected %u",
+            document->schemaVersion, Document::SchemaVersion);
+        return false;
+    }
+    return true;
 }
 
 #if RUN_TEST

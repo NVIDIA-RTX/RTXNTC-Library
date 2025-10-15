@@ -79,32 +79,22 @@ public:
     Status MakeImageDifferenceComputePass(MakeImageDifferenceComputePassParameters const& params,
         ComputePassDesc* pOutComputePass) const override;
 
-    Status MakeInferenceData(ITextureSetMetadata* textureSetMetadata, StreamRange latentStreamRange,
-        InferenceWeightType weightType, InferenceData* pOutInferenceData) const override;
+    Status MakeInferenceData(ITextureSetMetadata* textureSetMetadata,
+        InferenceWeightType weightType, int firstLatentMipInTexture, InferenceData* pOutInferenceData) const override;
     
-    Status MakePartialInferenceData(ITextureSetMetadata* textureSetMetadata, IStream* inputStream,
-        int firstMipLevel, int numMipLevels, Rect firstMipSlice,
-        InferenceWeightType weightType, InferenceData* pOutInferenceData, void* pOutLatentData, size_t* pInOutLatentSize) const override;
-        
-    Status GetConservativeLatentBufferSize(ITextureSetMetadata* textureSetMetadata,
-        int firstMipLevel, int numMipLevels, int firstMipSliceWidth, int firstMipSliceHeight, int sliceAlignment,
-        size_t* pOutLatentSize) const override;
-
-    bool IsCooperativeVectorInt8Supported() const override;
-    
-    bool IsCooperativeVectorFP8Supported() const override;
+    bool IsCooperativeVectorSupported() const override;
 
     GraphicsResources const* GetGraphicsResources() const { return m_graphicsResources; }
 
-    WeightLayout const* GetWeightLayout(int networkVersion, InferenceWeightType weightType) const;
+    WeightLayout const* GetWeightLayout(InferenceWeightType weightType) const;
 
 private:
     IAllocator* m_allocator;
     int m_cudaDevice = -1;
     GraphicsResources* m_graphicsResources = nullptr;
-    std::array<std::optional<WeightLayout>, NTC_NETWORK_COUNT * (size_t(InferenceWeightType::Count) - 1)> m_weightLayouts{};
+    std::array<std::optional<WeightLayout>, size_t(InferenceWeightType::Count) - 1> m_weightLayouts{};
 
-    static int GetWeightLayoutArrayIndex(int networkVersion, InferenceWeightType weightType);
+    static int GetWeightLayoutArrayIndex(InferenceWeightType weightType);
 };
 
 }

@@ -62,10 +62,7 @@ struct BufferView
 
 struct LatentShape
 {
-    uint32_t highResFeatures = 0;
-    uint32_t highResQuantBits = 0;
-    uint32_t lowResFeatures = 0;
-    uint32_t lowResQuantBits = 0;
+    uint32_t numFeatures = 0;
 
     LatentShape() = default;
     LatentShape(IAllocator* allocator) { }
@@ -99,10 +96,9 @@ struct MLPLayer
     uint32_t weightView = 0;
     std::optional<uint32_t> scaleView;
     uint32_t biasView = 0;
-    std::optional<MlpDataType> weightType;
-    std::optional<MlpDataType> scaleBiasType; // Deprecated, use scaleType and biasType
+    MlpDataType weightType = MlpDataType::Int8;
+    MlpDataType biasType = MlpDataType::Int8;
     std::optional<MlpDataType> scaleType;
-    std::optional<MlpDataType> biasType;
 
     MLPLayer() = default;
     MLPLayer(IAllocator* allocator) { }
@@ -113,8 +109,6 @@ struct MLP
     Vector<MLPLayer> layers;
     std::optional<ActivationType> activation;
     std::optional<MatrixLayout> weightLayout;
-    std::optional<MlpDataType> weightType;    // Deprecated, use MLPLayer::weightType
-    std::optional<MlpDataType> scaleBiasType; // Deprecated, use MLPLayer::scaleType and MLPLayer::biasType
 
     MLP(IAllocator* allocator)
         : layers(allocator)
@@ -148,14 +142,10 @@ struct Channel
 
 struct LatentImage
 {
-    uint32_t highResWidth = 0;
-    uint32_t highResHeight = 0;
-    uint32_t lowResWidth = 0;
-    uint32_t lowResHeight = 0;
-    uint32_t highResBitsPerPixel = 0;
-    uint32_t lowResBitsPerPixel = 0;
-    uint32_t highResView = 0;
-    uint32_t lowResView = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t arraySize = 0;
+    uint32_t view = 0;
 
     LatentImage(IAllocator* allocator)
     { }
@@ -191,7 +181,7 @@ struct ColorMip
 
 struct Document
 {
-    static constexpr uint32_t SchemaVersion = 1;
+    static constexpr uint32_t SchemaVersion = 2;
 
     IAllocator* allocator;
 
@@ -201,7 +191,6 @@ struct Document
     uint32_t numChannels = 0;
     std::optional<uint32_t> numColorMips;
     std::optional<LatentShape> latentShape;
-    std::optional<MLP> mlp;
     Vector<MLP> mlpVersions;
     Vector<Texture> textures;
     Vector<Channel> channels;

@@ -543,7 +543,7 @@ TIN_UNROLL
 
         // Copies tensor into a user array
         TIN_DEVICE Array(const Vector<T, N_COLS>& v) {
-            v.to_array<N_COLS>((T*)(&m_data));
+            v.template to_array<N_COLS>((T*)(&m_data));
         };
 
         TIN_DEVICE Array(const T* __restrict__ arr) {

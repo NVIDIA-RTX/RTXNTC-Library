@@ -16,7 +16,6 @@
 
 #if NTC_WITH_DX12
 #include <DecompressINT8.dxil.h>
-#include <DecompressCoopVecInt8.dxil.h>
 #include <DecompressCoopVecFP8.dxil.h>
 #include <CompressBC1.dxil.h>
 #include <CompressBC2.dxil.h>
@@ -29,7 +28,6 @@
 #endif
 #if NTC_WITH_VULKAN
 #include <DecompressINT8.spirv.h>
-#include <DecompressCoopVecInt8.spirv.h>
 #include <DecompressCoopVecFP8.spirv.h>
 #include <CompressBC1.spirv.h>
 #include <CompressBC2.spirv.h>
@@ -43,20 +41,10 @@
 
 namespace ntc
 {
-void GetDecompressShaderBytecode(const uint8_t* blobData, size_t blobSize, MlpDesc const* mlpDesc,
-    InferenceMath mathVersion, bool preloadLatents, const void** pOutData, size_t* pOutSize)
+void GetDecompressShaderBytecode(const uint8_t* blobData, size_t blobSize,
+    InferenceMath mathVersion, const void** pOutData, size_t* pOutSize)
 {
-    ShaderMake::ShaderConstant constants[] = {
-        { "NETWORK_VERSION", NetworkVersionToString(mlpDesc->networkVersion) },
-        { "PRELOAD_LATENTS", preloadLatents ? "1" : "0" },
-        { "USE_DP4A", (mathVersion == InferenceMath::DP4aWithFloat16 || mathVersion == InferenceMath::DP4aNoFloat16) ? "1": "0" },
-        { "USE_FLOAT16", (mathVersion == InferenceMath::DP4aWithFloat16) ? "1": "0" },
-    };
-
-    // No USE_DP4A or USE_FLOAT16 in the CoopVec shader
-    int const numConstants = (mathVersion == InferenceMath::CoopVecInt8 || mathVersion == InferenceMath::CoopVecFP8) ? 2 : 4;
-
-    ShaderMake::FindPermutationInBlob(blobData, blobSize, constants, numConstants, pOutData, pOutSize);
+    ShaderMake::FindPermutationInBlob(blobData, blobSize, nullptr, 0, pOutData, pOutSize);
 }
 
 void GetBC7ShaderBytecode(const uint8_t* blobData, size_t blobSize, bool writeAccelerationData,
@@ -75,14 +63,12 @@ void GetBC7ShaderBytecode(const uint8_t* blobData, size_t blobSize, bool writeAc
     *pOutSize = sizeof(symbol);
 
 #if NTC_WITH_DX12
-void GetDecompressDxilShaderBytecode(MlpDesc const* mlpDesc, InferenceMath mathVersion, bool preloadLatents, const void** pOutData, size_t* pOutSize)
+void GetDecompressDxilShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize)
 {
-    if (mathVersion == InferenceMath::CoopVecInt8)
-        GetDecompressShaderBytecode(g_DecompressCoopVecInt8_dxil, sizeof(g_DecompressCoopVecInt8_dxil), mlpDesc, mathVersion, preloadLatents, pOutData, pOutSize);
-    else if (mathVersion == InferenceMath::CoopVecFP8)
-        GetDecompressShaderBytecode(g_DecompressCoopVecFP8_dxil, sizeof(g_DecompressCoopVecFP8_dxil), mlpDesc, mathVersion, preloadLatents, pOutData, pOutSize);
+    if (mathVersion == InferenceMath::CoopVecFP8)
+        GetDecompressShaderBytecode(g_DecompressCoopVecFP8_dxil, sizeof(g_DecompressCoopVecFP8_dxil), mathVersion, pOutData, pOutSize);
     else
-        GetDecompressShaderBytecode(g_DecompressINT8_dxil, sizeof(g_DecompressINT8_dxil), mlpDesc, mathVersion, preloadLatents, pOutData, pOutSize);
+        GetDecompressShaderBytecode(g_DecompressINT8_dxil, sizeof(g_DecompressINT8_dxil), mathVersion, pOutData, pOutSize);
 }
 
 void GetBlockCompressDxilShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize)
@@ -119,14 +105,12 @@ void GetImageDifferenceDxilShaderBytecode(const void** pOutData, size_t* pOutSiz
 #endif
 
 #if NTC_WITH_VULKAN
-void GetDecompressSpirvShaderBytecode(MlpDesc const* mlpDesc, InferenceMath mathVersion, bool preloadLatents, const void** pOutData, size_t* pOutSize)
+void GetDecompressSpirvShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize)
 {
-    if (mathVersion == InferenceMath::CoopVecInt8)
-        GetDecompressShaderBytecode(g_DecompressCoopVecInt8_spirv, sizeof(g_DecompressCoopVecInt8_spirv), mlpDesc, mathVersion, preloadLatents, pOutData, pOutSize);
-    else if (mathVersion == InferenceMath::CoopVecFP8)
-        GetDecompressShaderBytecode(g_DecompressCoopVecFP8_spirv, sizeof(g_DecompressCoopVecFP8_spirv), mlpDesc, mathVersion, preloadLatents, pOutData, pOutSize);
+    if (mathVersion == InferenceMath::CoopVecFP8)
+        GetDecompressShaderBytecode(g_DecompressCoopVecFP8_spirv, sizeof(g_DecompressCoopVecFP8_spirv), mathVersion, pOutData, pOutSize);
     else
-        GetDecompressShaderBytecode(g_DecompressINT8_spirv, sizeof(g_DecompressINT8_spirv), mlpDesc, mathVersion, preloadLatents, pOutData, pOutSize);
+        GetDecompressShaderBytecode(g_DecompressINT8_spirv, sizeof(g_DecompressINT8_spirv), mathVersion, pOutData, pOutSize);
 }
 
 void GetBlockCompressSpirvShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize)

@@ -39,14 +39,8 @@ public:
 
     GraphicsAPI GetGraphicsApi() const { return m_graphicsApi; }
 
-    bool IsDP4aSupported() const { return m_dp4aSupported; }
+    bool IsCoopVecSupported() const { return m_coopVecSupported; }
 
-    bool IsFloat16Supported() const { return m_float16Supported; }
-    
-    bool IsCoopVecInt8Supported() const { return m_coopVecInt8Supported; }
-
-    bool IsCoopVecFP8Supported() const { return m_coopVecFP8Supported; }
-    
 #if NTC_WITH_VULKAN
     VkDevice GetVulkanDevice() const { return m_vulkanDevice; }
 
@@ -70,10 +64,7 @@ public:
 private:
     IAllocator* m_allocator;
     GraphicsAPI m_graphicsApi;
-    bool m_dp4aSupported = false;
-    bool m_float16Supported = false;
-    bool m_coopVecInt8Supported = false;
-    bool m_coopVecFP8Supported = false;
+    bool m_coopVecSupported = false;
 
 
 #if NTC_WITH_VULKAN

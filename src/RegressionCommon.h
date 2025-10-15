@@ -34,9 +34,9 @@ struct RegressionKernelParams
     int   numChannels;
     int   numMips;
     int   numNeuralMips;
-    int   highResFeatures;
-    int   lowResFeatures;
+    int   numFeatures;
     int   maskChannelIndex;
+    size_t latentStride;
     bool  discardMaskedOutPixels;
     bool  useFP8Quantization;
     uint32_t validChannelMask;
@@ -49,6 +49,7 @@ struct RegressionKernelParams
           void*     __restrict__ latentGradients;
           void*     __restrict__ networkGradients;
           float*    __restrict__ loss;
+          uint32_t* __restrict__ gradientMask;
 };
 
 struct InferenceKernelParams
@@ -57,6 +58,7 @@ struct InferenceKernelParams
     int   referenceHeight;
     int   numChannels;
     int   maskChannelIndex;
+    size_t latentStride;
     bool  discardMaskedOutPixels;
     bool  useFP8Quantization;
     uint32_t validChannelMask;
@@ -64,8 +66,7 @@ struct InferenceKernelParams
     int   highResLatentHeight;
     int   lowResLatentWidth;
     int   lowResLatentHeight;
-    int   highResFeatures;
-    int   lowResFeatures;
+    int   numFeatures;
     int   lossItemsPerChannel;
     float positionScale;
     float positionLod;
@@ -81,8 +82,10 @@ struct InferenceKernelParams
 struct MipInfo
 {
     uint64_t referenceTextureOffset;
-    uint64_t latentsOffsetHighRes;
-    uint64_t latentsOffsetLowRes;
+    uint64_t highResLatentOffset;
+    uint64_t lowResLatentOffset;
+    uint64_t highResMaskOffset;
+    uint64_t lowResMaskOffset;
 
     float positionScale;
     float positionLod;
@@ -93,7 +96,4 @@ struct MipInfo
     int highResLatentHeight;
     int lowResLatentWidth;
     int lowResLatentHeight;
-
-    uint32_t* highResGradientMask;
-    uint32_t* lowResGradientMask;
 };

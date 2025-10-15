@@ -12,7 +12,7 @@
 
 #include "Optimizer.h"
 #include "CudaUtils.h"
-#include "LatentQuantization.h"
+#include "FeatureGridMath.h"
 #include "tin/tin_reducer.h"
 #include <cooperative_groups.h>
 
@@ -32,13 +32,10 @@ struct AdamConstants
     float stepSize;
     float invSqrtBiasCorrection2;
     float step;
-    float rmin;
-    float rmax;
 };
 
 // Pre-computes various constants that are used by AdamKernel
 AdamConstants PrepareAdamConstants(
-    int   quantizationBits,
     float lossScale,
     float currentStep,
     float learningRate,
@@ -59,56 +56,48 @@ AdamConstants PrepareAdamConstants(
     const float invBiasCorrection1 = 1.f / biasCorrection1;
     constants.stepSize = learningRate * invBiasCorrection1;
     constants.invSqrtBiasCorrection2 = 1.f / sqrtf(biasCorrection2);
-    
-    if (quantizationBits > 0)
-    {
-        QuantizationParameters const quantizationParams = GetLatentQuantization(quantizationBits);
-        
-        constants.step = quantizationParams.step;
-        constants.rmin = round(quantizationParams.qmin) * constants.step;
-        constants.rmax = round(quantizationParams.qmax) * constants.step;
-    }
 
     return constants;
 }
 
 template<class TD>
 __device__ void AdamOptimizerCore(
-    half* __restrict__ baseWeights,
-    half* __restrict__ quantizedWeights,
-    TD* __restrict__ gradients,
-    float* __restrict__ moments1,
-    float* __restrict__ moments2,
+    half& inOutBaseWeight,
+    half& inOutQuantizedWeight,
+    TD& inOutGradient,
+    float& inOutMoment1,
+    float& inOutMoment2,
 
-    int weightIndex,
-    uint32_t randomSeed,
-    AdamConstants constants
+    HashBasedRNG& rng,
+    AdamConstants constants,
+    float quantizationStep
 )
 {
-    float gradient = float(gradients[weightIndex]) * constants.invLossScale;
+    float gradient = float(inOutGradient) * constants.invLossScale;
     if (gradient == 0.f)
         return;
-
-    const float inputWeight = baseWeights[weightIndex];
+    
+    const float inputWeight = inOutBaseWeight;
 
     const float gradientSquared = gradient * gradient;
 
-    const float moment1 = moments1[weightIndex] = constants.beta1 * moments1[weightIndex] + (1.f - constants.beta1) * gradient;
-    const float moment2 = moments2[weightIndex] = constants.beta2 * moments2[weightIndex] + (1.f - constants.beta2) * gradientSquared;
+    const float moment1 = inOutMoment1 = constants.beta1 * inOutMoment1 + (1.f - constants.beta1) * gradient;
+    const float moment2 = inOutMoment2 = constants.beta2 * inOutMoment2 + (1.f - constants.beta2) * gradientSquared;
     
     const float denom = sqrtf(moment2) * constants.invSqrtBiasCorrection2 + constants.epsilon;
     
     float newWeight = inputWeight - (moment1 / denom) * constants.stepSize;
+    
     half newWeightQuantized = half(newWeight);
 
-    if (constants.step != 0.f)
+    if (quantizationStep != 0.f)
     {
-        newWeight = std::min(std::max(newWeight, constants.rmin), constants.rmax);
+        newWeight = std::min(std::max(newWeight, 0.f), 1.f);
         
-        HashBasedRNG rng(randomSeed, weightIndex);
         const float noise = rng.NextFloat() - 0.5f;
 
-        float weight = newWeight + noise * constants.step;
+        float weight = newWeight + noise * quantizationStep;
+        weight = std::min(std::max(weight, 0.f), 1.f);
 
         newWeightQuantized = half(weight);
     }
@@ -119,15 +108,14 @@ __device__ void AdamOptimizerCore(
         if (IsHalfSpecial(newWeightQuantized)) newWeightQuantized = 0;
     }
 
-    gradients[weightIndex] = 0;
-    baseWeights[weightIndex] = newWeight;
-    if (quantizedWeights)
-        quantizedWeights[weightIndex] = newWeightQuantized;
+    inOutBaseWeight = newWeight;
+    inOutQuantizedWeight = newWeightQuantized;
+    inOutGradient = TD(0);
 }
 
 template<class TD>
 __global__ void NetworkAdamKernel(
-    int       dispatchSize,
+    uint32_t dispatchSize,
     half* __restrict__ baseWeights,
     half* __restrict__ quantizedWeights,
     TD* __restrict__ gradients,
@@ -140,17 +128,20 @@ __global__ void NetworkAdamKernel(
     using namespace cooperative_groups;
 
     grid_group grid = this_grid();
-    int i = grid.thread_rank();
+    uint32_t i = grid.thread_rank();
     if (i < dispatchSize)
     {
-        AdamOptimizerCore<TD>(baseWeights, quantizedWeights, gradients, moments1, moments2, i, randomSeed, constants);
+        HashBasedRNG rng(randomSeed, i);
+
+        AdamOptimizerCore<TD>(baseWeights[i], quantizedWeights[i], gradients[i], moments1[i], moments2[i],
+            rng, constants, 0.f);
     }
 }
 
-template<class TD>
+template<class TD, class TD2>
 __global__ void LatentAdamKernel(
-    int numLatentPixels,
-    int numFeatures,
+    uint32_t numPixels,
+    size_t latentStride,
     half* __restrict__ baseWeights,
     half* __restrict__ quantizedWeights,
     TD* __restrict__ gradients,
@@ -164,29 +155,45 @@ __global__ void LatentAdamKernel(
     using namespace cooperative_groups;
 
     grid_group grid = this_grid();
-    int i = grid.thread_rank();
-
-    if (i >= numLatentPixels)
+    uint32_t pixelIndex = grid.thread_index().x;
+    uint32_t featureGroupIndex = grid.thread_index().y;
+    
+    if (pixelIndex >= numPixels)
         return;
 
-    uint32_t const mask = gradientMask[i >> 5];
-    if ((mask & (1u << (i & 31))) == 0)
+    uint32_t const mask = gradientMask[pixelIndex >> 5];
+    if ((mask & (1u << (pixelIndex & 31))) == 0)
         return;
-        
-    for (int feature = 0; feature < numFeatures; feature += 2)
-    {
-        AdamOptimizerCore<TD>(baseWeights, quantizedWeights, gradients,
-            moments1, moments2, i * 2, randomSeed, constants);
 
-        AdamOptimizerCore<TD>(baseWeights, quantizedWeights, gradients,
-            moments1, moments2, i * 2 + 1, randomSeed, constants);
+    size_t latentIndex = size_t(pixelIndex) * FeatureGridMath::FeaturesPerGroup + featureGroupIndex * latentStride;
+    float const quantizationStep = 1.f / 15.f;
 
-        i += numLatentPixels;
-    }
+    TD2 gradientPair = *reinterpret_cast<TD2*>(gradients + latentIndex);
+    if (gradientPair.x == TD(0) && gradientPair.y == TD(0))
+        return;
+
+    half2 baseWeightPair = *reinterpret_cast<half2*>(baseWeights + latentIndex);
+    half2 quantizedWeightPair = *reinterpret_cast<half2*>(quantizedWeights + latentIndex);
+    float2 moment1Pair = *reinterpret_cast<float2*>(moments1 + latentIndex);
+    float2 moment2Pair = *reinterpret_cast<float2*>(moments2 + latentIndex);
+
+    HashBasedRNG rng(randomSeed, latentIndex);
+
+    AdamOptimizerCore<TD>(baseWeightPair.x, quantizedWeightPair.x, gradientPair.x,
+        moment1Pair.x, moment2Pair.x, rng, constants, quantizationStep);
+
+    AdamOptimizerCore<TD>(baseWeightPair.y, quantizedWeightPair.y, gradientPair.y,
+        moment1Pair.y, moment2Pair.y, rng, constants, quantizationStep);
+
+    *reinterpret_cast<half2*>(baseWeights + latentIndex) = baseWeightPair;
+    *reinterpret_cast<half2*>(quantizedWeights + latentIndex) = quantizedWeightPair;
+    *reinterpret_cast<TD2*>(gradients + latentIndex) = gradientPair;
+    *reinterpret_cast<float2*>(moments1 + latentIndex) = moment1Pair;
+    *reinterpret_cast<float2*>(moments2 + latentIndex) = moment2Pair;
 }
 
 void OptimizeNetwork(
-    int       dispatchSize,
+    uint32_t  dispatchSize,
     bool      useFloatGradients,
     half*     __restrict__ baseWeights,
     half*     __restrict__ quantizedWeights,
@@ -202,10 +209,10 @@ void OptimizeNetwork(
     float     beta2,
     float     epsilon)
 {
-    int threadBlockSize = OPT_WG_SIZE;
-    int gridSize = (dispatchSize + threadBlockSize - 1) / threadBlockSize;
+    uint32_t threadBlockSize = OPT_WG_SIZE;
+    uint32_t gridSize = DivRoundUp(dispatchSize, threadBlockSize);
 
-    AdamConstants constants = PrepareAdamConstants(0, lossScale, currentStep, learningRate, beta1, beta2, epsilon);
+    AdamConstants constants = PrepareAdamConstants(lossScale, currentStep, learningRate, beta1, beta2, epsilon);
     
     if (useFloatGradients)
         NetworkAdamKernel<float> <<< gridSize, threadBlockSize >>> (dispatchSize, baseWeights, quantizedWeights,
@@ -252,9 +259,9 @@ void ReduceNetworkGrad(
 }
 
 void OptimizeLatentGrid(
-    int         numLatents,
-    int         numFeatures,
-    int         quantizationBits,
+    uint32_t    numPixels,
+    uint32_t    numFeatures,
+    size_t      latentStride,
     bool        useFloatGradients,
     half*       __restrict__ baseWeights,
     half*       __restrict__ quantizedWeights,
@@ -271,58 +278,58 @@ void OptimizeLatentGrid(
     float     beta2,
     float     epsilon)
 {
-    int numLatentPixels = numLatents / numFeatures;
-    int dispatchSize = numLatentPixels;
-    int threadBlockSize = OPT_WG_SIZE;
-    int gridSize = (dispatchSize + threadBlockSize - 1) / threadBlockSize;
+    dim3 threadBlockSize = dim3(OPT_WG_SIZE, 1, 1);
+    dim3 gridSize = DivRoundUp(dim3(numPixels, numFeatures / FeatureGridMath::FeaturesPerGroup, 1), threadBlockSize);
 
-    AdamConstants constants = PrepareAdamConstants(quantizationBits, lossScale, currentStep, learningRate, beta1, beta2, epsilon);
+    AdamConstants constants = PrepareAdamConstants(lossScale, currentStep, learningRate, beta1, beta2, epsilon);
     
     if (useFloatGradients)
-        LatentAdamKernel<float> <<< gridSize, threadBlockSize >>> (numLatentPixels, numFeatures,
+        LatentAdamKernel<float, float2> <<< gridSize, threadBlockSize >>> (numPixels, latentStride,
             baseWeights, quantizedWeights, (float*)gradients, moments1, moments2, gradientMask, randomSeed, constants);
     else
-        LatentAdamKernel<half> <<< gridSize, threadBlockSize >>> (numLatentPixels, numFeatures,
+        LatentAdamKernel<half, half2> <<< gridSize, threadBlockSize >>> (numPixels, latentStride,
             baseWeights, quantizedWeights, (half*)gradients, moments1, moments2, gradientMask, randomSeed, constants);
 }
 
 __global__ void FreezeQuantizationKernel(
-    int       dispatchSize,
+    uint32_t numPixels,
+    uint32_t numFeatures,
     const half* __restrict__ baseWeights,
-    half*  __restrict__ quantizedWeights,
-    int quantizationBits)
+    half* __restrict__ quantizedWeights)
 {
     using namespace cooperative_groups;
 
     grid_group grid = this_grid();
-    int i = grid.thread_rank();
+    uint32_t globalThreadIndex = grid.thread_rank();
 
-    if (quantizationBits > 0)
+    if (globalThreadIndex >= numPixels)
+        return;
+        
+    size_t latentIndex = size_t(globalThreadIndex) * size_t(numFeatures);
+
+    for (int featureIndex = 0; featureIndex < numFeatures; ++featureIndex)
     {
-        if (i < dispatchSize)
-        {
-            QuantizationParameters const quantizationParams = GetLatentQuantization(quantizationBits);
+        float const quantizationStep = 1.f / 15.f;
 
-            const float inputWeight = baseWeights[i];
-            
-            float weight = inputWeight * quantizationParams.scale;
-            weight = std::min(std::max(weight, quantizationParams.qmin), quantizationParams.qmax);
-            weight = round(weight) * quantizationParams.step;
-            quantizedWeights[i] = half(weight);
-        }
+        float weight = baseWeights[latentIndex];
+        weight = std::min(std::max(weight, 0.f), 1.f);
+        weight = roundf(weight / quantizationStep) * quantizationStep;
+        quantizedWeights[latentIndex] = half(weight);
+        
+        ++latentIndex;
     }
 }
 
 void FreezeQuantization(
-    int       dispatchSize,
-    int       quantizationBits,
+    uint32_t numPixels,
+    uint32_t numFeatures,
     half* __restrict__ baseWeights,
     half*  __restrict__ quantizedWeights)
 {
-    int threadBlockSize = OPT_WG_SIZE;
-    int gridSize = (dispatchSize + threadBlockSize - 1) / threadBlockSize;
+    uint32_t threadBlockSize = OPT_WG_SIZE;
+    uint32_t gridSize = (numPixels + threadBlockSize - 1) / threadBlockSize;
     
-    FreezeQuantizationKernel <<< gridSize, threadBlockSize >>> (dispatchSize, baseWeights, quantizedWeights, quantizationBits);
+    FreezeQuantizationKernel <<< gridSize, threadBlockSize >>> (numPixels, numFeatures, baseWeights, quantizedWeights);
 }
 
 __global__ void LossReductionKernel(
@@ -360,7 +367,7 @@ __global__ void LossReductionKernel(
 cudaError_t ReduceLoss(size_t size, float* __restrict__ loss, DeviceAndHostArray<float>& scratch, float& outReducedLoss)
 {
     int threadBlockSize = LOSS_GROUP_SIZE;
-    size_t gridSize = (size + LOSS_ITEMS_PER_GROUP - 1) / LOSS_ITEMS_PER_GROUP;
+    size_t gridSize = DivRoundUp(size, LOSS_ITEMS_PER_GROUP);
 
     if (size_t(gridSize) > scratch.Length())
         return cudaErrorInvalidValue; // This should not happen, but checking just in case
@@ -375,7 +382,7 @@ cudaError_t ReduceLoss(size_t size, float* __restrict__ loss, DeviceAndHostArray
     
     // Reduce the short array on the CPU using double to avoid precision loss from serial reduction
     double acc = 0.0;
-    for (int idx = 0; idx < gridSize; ++idx)
+    for (size_t idx = 0; idx < gridSize; ++idx)
         acc += double(scratch.HostPtr()[idx]);
     
     outReducedLoss = float(acc);

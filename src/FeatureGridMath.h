@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstddef>
+#include <libntc/shaders/InferenceConstants.h>
 
 namespace ntc
 {
@@ -20,29 +21,21 @@ namespace ntc
 class FeatureGridMath
 {
 public:
-    enum class Grid
-    {
-        HighRes,
-        LowRes
-    };
+    static constexpr int BytesPerLatentPixel = 2;
+    static constexpr int FeaturesPerLayer = NTC_FEATURES_PER_LAYER;
+    static constexpr int FeaturesPerGroup = 2;
 
-    static constexpr int NeuralMipRatio = 2;
+    static size_t CalculateQuantizedLatentsSize(int imageWidth, int imageHeight, int imageMips, int gridScale,
+        int numFeatures);
 
-    static size_t CalculateQuantizedLatentsSize(int imageWidth, int imageHeight, int imageMips, int highResGridScale,
-        int highResFeatures, int lowResFeatures, int highResQuantBits, int lowResQuantBits);
+    static int LodToNeuralLod(int lod, int gridScale, int neuralLods);
 
-    static size_t GetQuantizedLatentSizeUints(size_t num_weights, int quant_bits);
+    static int GetGridDimension(int imageDimension, int neuralLod, int gridScale);
 
-    static int LodToNeuralLod(int lod, int highResGridScale, int neuralLods);
-
-    static int GetGridDimension(Grid grid, int imageDimension, int neuralLod, int highResScale);
-
-    static void GetPositionLodAndScale(int neuralLod, int mipLevel, float& outPositionLod, float& outPositionScale);
+    static int GetNumLayers(int numFeatures);
 
 protected:
-    static int CalculateNumNeuralMipLevels(int imageWidth, int imageHeight, int highResGridScale);
-
-    static size_t CalculateNumLatentsInNeuralMip(Grid grid, int imageWidth, int imageHeight, int highResGridScale, int mip);
+    static int CalculateNumNeuralMipLevels(int imageWidth, int imageHeight, int gridScale);
 };
 
 }

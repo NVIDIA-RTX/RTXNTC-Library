@@ -15,7 +15,6 @@
 #include "Errors.h"
 #include "FeatureGridMath.h"
 #include "JsonFileFormat.h"
-#include "LatentQuantization.h"
 #include "MathUtils.h"
 #include "MlpDesc.h"
 #include "TextureMetadata.h"
@@ -23,6 +22,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstring>
+#include <cmath>
 
 #include <libntc/shaders/DecompressConstants.h>
 
@@ -42,11 +42,6 @@ TextureSetMetadata::TextureSetMetadata(IAllocator* allocator, Context const* con
     , m_rowMajorWeightDataFP8(allocator)
     , m_latentImages(allocator)
 {
-    if (!m_latentShape.IsEmpty())
-    {
-        m_mlpDesc = MlpDesc::PickOptimalConfig(m_latentShape.highResFeatures, m_latentShape.lowResFeatures);
-    }
-
     m_channelColorSpaces.fill(ntc::ColorSpace::Linear);
 
     // Initialize the shuffle pattern with an identity map (i -> i)
@@ -110,54 +105,32 @@ ColorSpace TextureSetMetadata::GetChannelStorageColorSpace(int channel) const
     return ColorSpace::Linear;
 }
 
-int TextureSetMetadata::GetNetworkVersion() const
+LatentTextureDesc TextureSetMetadata::GetLatentTextureDesc() const
 {
-    return m_mlpDesc ? m_mlpDesc->networkVersion : NTC_NETWORK_UNKNOWN;
+    LatentTextureDesc desc;
+    desc.width = m_latentImages[0].width;
+    desc.height = m_latentImages[0].height;
+    desc.arraySize = FeatureGridMath::GetNumLayers(m_latentShape.numFeatures);
+    desc.mipLevels = int(m_latentImages.size());
+    return desc;
 }
 
-Status TextureSetMetadata::GetStreamRangeForLatents(int firstMip, int numMips, StreamRange& outRange) const
+Status TextureSetMetadata::GetLatentTextureFootprint(int latentMipLevel, LatentTextureFootprint& outFootprint) const
 {
-    if (firstMip < 0 || firstMip >= m_desc.mips)
+    if (latentMipLevel < 0 || latentMipLevel >= m_latentImages.size())
     {
-        SetErrorMessage("firstMip (%d) must be between 0 and %d", firstMip, m_desc.mips - 1);
+        SetErrorMessage("latentMipLevel (%d) must be between 0 and %d", latentMipLevel, int(m_latentImages.size() - 1));
         return Status::OutOfRange;
     }
+
+    ntc::LatentImageDesc const& latentImage = m_latentImages[latentMipLevel];
+
+    outFootprint.range = latentImage.range;
+    outFootprint.width = latentImage.width;
+    outFootprint.height = latentImage.height;
+    outFootprint.rowPitch = outFootprint.width * FeatureGridMath::BytesPerLatentPixel;
+    outFootprint.slicePitch = outFootprint.rowPitch * outFootprint.height;
     
-    if (numMips < 1 || firstMip + numMips > m_desc.mips)
-    {
-        SetErrorMessage("numMips (%d) must be between 1 and %d", numMips, m_desc.mips - firstMip);
-        return Status::OutOfRange;
-    }
-
-    int const firstNeuralLod = m_colorMips[firstMip].neuralLod;
-    int const lastNeuralLod = m_colorMips[firstMip + numMips - 1].neuralLod;
-
-    uint64_t rangeStart = 0;
-    uint64_t rangeEnd = 0;
-
-    auto addView = [&rangeStart, &rangeEnd, this](StreamRange view) {
-        uint64_t const viewEnd = view.offset + view.size;
-        if (rangeStart != rangeEnd)
-        {
-            rangeStart = std::min(rangeStart, view.offset);
-            rangeEnd = std::max(rangeEnd, viewEnd);
-        }
-        else
-        {
-            rangeStart = view.offset;
-            rangeEnd = viewEnd;
-        }
-    };
-
-    for (int neuralLod = firstNeuralLod; neuralLod <= lastNeuralLod; ++neuralLod)
-    {
-        addView(m_latentImages[neuralLod].highResRange);
-        addView(m_latentImages[neuralLod].lowResRange);
-    }
-
-    outRange.offset = rangeStart;
-    outRange.size = rangeEnd - rangeStart;
-
     return Status::Ok;
 }
 
@@ -251,7 +224,6 @@ Status TextureSetMetadata::GetMipLevelsForLatentImage(int latentImageIndex, int*
 InferenceWeightType TextureSetMetadata::GetBestSupportedWeightType() const
 {
     for (auto type : { InferenceWeightType::CoopVecFP8,
-                       InferenceWeightType::CoopVecInt8,
                        InferenceWeightType::GenericInt8 })
     {
         if (IsInferenceWeightTypeSupported(type))
@@ -264,7 +236,7 @@ InferenceWeightType TextureSetMetadata::GetBestSupportedWeightType() const
 Status TextureSetMetadata::GetInferenceWeights(InferenceWeightType weightType,
     void const** pOutData, size_t* pOutSize, size_t* pOutConvertedSize)
 {
-    WeightLayout const* layout = m_context->GetWeightLayout(m_mlpDesc->networkVersion, weightType);
+    WeightLayout const* layout = m_context->GetWeightLayout(weightType);
 
     if (!IsInferenceWeightTypeSupported(weightType) || layout == nullptr)
     {
@@ -286,11 +258,6 @@ Status TextureSetMetadata::GetInferenceWeights(InferenceWeightType weightType,
         case InferenceWeightType::GenericFP8:
             size = m_rowMajorWeightDataFP8.size();
             pData = m_rowMajorWeightDataFP8.data();
-            break;
-        case InferenceWeightType::CoopVecInt8:
-            size = m_rowMajorWeightDataInt8.size();
-            pData = m_rowMajorWeightDataInt8.data();
-            convertedSize = layout->bufferSize;
             break;
         case InferenceWeightType::CoopVecFP8:
             size = m_rowMajorWeightDataFP8.size();
@@ -367,15 +334,16 @@ Status TextureSetMetadata::ShuffleInferenceOutputs(ShuffleSource mapping[NTC_MAX
         if (data.empty())
             return;
 
-        WeightLayout const* layout = m_context->GetWeightLayout(m_mlpDesc->networkVersion, weightType);
+        WeightLayout const* layout = m_context->GetWeightLayout(weightType);
         assert(layout);
 
         Span const& outputLayerWeights = layout->weights[NTC_MLP_LAYERS - 1];
         Span const& outputLayerScales = layout->scales[NTC_MLP_LAYERS - 1];
         Span const& outputLayerBiases = layout->biases[NTC_MLP_LAYERS - 1];
 
-        int const inputChannels = m_mlpDesc->GetLayerInputChannels(NTC_MLP_LAYERS - 1);
-        int const outputChannels = m_mlpDesc->GetLayerOutputChannels(NTC_MLP_LAYERS - 1);
+        MlpDesc const& mlpDesc = MlpDesc::Get();
+        int const inputChannels = mlpDesc.GetLayerInputChannels(NTC_MLP_LAYERS - 1);
+        int const outputChannels = mlpDesc.GetLayerOutputChannels(NTC_MLP_LAYERS - 1);
 
         // Sanity check
         assert(inputChannels == NTC_MLP_HIDDEN_CHANNELS);
@@ -465,14 +433,11 @@ Status TextureSetMetadata::LoadMetadataFromStream(json::Document const& document
     
     // MLP versions
 
-    if (!document.mlp.has_value() && document.mlpVersions.empty())
+    if (document.mlpVersions.empty())
     {
         SetErrorMessage("File doesn't contain MLP information");
         return Status::FileUnrecognized;
     }
-
-    if (document.mlp.has_value() && !ValidateMLP(document, *document.mlp))
-        return Status::FileUnrecognized;
 
     for (json::MLP const& mlp : document.mlpVersions)
     {
@@ -538,43 +503,19 @@ Status TextureSetMetadata::LoadMetadataFromStream(json::Document const& document
     {
         // Views
 
-        uint64_t const highResSize = (uint64_t(mipHeader.highResWidth * mipHeader.highResHeight) 
-            * uint32_t(mipHeader.highResBitsPerPixel) + 7) / 8;
+        int const widthBlocks = (mipHeader.width + 3) / 4;
+        int const heightBlocks = (mipHeader.height + 3) / 4;
 
-        uint64_t const lowResSize = (uint64_t(mipHeader.lowResWidth * mipHeader.lowResHeight) 
-            * uint32_t(mipHeader.lowResBitsPerPixel) + 7) / 8;
+        uint64_t const expectedSize = uint64_t(widthBlocks) * uint64_t(heightBlocks) * FeatureGridMath::BytesPerLatentPixel;
 
-        if (!ValidateBufferView(mipHeader.highResView, highResSize, document))
+        if (!ValidateBufferView(mipHeader.view, expectedSize, document))
             return Status::FileUnrecognized;
-            
-        if (!ValidateBufferView(mipHeader.lowResView, lowResSize, document))
-            return Status::FileUnrecognized;
-
-        // Packing
-        int const highResBitsPerPixel = latentShape.highResFeatures * latentShape.highResQuantBits;
-        int const lowResBitsPerPixel = latentShape.lowResFeatures * latentShape.lowResQuantBits;
-        if (mipHeader.highResBitsPerPixel != highResBitsPerPixel ||
-            mipHeader.lowResBitsPerPixel != lowResBitsPerPixel)
-        {
-            SetErrorMessage("Neural MIP %d packing strides (%d and %d bits) don't match "
-                "the expected strides (%d and %d bits)",
-                neuralLod,
-                mipHeader.highResBitsPerPixel,
-                mipHeader.lowResBitsPerPixel,
-                highResBitsPerPixel,
-                lowResBitsPerPixel);
-            return Status::FileUnrecognized;
-        }
-
+        
         LatentImageDesc& imageDesc = m_latentImages.emplace_back();
-        imageDesc.highResRange.offset = document.views[mipHeader.highResView].offset + m_binaryChunkOffset;
-        imageDesc.highResRange.size = document.views[mipHeader.highResView].storedSize;
-        imageDesc.lowResRange.offset = document.views[mipHeader.lowResView].offset + m_binaryChunkOffset;
-        imageDesc.lowResRange.size = document.views[mipHeader.lowResView].storedSize;
-        imageDesc.highResWidth = mipHeader.highResWidth;
-        imageDesc.highResHeight = mipHeader.highResHeight;
-        imageDesc.lowResWidth = mipHeader.lowResWidth;
-        imageDesc.lowResHeight = mipHeader.lowResHeight;
+        imageDesc.range.offset = document.views[mipHeader.view].offset + m_binaryChunkOffset;
+        imageDesc.range.size = document.views[mipHeader.view].storedSize;
+        imageDesc.width = mipHeader.width;
+        imageDesc.height = mipHeader.height;
 
         ++neuralLod;
     }
@@ -593,20 +534,15 @@ Status TextureSetMetadata::LoadMetadataFromStream(json::Document const& document
         }
 
         m_colorMips[mipLevel].neuralLod = *colorMip.latentMip;
-        if (colorMip.positionLod.has_value() && colorMip.positionScale.has_value())
+        
+        if (!colorMip.positionLod.has_value() || !colorMip.positionScale.has_value())
         {
-            m_colorMips[mipLevel].positionLod = *colorMip.positionLod;
-            m_colorMips[mipLevel].positionScale = *colorMip.positionScale;
+            SetErrorMessage("Color MIP %d doesn't have the positionLod and positionScale parameters.", mipLevel);
+            return Status::FileUnrecognized;
         }
-        else
-        {
-            // [COMPAT]
-            // These parameters are always provided now, but older versions of libntc didn't do that.
-            // Reconstruct them using normal rules in this case.
-            FeatureGridMath::GetPositionLodAndScale(*colorMip.latentMip, mipLevel,
-                m_colorMips[mipLevel].positionLod,
-                m_colorMips[mipLevel].positionScale);
-        }
+
+        m_colorMips[mipLevel].positionLod = *colorMip.positionLod;
+        m_colorMips[mipLevel].positionScale = *colorMip.positionScale;
 
         if (colorMip.width.has_value() && colorMip.height.has_value())
         {
@@ -686,12 +622,12 @@ Status TextureSetMetadata::ConvertInferenceWeights(InferenceWeightType weightTyp
         return Status::InvalidArgument;
     }
     
-    WeightLayout const* srcLayout = m_context->GetWeightLayout(m_mlpDesc->networkVersion,
+    WeightLayout const* srcLayout = m_context->GetWeightLayout(
         CoopVecWeightConverter::GetGenericWeightType(weightType));
 
     assert(srcLayout); // Row-major layouts are always available
 
-    WeightLayout const* dstLayout = m_context->GetWeightLayout(m_mlpDesc->networkVersion, weightType);
+    WeightLayout const* dstLayout = m_context->GetWeightLayout(weightType);
 
     if (dstLayout == nullptr)
     {
@@ -700,23 +636,11 @@ Status TextureSetMetadata::ConvertInferenceWeights(InferenceWeightType weightTyp
         return Status::Unsupported;
     }
 
-    CoopVecWeightConverter::ConvertWeights(m_context->GetGraphicsResources(), *m_mlpDesc,
+    CoopVecWeightConverter::ConvertWeights(m_context->GetGraphicsResources(), MlpDesc::Get(),
         *srcLayout, srcBuffer, srcOffset,
         *dstLayout, dstBuffer, dstOffset, commandList);
 
     return Status::Ok;
-}
-
-// Get the MLP weight type from the legacy descriptor in the MLP or the new descriptor in its first layer
-static std::optional<json::MlpDataType> GetRepresentativeMlpWeightType(std::optional<json::MLP> const& mlp)
-{
-    if (!mlp.has_value())
-        return std::nullopt;
-
-    if (!mlp->layers.empty() && mlp->layers[0].weightType.has_value())
-        return mlp->layers[0].weightType;
-
-    return mlp->weightType;
 }
 
 Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document, IStream* inputStream)
@@ -724,7 +648,7 @@ Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document,
     auto readMlpData = [this, &inputStream, &document]
     (json::MLP const& mlp, Vector<uint8_t>& dst, InferenceWeightType weightType)
     {
-        WeightLayout const* weightLayout = m_context->GetWeightLayout(m_mlpDesc->networkVersion, weightType);
+        WeightLayout const* weightLayout = m_context->GetWeightLayout(weightType);
         dst.resize(weightLayout->bufferSize);
         
         for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
@@ -761,48 +685,6 @@ Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document,
             if (!ReadViewFromStream(inputStream, document, layer.biasView,
                 dst.data() + layerBias.offset, layerBias.size))
                 return Status::IOError;
-
-            // For INT8 layers in legacy files, convert the float scale and bias from the (float(output) * scale + bias) form
-            // to the (float(output + int(bias/scale)) * scale) form
-            std::optional<json::MlpDataType> storedBiasType;
-            if (layer.biasType.has_value())
-                storedBiasType = layer.biasType;
-            else if (layer.scaleBiasType.has_value())
-                storedBiasType = layer.scaleBiasType;
-            else
-                storedBiasType = mlp.scaleBiasType;
-
-            if (layerWeights.type == DataType::Int8 &&
-                layerBias.type == DataType::Int32 && storedBiasType == json::MlpDataType::Float32 &&
-                layerScale.type == DataType::FP32)
-            {
-                int const inputChannels = m_mlpDesc->GetLayerInputChannels(layerIndex);
-                for (uint32_t i = 0; i < layer.outputChannels; ++i)
-                {
-                    float* const pScale = (float*)(dst.data() + layerScale.offset) + i;
-                    
-                    // Use void* because we're converting from a float to an int
-                    void* pBias = dst.data() + layerBias.offset + i * sizeof(float);
-
-                    // Special case when scale is zero, which can happen on the output layer if an image channel is constant.
-                    // See also QuantizeColumnInt8(...) in Quantizer.cu which implements the same logic.
-                    if (*pScale == 0.f)
-                    {
-                        // Zero scale: use a predefined constant scale and express the constant bias using this scale.
-                        *pScale = 1.f / c_ConstantBiasScale;
-                        *(int*)pBias = int(roundf(*(float*)pBias * c_ConstantBiasScale));
-
-                        // Zero out the weights to produce the correct result.
-                        uint8_t* pWeightRow = dst.data() + layerWeights.offset + inputChannels * i;
-                        memset(pWeightRow, 0, inputChannels);
-                    }
-                    else
-                    {
-                        // Nonzero scale: simple conversion.
-                        *(int*)pBias = int(roundf(*(float*)pBias / *pScale));
-                    }
-                }
-            }
         }
 
         return Status::Ok;
@@ -810,24 +692,12 @@ Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document,
 
     Status status;
 
-    std::optional<json::MlpDataType> const documentMlpWeightType = GetRepresentativeMlpWeightType(document.mlp);
-
-    if (documentMlpWeightType == json::MlpDataType::Int8)
-    {
-        status = readMlpData(*document.mlp, m_rowMajorWeightDataInt8, InferenceWeightType::GenericInt8);
-        if (status != Status::Ok)
-            return status;
-    }
-    else if (documentMlpWeightType == json::MlpDataType::FloatE4M3)
-    {
-        status = readMlpData(*document.mlp, m_rowMajorWeightDataFP8, InferenceWeightType::GenericFP8);
-        if (status != Status::Ok)
-            return status;
-    }
-
     for (json::MLP const& mlp : document.mlpVersions)
     {
-        std::optional<json::MlpDataType> const mlpWeightType = GetRepresentativeMlpWeightType(mlp);
+        if (mlp.layers.empty())
+            continue;
+        
+        json::MlpDataType const mlpWeightType = mlp.layers[0].weightType;
 
         if (mlpWeightType == json::MlpDataType::Int8)
         {
@@ -847,14 +717,19 @@ Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document,
 }
 
 void TextureSetMetadata::GetWeightOffsets(InferenceWeightType weightType,
-    int weightOffsets[NTC_MLP_LAYERS], int& scaleBiasOffset)
+    int weightOffsets[NTC_MLP_LAYERS],
+    int biasOffsets[NTC_MLP_LAYERS],
+    int scaleOffsets[NTC_MLP_LAYERS]) const
 {
-    WeightLayout const* layout = m_context->GetWeightLayout(m_mlpDesc->networkVersion, weightType);
+    WeightLayout const* layout = m_context->GetWeightLayout(weightType);
     assert(layout); // Support should be validated by the caller
 
     for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
+    {
         weightOffsets[layer] = int(layout->weights[layer].offset);
-    scaleBiasOffset = int(layout->combinedScaleBias.offset);
+        biasOffsets[layer] = int(layout->biases[layer].offset);
+        scaleOffsets[layer] = int(layout->scales[layer].offset);
+    }
 }
 
 static uint32_t GetChannelMask(int firstChannel, int numChannels)
@@ -905,48 +780,12 @@ uint32_t TextureSetMetadata::GetPackedColorSpaces() const
     return packed;
 }
 
-void TextureSetMetadata::FillNeuralMipConstants(
-    NtcNeuralMipConstants& highResLatents,
-    NtcNeuralMipConstants& lowResLatents,
-    int neuralLod,
-    uint64_t latentBufferOffset)
-{
-    if (m_latentImages.empty())
-        return;
-
-    LatentImageDesc const& latentImage = m_latentImages[neuralLod];
-
-    if (latentImage.highResRange.offset < latentBufferOffset || 
-        latentImage.lowResRange.offset < latentBufferOffset)
-    {
-        // If the neural mip data is out of the available range, silently do nothing.
-        // The decompression function validates the necessary range, and the inference function will ignore the issue.
-        // TODO: implement binding a subset of the mip chain for inference.
-        return;
-    }
-
-    highResLatents.dataOffset = uint32_t(latentImage.highResRange.offset - latentBufferOffset);
-    highResLatents.imageWidth = uint16_t(latentImage.highResWidth);
-    highResLatents.imageHeight = uint16_t(latentImage.highResHeight);
-    highResLatents.sliceLeft = 0;
-    highResLatents.sliceTop = 0;
-    highResLatents.sliceWidth = highResLatents.imageWidth;
-    highResLatents.sliceHeight = highResLatents.imageHeight;
-
-    lowResLatents.dataOffset = uint32_t(latentImage.lowResRange.offset - latentBufferOffset);
-    lowResLatents.imageWidth = uint16_t(latentImage.lowResWidth);
-    lowResLatents.imageHeight = uint16_t(latentImage.lowResHeight);
-    lowResLatents.sliceLeft = 0;
-    lowResLatents.sliceTop = 0;
-    lowResLatents.sliceWidth = lowResLatents.imageWidth;
-    lowResLatents.sliceHeight = lowResLatents.imageHeight;
-}
-
 void TextureSetMetadata::FillColorMipConstants(
     NtcColorMipConstants& colorMip,
-    int mipLevel)
+    int mipLevel,
+    int firstLatentMipInTexture)
 {
-    colorMip.neuralMip = m_colorMips[mipLevel].neuralLod;
+    colorMip.neuralMip = m_colorMips[mipLevel].neuralLod - firstLatentMipInTexture;
     colorMip.positionLod = m_colorMips[mipLevel].positionLod;
     colorMip.positionScale = m_colorMips[mipLevel].positionScale;
     colorMip.pad = 0;
@@ -954,18 +793,12 @@ void TextureSetMetadata::FillColorMipConstants(
 
 void TextureSetMetadata::FillDecompressionConstants(
     NtcDecompressConstants& output,
-    InferenceWeightType weightType,
-    int weightOffset,
-    int mipLevel,
+    MakeDecompressionComputePassParameters const& params,
     Rect srcRect,
-    Point dstOffset,
-    OutputTextureDesc const* pOutputTextures,
-    int numOutputTextures,
-    int firstOutputDescriptorIndex,
-    uint64_t latentBufferOffset)
+    Point dstOffset)
 {
-    int const mipWidth = std::max(m_desc.width >> mipLevel, 1);
-    int const mipHeight = std::max(m_desc.height >> mipLevel, 1);
+    int const mipWidth = std::max(m_desc.width >> params.mipLevel, 1);
+    int const mipHeight = std::max(m_desc.height >> params.mipLevel, 1);
 
     output.srcLeft = srcRect.left;
     output.srcTop = srcRect.top;
@@ -974,16 +807,24 @@ void TextureSetMetadata::FillDecompressionConstants(
     output.dstLeft = dstOffset.x;
     output.dstTop = dstOffset.y;
     
-    // Round down the grid origin to a multiple of 8 to make sure each thread group preloads all the latents
-    output.gridLeft = srcRect.left & ~7;
-    output.gridTop = srcRect.top & ~7;
     output.imageWidth = mipWidth;
     output.imageHeight = mipHeight;
     
-    GetWeightOffsets(weightType, output.networkWeightOffsets, output.networkScaleBiasOffset);
+    GetWeightOffsets(
+        params.weightType,
+        output.networkWeightOffsets,
+        output.networkBiasOffsets,
+        output.networkScaleOffsets);
+        
     for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
-        output.networkWeightOffsets[layer] += weightOffset;
-    output.networkScaleBiasOffset += weightOffset;
+    {
+        output.networkWeightOffsets[layer] += params.weightOffset;
+        output.networkBiasOffsets[layer] += params.weightOffset;
+        output.networkScaleOffsets[layer] += params.weightOffset;
+    }
+
+    OutputTextureDesc const* pOutputTextures = params.pOutputTextures;
+    int numOutputTextures = params.numOutputTextures;
 
     // If there are no user-specified outputs, fill out the output descriptors from metadata
     OutputTextureDesc defaultOutputs[DECOMPRESS_CS_MAX_OUTPUTS] {};
@@ -1019,7 +860,7 @@ void TextureSetMetadata::FillDecompressionConstants(
         dst.dstRgbColorSpace = int(src.rgbColorSpace);
         dst.dstAlphaColorSpace = int(src.alphaColorSpace);
         dst.ditherScale = src.ditherScale;
-        dst.textureIndex = firstOutputDescriptorIndex + src.descriptorIndex;
+        dst.textureIndex = params.firstOutputDescriptorIndex + src.descriptorIndex;
         
         int alphaChannel = dst.firstChannel + 3;
         // TODO: validate that all 3 RGB channels have the same storage color space, or support them being different.
@@ -1030,16 +871,8 @@ void TextureSetMetadata::FillDecompressionConstants(
             ? int(m_channelColorSpaces[alphaChannel])
             : int(ColorSpace::Linear);
     }
-
-    FillLatentEncodingConstants(output.highResEncoding,
-        m_latentShape.highResFeatures, m_latentShape.highResQuantBits, weightType);
-    FillLatentEncodingConstants(output.lowResEncoding,
-        m_latentShape.lowResFeatures, m_latentShape.lowResQuantBits, weightType);
-
-    int const neuralLod = m_colorMips[mipLevel].neuralLod;
-    FillNeuralMipConstants(output.highResNeuralMip, output.lowResNeuralMip, neuralLod, latentBufferOffset);
-
-    FillColorMipConstants(output.colorMip, mipLevel);
+    
+    FillColorMipConstants(output.colorMip, params.mipLevel, params.firstLatentMipInTexture);
 }
 
 bool TextureSetMetadata::ValidateBufferView(uint32_t view, uint64_t minSize,
@@ -1098,17 +931,6 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
         return false;
     }
 
-    // Derive the NetworkVersion from the MLP input count
-
-    m_mlpDesc = MlpDesc::FromInputChannels(mlp.layers[0].inputChannels);
-    if (!m_mlpDesc)
-    {
-        SetErrorMessage("File contains MLP weights for %d input channels, "
-            "which is an unsupported configuration.",
-            mlp.layers[0].inputChannels);
-        return false;
-    }
-
     // Validate the MLP geometry
 
     if (mlp.weightLayout != json::MatrixLayout::RowMajor)
@@ -1118,9 +940,9 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
     }
 
     // We support two MLP configurations:
-    // 1. All layers have Int8 weights, Float32 scale, Int32 or Float32 (legacy) bias
+    // 1. All layers have Int8 weights, Float32 scale, Int32 bias
     // 2. Layers 0-2 have FP8 weights and Float16 bias;
-    //    Layer 3 has Int8 weights, Float32 scale, Int32 or Float32 (legacy) bias
+    //    Layer 3 has Int8 weights, Float32 scale, Int32 bias
     // Validate that the provided config matches one of these.
     static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_Int8WeightTypes = {
         json::MlpDataType::Int8, json::MlpDataType::Int8, json::MlpDataType::Int8, json::MlpDataType::Int8 };
@@ -1128,15 +950,11 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
         json::MlpDataType::Float32, json::MlpDataType::Float32, json::MlpDataType::Float32, json::MlpDataType::Float32 };
     static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_Int8BiasTypes = {
         json::MlpDataType::Int32, json::MlpDataType::Int32, json::MlpDataType::Int32, json::MlpDataType::Int32 };
-    static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_Int8LegacyBiasTypes = {
-        json::MlpDataType::Float32, json::MlpDataType::Float32, json::MlpDataType::Float32, json::MlpDataType::Float32 };
     static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_FP8WeightTypes = {
         json::MlpDataType::FloatE4M3, json::MlpDataType::FloatE4M3, json::MlpDataType::FloatE4M3, json::MlpDataType::Int8 };
     static std::array<std::optional<json::MlpDataType>, NTC_MLP_LAYERS> const c_FP8ScaleTypes = {
         std::nullopt, std::nullopt, std::nullopt, json::MlpDataType::Float32 };
     static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_FP8BiasTypes = {
-        json::MlpDataType::Float16, json::MlpDataType::Float16, json::MlpDataType::Float16, json::MlpDataType::Float32 };
-    static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_FP8LegacyBiasTypes = {
         json::MlpDataType::Float16, json::MlpDataType::Float16, json::MlpDataType::Float16, json::MlpDataType::Int32 };
 
     std::array<json::MlpDataType, NTC_MLP_LAYERS> weightTypes;
@@ -1145,69 +963,43 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
     for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
     {
         json::MLPLayer const& layer = mlp.layers[layerIndex];
-        if (layer.weightType.has_value())
-            weightTypes[layerIndex] = *layer.weightType;
-        else if (mlp.weightType.has_value())
-            weightTypes[layerIndex] = *mlp.weightType;
-        else
-        {
-            SetErrorMessage("MLP layer %d doesn't have a weight type defined, "
-                "and the MLP doesn't have a default weight type either.", layerIndex);
-            return false;
-        }
-
-        if (layer.scaleType.has_value())
-            scaleTypes[layerIndex] = layer.scaleType;
-        else if (layer.scaleBiasType.has_value() && layer.scaleView.has_value())
-            scaleTypes[layerIndex] = layer.scaleBiasType;
-        else if (mlp.scaleBiasType.has_value() && layer.scaleView.has_value())
-            scaleTypes[layerIndex] = mlp.scaleBiasType;
-
-        if (layer.biasType.has_value())
-            biasTypes[layerIndex] = *layer.biasType;
-        else if (layer.scaleBiasType.has_value())
-            biasTypes[layerIndex] = *layer.scaleBiasType;
-        else if (mlp.scaleBiasType.has_value())
-            biasTypes[layerIndex] = *mlp.scaleBiasType;
-        else
-        {
-            SetErrorMessage("MLP layer %d doesn't have a bias type defined, "
-                "and the MLP doesn't have a default bias type either.", layerIndex);
-            return false;
-        }
+        weightTypes[layerIndex] = layer.weightType;
+        biasTypes[layerIndex] = layer.biasType;
+        scaleTypes[layerIndex] = layer.scaleType;
     }
 
     bool const isValidInt8MLP =
         weightTypes == c_Int8WeightTypes &&
         scaleTypes == c_Int8ScaleTypes &&
-        (biasTypes == c_Int8BiasTypes || biasTypes == c_Int8LegacyBiasTypes);
+        biasTypes == c_Int8BiasTypes;
 
     bool const isValidFP8MLP =
         weightTypes == c_FP8WeightTypes &&
         scaleTypes == c_FP8ScaleTypes &&
-        (biasTypes == c_FP8BiasTypes || biasTypes == c_FP8LegacyBiasTypes);
+        biasTypes == c_FP8BiasTypes;
 
     if (!isValidInt8MLP && !isValidFP8MLP)
     {
-        SetErrorMessage("Only Int8 weights + Float32 scale + Float32/Int32 bias or FloatE4M3 + Float16 bias"
+        SetErrorMessage("Only Int8 weights + Float32 scale + Int32 bias or FloatE4M3 + Float16 bias"
             " MLP configurations are supported at this time.");
         return false;
     }
 
+    MlpDesc const& mlpDesc = MlpDesc::Get();
     for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
     {
         json::MLPLayer const& layer = mlp.layers[layerIndex];
 
-        if (layer.inputChannels != m_mlpDesc->GetLayerInputChannels(layerIndex) ||
-            layer.outputChannels != m_mlpDesc->GetLayerOutputChannels(layerIndex))
+        if (layer.inputChannels != mlpDesc.GetLayerInputChannels(layerIndex) ||
+            layer.outputChannels != mlpDesc.GetLayerOutputChannels(layerIndex))
         {   
             SetErrorMessage("File describes MLP layer %d with %d inputs and %d outputs, "
                 "but that layer should have %d inputs and %d outputs.",
                 layerIndex,
                 layer.inputChannels,
                 layer.outputChannels,
-                m_mlpDesc->GetLayerInputChannels(layerIndex),
-                m_mlpDesc->GetLayerOutputChannels(layerIndex));
+                mlpDesc.GetLayerInputChannels(layerIndex),
+                mlpDesc.GetLayerOutputChannels(layerIndex));
             return false;
         }
 
@@ -1237,123 +1029,25 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
     return true;
 }
 
-void TextureSetMetadata::FillLatentEncodingConstants(NtcLatentEncodingConstants& encoding,
-    int numFeatures, int quantBits, InferenceWeightType weightType)
-{
-    QuantizationParameters const quantizationParams = GetLatentQuantization(quantBits);
-    
-    encoding.numFeatures = numFeatures;
-    encoding.quantBits = quantBits;
-    encoding.logElementsPerUint = 5 - Log2i(quantBits);
-    encoding.pad = 0;
-
-    encoding.addressMask = (1u << encoding.logElementsPerUint) - 1u;
-    encoding.dataMask = (1u << encoding.quantBits) - 1u;
-
-    if (weightType == InferenceWeightType::GenericFP8 || weightType == InferenceWeightType::CoopVecFP8)
-    {
-        // Copy the step and bias parameters (floats) into int variables
-        std::memcpy(&encoding.quantizedScale, &quantizationParams.step, sizeof(float));
-        std::memcpy(&encoding.quantizedBias, &quantizationParams.bias, sizeof(float));
-    }
-    else
-    {
-        // These scale and bias values convert latents from their low-bit quantized representation
-        // into the same quantized representation used by the Int8 network inputs.
-        // The reason this works at all is a numeric relationship between the quantization scales:
-        // - 1-bit latents have scale = 2/3, i.e. we use 3 bins and drop the lowest one
-        // - 2-bit latents have scale = 2/5
-        // - 4-bit latents have scale = 2/17
-        // - 8-bit latents have scale = 2/255 as a special case to be compatible with inputs
-        // - network inputs have scale = 2/255 = 2/(3*5*17)
-        // So, we just multiply the quantized latents by the product of the remaining 2 factors 
-        // to get it to the right scale. The bias is just negative index of the latent bin that contains zero,
-        // multiplied by the scale.
-        switch(quantBits)
-        {
-            case 1:
-                encoding.quantizedScale = 5 * 17;
-                encoding.quantizedBias = 0;
-                break;
-            case 2:
-                encoding.quantizedScale = 3 * 17;
-                encoding.quantizedBias = -encoding.quantizedScale;
-                break;
-            case 4:
-                encoding.quantizedScale = 3 * 5;
-                encoding.quantizedBias = -7 * encoding.quantizedScale;
-                break;
-            case 8:
-                encoding.quantizedScale = 1;
-                encoding.quantizedBias = -126;
-                break;
-            default:
-                assert(!"Unsupported latent quantization bits!");
-        }
-    }
-}
-
-Status TextureSetMetadata::ValidateLatentShape(LatentShape const& latentShape, int networkVersion)
+Status TextureSetMetadata::ValidateLatentShape(LatentShape const& latentShape)
 {
     if (latentShape.IsEmpty())
         return Status::Ok;
         
-    if (latentShape.highResFeatures < 4 ||
-        latentShape.highResFeatures > 16 ||
-        (latentShape.highResFeatures & 3) != 0 ||
-        latentShape.lowResFeatures < 4 ||
-        latentShape.lowResFeatures > 16 ||
-        (latentShape.lowResFeatures & 3) != 0)
+    if (latentShape.numFeatures <= 0 ||
+        latentShape.numFeatures > NTC_MLP_FEATURES ||
+        (latentShape.numFeatures % NTC_FEATURES_PER_LAYER) != 0)
     {
-        SetErrorMessage("Invalid LatentShape: highResFeatures (%d) and lowResFeatures (%d) "
-            "must be multiples of 4 between 4 and 16.",
-            latentShape.highResFeatures, latentShape.lowResFeatures);
+        SetErrorMessage("Invalid LatentShape: numFeatures (%d) must be a positive multiple of %d up to %d.",
+            latentShape.numFeatures, NTC_FEATURES_PER_LAYER, NTC_MLP_FEATURES);
         return Status::OutOfRange;
     }
 
-    if (latentShape.gridSizeScale < 2 || latentShape.gridSizeScale > 8)
+    if (latentShape.gridSizeScale < 1 || latentShape.gridSizeScale > 6)
     {
-        SetErrorMessage("Invalid LatentShape: gridSizeScale (%d) must be between 2 and 8.",
+        SetErrorMessage("Invalid LatentShape: gridSizeScale (%d) must be between 1 and 6.",
             latentShape.gridSizeScale);
         return Status::OutOfRange;
-    }
-
-    constexpr int maxQuantBits = 8;
-    if (latentShape.highResQuantBits <= 0 ||
-        latentShape.highResQuantBits > maxQuantBits ||
-        !IsPowerOf2(latentShape.highResQuantBits) ||
-        latentShape.lowResQuantBits <= 0 ||
-        latentShape.lowResQuantBits > maxQuantBits ||
-        !IsPowerOf2(latentShape.lowResQuantBits))
-    {
-        SetErrorMessage("Invalid LatentShape: highResQuantBits (%d) and lowResQuantBits (%d) "
-            "must be powers of 2 between 1 and %d.",
-            latentShape.highResQuantBits, latentShape.lowResQuantBits, maxQuantBits);
-        return Status::OutOfRange;
-    }
-
-    if (networkVersion != NTC_NETWORK_UNKNOWN)
-    {
-        MlpDesc const* mlpDesc = MlpDesc::FromNetworkVersion(networkVersion);
-
-        if (!mlpDesc)
-        {
-            SetErrorMessage("NetworkVersion (%d) must be between %d and %d",
-                networkVersion, NTC_NETWORK_UNKNOWN, NTC_NETWORK_XLARGE);
-            return Status::OutOfRange;
-        }
-
-        if (mlpDesc->highResFeatures < latentShape.highResFeatures ||
-            mlpDesc->lowResFeatures < latentShape.lowResFeatures)
-        {
-            SetErrorMessage("NetworkVersion (%s) is too small for the provided LatentShape: it supports "
-                "up to %d high-res and %d low-res features, while the latent shape specifies %d high-res and "
-                "%d low-res features.",
-                NetworkVersionToString(networkVersion),
-                mlpDesc->highResFeatures, mlpDesc->lowResFeatures,
-                latentShape.highResFeatures, latentShape.lowResFeatures);
-            return Status::OutOfRange;
-        }
     }
 
     return Status::Ok;
@@ -1387,14 +1081,11 @@ Status TextureSetMetadata::DeserializeTextureSetDesc(json::Document const& docum
     desc.mips = document.numColorMips.value_or(1);
     if (document.latentShape.has_value() && !document.latents.empty())
     {
-        latentShape.highResQuantBits = document.latentShape->highResQuantBits;
-        latentShape.lowResQuantBits = document.latentShape->lowResQuantBits;
-        latentShape.highResFeatures = document.latentShape->highResFeatures;
-        latentShape.lowResFeatures = document.latentShape->lowResFeatures;
+        latentShape.numFeatures = document.latentShape->numFeatures;
         
         json::LatentImage const& firstLatents = document.latents[0];
-        float const widthRatio = float(desc.width) / float(std::max(firstLatents.highResWidth, 1u));
-        float const heightRatio = float(desc.height) / float(std::max(firstLatents.highResHeight, 1u));
+        float const widthRatio = float(desc.width) / float(std::max(firstLatents.width, 1u));
+        float const heightRatio = float(desc.height) / float(std::max(firstLatents.height, 1u));
         latentShape.gridSizeScale = int(roundf(std::min(widthRatio, heightRatio)));
     }
     else
@@ -1404,7 +1095,7 @@ Status TextureSetMetadata::DeserializeTextureSetDesc(json::Document const& docum
     if (status != Status::Ok)
         return status;
 
-    status = ValidateLatentShape(latentShape, NTC_NETWORK_UNKNOWN);
+    status = ValidateLatentShape(latentShape);
     if (status != Status::Ok)
         return status;
 
@@ -1458,13 +1149,6 @@ Status TextureSetMetadata::LoadFileHeadersFromStream(IAllocator* allocator, IStr
     if (!json::ParseDocument(outDocument, jsonData.data(), errorMessage))
     {
         SetUnformattedErrorMessage(errorMessage.c_str());
-        return Status::FileUnrecognized;
-    }
-
-    if (outDocument.schemaVersion != json::Document::SchemaVersion)
-    {
-        SetErrorMessage("Incompatible file schema version: expected %u, got %u.",
-            json::Document::SchemaVersion, outDocument.schemaVersion);
         return Status::FileUnrecognized;
     }
 

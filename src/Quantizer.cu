@@ -16,7 +16,6 @@
 #include "FeatureGridMath.h"
 #include "MlpDesc.h"
 #include "RegressionCommon.h"
-#include "LatentQuantization.h"
 #include "tin/tin_matrix_host.h"
 #include "tin/tin_activation.h"
 #include "tin/tin_mlp.h"
@@ -317,25 +316,27 @@ __global__ void QuantizeNetworkFP8Kernel(
 }
 
 void QuantizeNetwork(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ outputData,
     bool useFP8)
 {
-    int const outputCount = mlpDesc->GetLayerOutputCount();
-    int const weightCount = mlpDesc->GetWeightCount();
-    
+    int const outputCount = mlpDesc.GetLayerOutputCount();
+    int const weightCount = mlpDesc.GetWeightCount();
+
     int threadBlockSize = outputCount;
+    int gridSize = 1;
+
     if (useFP8)
     {
-        QuantizeNetworkFP8Kernel <<< outputCount, threadBlockSize >>> (weightCount, mlpDesc->GetHiddenLayers(),
-            mlpDesc->GetInputChannels(), mlpDesc->GetHiddenChannels(), mlpDesc->GetOutputChannels(),
+        QuantizeNetworkFP8Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
+            mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
             halfWeights, outputData);
     }
     else
     {
-        QuantizeNetworkInt8Kernel <<< outputCount, threadBlockSize >>> (weightCount, mlpDesc->GetHiddenLayers(),
-            mlpDesc->GetInputChannels(), mlpDesc->GetHiddenChannels(), mlpDesc->GetOutputChannels(),
+        QuantizeNetworkInt8Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
+            mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
             halfWeights, outputData);
     }
 }
@@ -490,24 +491,26 @@ __global__ void ConvertNetworkFromFP8ToFP16Kernel(
 }
 
 void ConvertNetworkFromQuantizedToFp16(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ inputData,
     bool useFP8)
 {
-    int const outputCount = mlpDesc->GetLayerOutputCount();
-    int const weightCount = mlpDesc->GetWeightCount();
+    int const outputCount = mlpDesc.GetLayerOutputCount();
+    int const weightCount = mlpDesc.GetWeightCount();
 
     int threadBlockSize = outputCount;
+    int gridSize = 1;
+
     if (useFP8)
     {
-        ConvertNetworkFromFP8ToFP16Kernel <<< outputCount, threadBlockSize >>> (weightCount, mlpDesc->GetHiddenLayers(),
-        mlpDesc->GetInputChannels(), mlpDesc->GetHiddenChannels(), mlpDesc->GetOutputChannels(), halfWeights, inputData);
+        ConvertNetworkFromFP8ToFP16Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
+        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.   GetOutputChannels(), halfWeights, inputData);
     }
     else
     {
-        ConvertNetworkFromInt8ToFP16Kernel <<< outputCount, threadBlockSize >>> (weightCount, mlpDesc->GetHiddenLayers(),
-        mlpDesc->GetInputChannels(), mlpDesc->GetHiddenChannels(), mlpDesc->GetOutputChannels(), halfWeights, inputData);
+        ConvertNetworkFromInt8ToFP16Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
+        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(), halfWeights, inputData);
     }
 }
 
@@ -558,16 +561,18 @@ __global__ void ExportNetworkIntoRowMajorLayoutKernel(
 }
 
 void ExportNetworkIntoRowMajorLayout(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     half* __restrict__ outputData)
 {
-    int const outputCount = mlpDesc->GetLayerOutputCount();
-    int const weightCount = mlpDesc->GetWeightCount();
+    int const outputCount = mlpDesc.GetLayerOutputCount();
+    int const weightCount = mlpDesc.GetWeightCount();
 
     int threadBlockSize = outputCount;
-    ExportNetworkIntoRowMajorLayoutKernel <<< outputCount, threadBlockSize >>> (weightCount, mlpDesc->GetHiddenLayers(),
-        mlpDesc->GetInputChannels(), mlpDesc->GetHiddenChannels(), mlpDesc->GetOutputChannels(),
+    int gridSize = 1;
+
+    ExportNetworkIntoRowMajorLayoutKernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
+        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
         halfWeights, outputData);
 }
 
@@ -612,159 +617,125 @@ __global__ void ImportNetworkFromRowMajorLayoutKernel(
 }
 
 void ImportNetworkFromRowMajorLayout(
-    MlpDesc const* mlpDesc,
+    MlpDesc const& mlpDesc,
     half* __restrict__ halfWeights,
     half* __restrict__ inputData)
 {
-    int const outputCount = mlpDesc->GetLayerOutputCount();
-    int const weightCount = mlpDesc->GetWeightCount();
+    int const outputCount = mlpDesc.GetLayerOutputCount();
+    int const weightCount = mlpDesc.GetWeightCount();
 
     int threadBlockSize = outputCount;
-    ImportNetworkFromRowMajorLayoutKernel <<< outputCount, threadBlockSize >>> (weightCount, mlpDesc->GetHiddenLayers(),
-        mlpDesc->GetInputChannels(), mlpDesc->GetHiddenChannels(), mlpDesc->GetOutputChannels(),
+    int gridSize = 1;
+
+    ImportNetworkFromRowMajorLayoutKernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
+        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
         halfWeights, inputData);
 }
 
-__device__ int WeightIndexToFeatureAddress(
-    int width,
-    int height,
-    int numFeatures,
-    int weightIdx)
+__device__ uint32_t QuantizeValue(float value, int bits)
 {
-    int feature = weightIdx % numFeatures;
-    int pixel = weightIdx / numFeatures;
-    int x = pixel % width;
-    int y = pixel / width;
-
-    //     [------------- plane -------------]   [----- pixel -----]   [- feature -]
-    return (feature >> 1) * width * height * 2 + (y * width + x) * 2 + (feature & 1);
+    float const quantizationStep = 1.f / float((1 << bits) - 1);
+    value = std::max(0.f, std::min(1.f, value));
+    float quantizedValue = roundf(value / quantizationStep);
+    return uint32_t(quantizedValue);
 }
 
-__global__ void QuantizeAndPackLatentsKernel(
+__device__ float UnquantizeValue(uint32_t quantized, int bits)
+{
+    float const quantizationStep = 1.f / float((1 << bits) - 1);
+    quantized &= (1 << bits) - 1;
+    return float(quantized) * quantizationStep;
+}
+
+__global__ void PackLatentsKernel(
     int width,
     int height,
-    int numFeatures,
-    int numWeights,
-    int numQuantizedWords,
-    int quantBits,
+    int numLayers,
+    size_t latentStride,
     const half* __restrict__ w_in,
-    uint32_t* __restrict__ w_packed_out)
+    uint16_t* __restrict__ w_out)
 {
     using namespace cooperative_groups;
 
     grid_group gg = this_grid();
-    int threadIdx = gg.thread_rank();
+    dim3 globalIdx = gg.thread_index();
 
-    if (threadIdx >= numQuantizedWords)
+    static_assert(FeatureGridMath::FeaturesPerGroup == 2, "Expecting 2 features per group");
+    static_assert(FeatureGridMath::FeaturesPerLayer == 4, "Expecting 4 features per layer");
+
+    if (globalIdx.x >= width || globalIdx.y >= height || globalIdx.z >= numLayers)
         return;
-        
-    QuantizationParameters const quantizationParams = GetLatentQuantization(quantBits);
-
-    const int elementsPerThread = 32 / quantBits;
-    const int elementMask = (1 << quantBits) - 1;
-
-    uint32_t result = 0;
-    for (int elemIdx = 0; elemIdx < elementsPerThread; ++elemIdx)
-    {
-        const int weightIdx = threadIdx * elementsPerThread + elemIdx;
-
-        const int srcAddr = WeightIndexToFeatureAddress(width, height, numFeatures, weightIdx);
-        
-        if (srcAddr >= numWeights)
-            break;
-
-        // Load the weight
-        float weight = w_in[srcAddr];
-
-        // Quantize
-        weight *= quantizationParams.scale;
-        weight = std::min(std::max(weight, quantizationParams.qmin), quantizationParams.qmax);
-        // Offset so that -1 maps to 0
-        weight += quantizationParams.scale - 1.f;
-        // Convert to integer
-        const int w_i = int(floorf(weight));
-        // Pack into the result
-        result |= (w_i & elementMask) << (elemIdx * quantBits);
-    }
-
-    w_packed_out[threadIdx] = result;
-}
-
-void QuantizeAndPackLatents(
-    int width,
-    int height,
-    int numFeatures,
-    int quantBits,
-    const half* __restrict__ w_in,
-    uint32_t* __restrict__ w_packed_out)
-{
-    int numWeights = width * height * numFeatures;
-    int numQuantizedWords = FeatureGridMath::GetQuantizedLatentSizeUints(numWeights, quantBits);
-
-    int dim_tb = tin::WarpSize;
-    int dim_grid = (numQuantizedWords + dim_tb - 1) / dim_tb;
-
-    QuantizeAndPackLatentsKernel <<< dim_grid, dim_tb >>> (width, height, numFeatures, numWeights, numQuantizedWords, quantBits, w_in, w_packed_out);
-}
-
-__global__ void UnpackQuantizedLatentsKernel(
-    int width,
-    int height,
-    int numFeatures,
-    int numWeights,
-    int numQuantizedWords,
-    int quantBits,
-    const uint32_t* __restrict__ w_packed_in,
-    half* __restrict__ w_out)
-{
-    using namespace cooperative_groups;
-
-    grid_group gg = this_grid();
-    int threadIdx = gg.thread_rank();
-
-    if (threadIdx >= numQuantizedWords)
-        return;
-
-    const int elementsPerThread = 32 / quantBits;
-
-    QuantizationParameters const quantizationParams = GetLatentQuantization(quantBits);
     
-    const uint32_t elementMask = (1 << quantBits) - 1;
-
-    const uint32_t packed = w_packed_in[threadIdx];
-
-    for (int elemIdx = 0; elemIdx < elementsPerThread; ++elemIdx)
-    {
-        const int weightIdx = threadIdx * elementsPerThread + elemIdx;
-
-        const int dstAddr = WeightIndexToFeatureAddress(width, height, numFeatures, weightIdx);
-
-        if (dstAddr >= numWeights)
-            break;
-
-        // Convert from [0..2^quant_bits-1] to (-1..1)
-        const uint32_t w_i = (packed >> (elemIdx * quantBits)) & elementMask;
-        float w = float(w_i) * quantizationParams.step + quantizationParams.bias;
-
-        w_out[dstAddr] = half(w);
-    }
+    size_t const srcOffset = globalIdx.z * latentStride * 2
+                           + (globalIdx.y * width + globalIdx.x) * FeatureGridMath::FeaturesPerGroup;
+    
+    uint32_t packed;
+    packed = QuantizeValue(float(w_in[srcOffset + 0]), 4);
+    packed |= QuantizeValue(float(w_in[srcOffset + 1]), 4) << 4;
+    packed |= QuantizeValue(float(w_in[srcOffset + latentStride + 0]), 4) << 8;
+    packed |= QuantizeValue(float(w_in[srcOffset + latentStride + 1]), 4) << 12;
+    
+    size_t const dstOffset = (globalIdx.z * height + globalIdx.y) * width + globalIdx.x;
+    w_out[dstOffset] = packed;
 }
 
-void UnpackQuantizedLatents(
+void PackLatents(
     int width,
     int height,
-    int numFeatures,
-    int quantBits,
-    const uint32_t* __restrict__ w_packed_in,
+    int numLayers,
+    size_t latentStride,
+    const half* __restrict__ w_in,
+    uint16_t* __restrict__ w_out)
+{
+    dim3 blockSize(8, 8, 1);
+    dim3 gridSize = DivRoundUp(dim3(width, height, numLayers), blockSize);
+
+    PackLatentsKernel <<< gridSize, blockSize >>> (width, height, numLayers, latentStride, w_in, w_out);
+}
+
+__global__ void UnpackLatentsKernel(
+    int width,
+    int height,
+    int numLayers,
+    size_t latentStride,
+    const uint16_t* __restrict__ w_in,
     half* __restrict__ w_out)
 {
-    int numWeights = width * height * numFeatures;
-    int numQuantizedWords = FeatureGridMath::GetQuantizedLatentSizeUints(numWeights, quantBits);
+    using namespace cooperative_groups;
 
-    int dim_tb = tin::WarpSize;
-    int dim_grid = (numQuantizedWords + dim_tb - 1) / dim_tb;
+    grid_group gg = this_grid();
+    dim3 globalIdx = gg.thread_index();
 
-    UnpackQuantizedLatentsKernel <<< dim_grid, dim_tb >>> (width, height, numFeatures, numWeights, numQuantizedWords, quantBits, w_packed_in, w_out);
+    static_assert(FeatureGridMath::FeaturesPerGroup == 2, "Expecting 2 features per group");
+    static_assert(FeatureGridMath::FeaturesPerLayer == 4, "Expecting 4 features per layer");
+
+    if (globalIdx.x >= width || globalIdx.y >= height || globalIdx.z >= numLayers)
+        return;
+        
+    size_t const srcOffset = (globalIdx.z * height + globalIdx.y) * width + globalIdx.x;
+    uint32_t const packed = w_in[srcOffset];
+
+    size_t const dstOffset = globalIdx.z * latentStride * 2
+                           + (globalIdx.y * width + globalIdx.x) * FeatureGridMath::FeaturesPerGroup;
+
+    w_out[dstOffset + 0] = half(UnquantizeValue(packed, 4));
+    w_out[dstOffset + 1] = half(UnquantizeValue(packed >> 4, 4));
+    w_out[dstOffset + latentStride + 0] = half(UnquantizeValue(packed >> 8, 4));
+    w_out[dstOffset + latentStride + 1] = half(UnquantizeValue(packed >> 12, 4));
+}
+
+void UnpackLatents(
+    int width,
+    int height,
+    int numLayers,
+    size_t latentStride,
+    const uint16_t* __restrict__ w_in,
+    half* __restrict__ w_out)
+{
+    dim3 blockSize(8, 8, 1);
+    dim3 gridSize = DivRoundUp(dim3(width, height, numLayers), blockSize);
+
+    UnpackLatentsKernel <<< gridSize, blockSize >>> (width, height, numLayers, latentStride, w_in, w_out);
 }
 
 } // namespace ntc::cuda

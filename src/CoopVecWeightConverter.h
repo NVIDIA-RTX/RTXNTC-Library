@@ -41,10 +41,10 @@ public:
     static InferenceWeightType GetGenericWeightType(InferenceWeightType weightType);
 
 #if NTC_WITH_DX12
-    static void IsDX12CoopVecSupported(GraphicsResources const* resources, bool& outInt8Supported, bool& outFP8Supported);
+    static void IsDX12CoopVecSupported(GraphicsResources const* resources, bool& outSupported);
 #endif
 #if NTC_WITH_VULKAN
-    static void IsVkCoopVecSupported(GraphicsResources const* resources, bool& outInt8Supported, bool& outFP8Supported);
+    static void IsVkCoopVecSupported(GraphicsResources const* resources, bool& outSupported);
 #endif
 };
 

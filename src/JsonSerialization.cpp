@@ -451,7 +451,18 @@ bool ParseHandler::Int64(int64_t i)
 
     if (success)
     {
-        MarkFieldAsPresent(ctx);
+        if (field.validateFunc)
+        {
+            if (!field.validateFunc(ctx->object, field, m_errorMessage, sizeof m_errorMessage))
+            {
+                success = false;
+            }
+        }
+
+        if (success)
+        {
+            MarkFieldAsPresent(ctx);
+        }
     }
     else
     {

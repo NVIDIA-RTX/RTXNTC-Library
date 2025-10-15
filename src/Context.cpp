@@ -52,24 +52,22 @@ Context::Context(ContextParameters const& params)
     }
 
     // Fill the layout cache
-    for (int networkVersion = NTC_NETWORK_SMALL; networkVersion <= NTC_NETWORK_XLARGE; ++networkVersion)
+    for (InferenceWeightType weightType : {
+        InferenceWeightType::GenericInt8,
+        InferenceWeightType::GenericFP8,
+        InferenceWeightType::CoopVecFP8 })
     {
-        for (InferenceWeightType weightType : {
-            InferenceWeightType::GenericInt8, InferenceWeightType::GenericFP8,
-            InferenceWeightType::CoopVecInt8, InferenceWeightType::CoopVecFP8 })
+        if (CoopVecWeightConverter::IsCoopVecWeightType(weightType))
         {
-            if (CoopVecWeightConverter::IsCoopVecWeightType(weightType))
-            {
-                if (!CoopVecWeightConverter::IsConversionSupported(m_graphicsResources, weightType))
-                    continue;
-            }
+            if (!CoopVecWeightConverter::IsConversionSupported(m_graphicsResources, weightType))
+                continue;
+        }
 
-            WeightLayout layout;
-            if (CoopVecWeightConverter::GetWeightLayout(m_graphicsResources,
-                *MlpDesc::FromNetworkVersion(networkVersion), weightType, layout))
-            {
-                m_weightLayouts[GetWeightLayoutArrayIndex(networkVersion, weightType)] = layout;
-            }
+        WeightLayout layout;
+        if (CoopVecWeightConverter::GetWeightLayout(m_graphicsResources,
+            MlpDesc::Get(), weightType, layout))
+        {
+            m_weightLayouts[GetWeightLayoutArrayIndex(weightType)] = layout;
         }
     }
 }
@@ -513,13 +511,6 @@ Status Context::MakeDecompressionComputePass(MakeDecompressionComputePassParamet
 
     TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
     LatentShape const& latentShape = textureSetMetadata->GetLatentShape();
-    MlpDesc const* mlpDesc = textureSetMetadata->GetMlpDesc();
-
-    if (!mlpDesc)
-    {
-        SetErrorMessage("The texture set metadata doesn't have MLP information.");
-        return Status::InvalidArgument;
-    }
     
     if (params.mipLevel < 0 || params.mipLevel >= textureSetDesc.mips)
     {
@@ -539,27 +530,21 @@ Status Context::MakeDecompressionComputePass(MakeDecompressionComputePassParamet
         return Status::InternalError;
     }
 
-    // The preload code only works when the resolution of high-res latents is <= the resolution of color pixels,
-    // otherwise there's not enough shared memory allocated to store all the latents.
-    bool const preloadLatents = latentImage->highResWidth <= mipWidth && latentImage->highResHeight <= mipHeight;
+    if (neuralLod < params.firstLatentMipInTexture)
+    {
+        SetErrorMessage("mipLevel (%d) cannot be decompressed when the texture set is partially loaded, as indicated "
+            " by firstLatentMipInTexture (%d).", params.mipLevel, params.firstLatentMipInTexture);
+        return Status::OutOfRange;
+    }
 
-    // Select the shader version based on which math modes are supported and enabled.
-    InferenceMath mathVersion = InferenceMath::Legacy;
+    // Select the shader version
+    InferenceMath mathVersion;
     switch(params.weightType)
     {
         case InferenceWeightType::GenericInt8:
-            if (m_graphicsResources->IsDP4aSupported() && m_graphicsResources->IsFloat16Supported())
-                mathVersion = InferenceMath::DP4aWithFloat16;
-            else if (m_graphicsResources->IsDP4aSupported())
-                mathVersion = InferenceMath::DP4aNoFloat16;
-            else
-                mathVersion = InferenceMath::Legacy;
+            mathVersion = InferenceMath::DP4a;
             break;
             
-        case InferenceWeightType::CoopVecInt8:
-            mathVersion = InferenceMath::CoopVecInt8;
-            break;
-
         case InferenceWeightType::CoopVecFP8:
             mathVersion = InferenceMath::CoopVecFP8;
             break;
@@ -577,13 +562,13 @@ Status Context::MakeDecompressionComputePass(MakeDecompressionComputePassParamet
     {
         case GraphicsAPI::D3D12:
 #if NTC_WITH_DX12
-            GetDecompressDxilShaderBytecode(mlpDesc, mathVersion, preloadLatents,
+            GetDecompressDxilShaderBytecode(mathVersion,
                 &pOutComputePass->computeShader, &pOutComputePass->computeShaderSize);
 #endif
             break;
         case GraphicsAPI::Vulkan:
 #if NTC_WITH_VULKAN
-            GetDecompressSpirvShaderBytecode(mlpDesc, mathVersion, preloadLatents,
+            GetDecompressSpirvShaderBytecode(mathVersion,
                 &pOutComputePass->computeShader, &pOutComputePass->computeShaderSize);
 #endif
             break;
@@ -619,45 +604,15 @@ Status Context::MakeDecompressionComputePass(MakeDecompressionComputePassParamet
         dstOffset = *params.pDstOffset;
     }
 
-    // Get the stream range for this mip level
-    StreamRange requiredRange;
-    Status status = textureSetMetadata->GetStreamRangeForLatents(params.mipLevel, 1, requiredRange);
-    if (status != Status::Ok)
-        return status;
-    
-    StreamRange latentStreamRange = params.latentStreamRange;
-
-    // Convert the "entire stream" range into the actual stream size
-    if (latentStreamRange.size + 1 == 0)
-    {
-        latentStreamRange.size = std::max(textureSetMetadata->GetSourceStreamSize(), latentStreamRange.offset)
-            - latentStreamRange.offset;
-    }
-        
-    // Validate that the provided stream range contains the required range
-    if (requiredRange.offset < latentStreamRange.offset ||
-        requiredRange.offset + requiredRange.size > latentStreamRange.offset + latentStreamRange.size)
-    {
-        SetErrorMessage("Decompression of mip level %d requires input stream range %" PRId64 "-%" PRId64", "
-            "which is not contained in the provided range %" PRId64 "-%" PRId64 ".",
-            params.mipLevel,
-            requiredRange.offset, requiredRange.offset + requiredRange.size,
-            latentStreamRange.offset, latentStreamRange.offset + latentStreamRange.size);
-        return Status::OutOfRange;
-    }
-
     NtcDecompressConstants& constants = reinterpret_cast<NtcDecompressConstants&>(pOutComputePass->constantBufferData);
     static_assert(sizeof(NtcDecompressConstants) <= sizeof(ComputePassDesc::constantBufferData),
         "NtcDecompressConstants don't fit into constantBufferData. Increase MaxComputePassConstantSize.");
     pOutComputePass->constantBufferSize = sizeof(NtcDecompressConstants);
 
-    // Fill the constant buffer using that latent buffer offset
-    textureSetMetadata->FillDecompressionConstants(constants, params.weightType, params.weightOffset, params.mipLevel,
-        srcRect, dstOffset, params.pOutputTextures, params.numOutputTextures, params.firstOutputDescriptorIndex,
-        latentStreamRange.offset);
+    textureSetMetadata->FillDecompressionConstants(constants, params, srcRect, dstOffset);
 
-    int const gridWidth = constants.srcRight - constants.gridLeft;
-    int const gridHeight = constants.srcBottom - constants.gridTop;
+    int const gridWidth = constants.srcRight - constants.srcLeft;
+    int const gridHeight = constants.srcBottom - constants.srcTop;
 
     pOutComputePass->dispatchWidth = (gridWidth + DECOMPRESS_CS_BLOCK_WIDTH - 1) / DECOMPRESS_CS_BLOCK_WIDTH;
     pOutComputePass->dispatchHeight = (gridHeight + DECOMPRESS_CS_BLOCK_HEIGHT - 1) / DECOMPRESS_CS_BLOCK_HEIGHT;
@@ -848,8 +803,8 @@ Status Context::MakeImageDifferenceComputePass(MakeImageDifferenceComputePassPar
     return Status::Ok;
 }
 
-Status Context::MakeInferenceData(ITextureSetMetadata* _textureSetMetadata, StreamRange latentStreamRange,
-    InferenceWeightType weightType, InferenceData* pOutInferenceData) const
+Status Context::MakeInferenceData(ITextureSetMetadata* _textureSetMetadata,
+    InferenceWeightType weightType, int firstLatentMipInTexture, InferenceData* pOutInferenceData) const
 {
     if (!pOutInferenceData)
     {
@@ -867,7 +822,6 @@ Status Context::MakeInferenceData(ITextureSetMetadata* _textureSetMetadata, Stre
     switch(weightType)
     {
         case InferenceWeightType::GenericInt8:
-        case InferenceWeightType::CoopVecInt8:
         case InferenceWeightType::GenericFP8:
         case InferenceWeightType::CoopVecFP8:
             break;
@@ -887,454 +841,39 @@ Status Context::MakeInferenceData(ITextureSetMetadata* _textureSetMetadata, Stre
     TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
     LatentShape const& latentShape = textureSetMetadata->GetLatentShape();
 
-    TextureSetMetadata::FillLatentEncodingConstants(pOutInferenceData->constants.highResEncoding,
-        latentShape.highResFeatures, latentShape.highResQuantBits, weightType);
-    TextureSetMetadata::FillLatentEncodingConstants(pOutInferenceData->constants.lowResEncoding,
-        latentShape.lowResFeatures, latentShape.lowResQuantBits, weightType);
-
-    for (int neuralLod = 0; neuralLod < textureSetMetadata->GetNumLatentImages(); ++neuralLod)
-    {
-        assert(neuralLod < NTC_MAX_NEURAL_MIPS);
-
-        textureSetMetadata->FillNeuralMipConstants(
-            pOutInferenceData->constants.highResNeuralMips[neuralLod],
-            pOutInferenceData->constants.lowResNeuralMips[neuralLod],
-            neuralLod, latentStreamRange.offset);
-    }
-
     for (int mipLevel = 0; mipLevel < textureSetDesc.mips; ++mipLevel)
     {
         assert(mipLevel < NTC_MAX_MIPS);
         
-        textureSetMetadata->FillColorMipConstants(pOutInferenceData->constants.colorMips[mipLevel], mipLevel);
+        textureSetMetadata->FillColorMipConstants(pOutInferenceData->constants.colorMips[mipLevel],
+            mipLevel, firstLatentMipInTexture);
     }
-
+    
     pOutInferenceData->constants.imageWidth = textureSetDesc.width;
     pOutInferenceData->constants.imageHeight = textureSetDesc.height;
     pOutInferenceData->constants.imageMips = textureSetDesc.mips;
-    textureSetMetadata->GetWeightOffsets(weightType, pOutInferenceData->constants.networkWeightOffsets,
-        pOutInferenceData->constants.networkScaleBiasOffset);
+    textureSetMetadata->GetWeightOffsets(
+        weightType,
+        pOutInferenceData->constants.networkWeightOffsets,
+        pOutInferenceData->constants.networkBiasOffsets,
+        pOutInferenceData->constants.networkScaleOffsets);
     pOutInferenceData->constants.validChannelMask = textureSetMetadata->GetValidChannelMask();
     pOutInferenceData->constants.channelColorSpaces = textureSetMetadata->GetPackedColorSpaces();
  
     return Status::Ok;
 }
 
-Status Context::MakePartialInferenceData(ITextureSetMetadata* _textureSetMetadata, IStream* inputStream,
-    int firstMipLevel, int numMipLevels, Rect firstMipSlice, InferenceWeightType weightType,
-    InferenceData* pOutInferenceData, void* pOutLatentData, size_t* pInOutLatentSize) const
-{
-    if (!pInOutLatentSize)
-    {
-        SetErrorMessage("pInOutLatentSize is NULL");
-        return Status::InvalidArgument;
-    }
-
-    if (!pOutInferenceData && pOutLatentData)
-    {
-        SetErrorMessage("pOutInferenceData is NULL");
-        return Status::InvalidArgument;
-    }
-
-    TextureSetMetadata* textureSetMetadata = dynamic_cast<TextureSetMetadata*>(_textureSetMetadata);
-    if (!textureSetMetadata)
-    {
-        SetErrorMessage("textureSetMetadata is NULL or points at a wrong object type");
-        return Status::InvalidArgument;
-    }
-
-    switch(weightType)
-    {
-        case InferenceWeightType::GenericInt8:
-        case InferenceWeightType::CoopVecInt8:
-        case InferenceWeightType::GenericFP8:
-        case InferenceWeightType::CoopVecFP8:
-            break;
-        default:
-            SetErrorMessage("Unsupported weightType (%s)", InferenceWeightTypeToString(weightType));
-            return Status::InvalidArgument;
-    }
-
-    if (!textureSetMetadata->IsInferenceWeightTypeSupported(weightType))
-    {
-        SetErrorMessage("The texture set does not provide %s weights", InferenceWeightTypeToString(weightType));
-        return Status::Unsupported;
-    }
-    
-    TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
-    LatentShape const& latentShape = textureSetMetadata->GetLatentShape();
-
-    if (firstMipLevel < 0 || numMipLevels <= 0 || firstMipLevel + numMipLevels > textureSetDesc.mips)
-    {
-        SetErrorMessage("firstMipLevel (%d) and numMipLevels (%d) must describe a valid range within 0-%d",
-            firstMipLevel, numMipLevels, textureSetDesc.mips - 1);
-        return Status::OutOfRange;
-    }
-    
-    int colorMipWidth = std::max(textureSetDesc.width >> firstMipLevel, 1);
-    int colorMipHeight = std::max(textureSetDesc.height >> firstMipLevel, 1);
-    
-    if (firstMipSlice.left < 0 || firstMipSlice.top < 0 || firstMipSlice.width <= 0 || firstMipSlice.height <= 0 ||
-        firstMipSlice.left + firstMipSlice.width > colorMipWidth ||
-        firstMipSlice.top + firstMipSlice.height > colorMipWidth)
-    {
-        SetErrorMessage("firstMipSlice (%dx%d starting at %d, %d) must be within the bounds of MIP %d (%dx%d)",
-            firstMipSlice.left + firstMipSlice.width, firstMipSlice.top + firstMipSlice.height,
-            firstMipSlice.left, firstMipSlice.top,
-            firstMipLevel, colorMipWidth, colorMipHeight);
-        return Status::OutOfRange;
-    }
-
-    int const highResBitsPerLatentPixel = latentShape.highResFeatures * latentShape.highResQuantBits;
-    int const lowResBitsPerLatentPixel = latentShape.lowResFeatures * latentShape.lowResQuantBits;
-
-    // Validate that the latent pixels occupy a multiple of 4 bits. That should always be true because we enforce
-    // that the number of latents is a multiple of 4 (see TextureSetMetadata::ValidateLatentShape)
-    assert((highResBitsPerLatentPixel & 3) == 0);
-    assert((lowResBitsPerLatentPixel & 3) == 0);
-
-    size_t const latentBufferSize = pOutLatentData ? *pInOutLatentSize : 0;
-    size_t totalLatentSize = 0;
-
-    NtcTextureSetConstants* constants = pOutInferenceData ? &pOutInferenceData->constants : nullptr;
-
-    if (constants)
-    {
-        memset(constants, 0, sizeof(NtcTextureSetConstants));
-
-        TextureSetMetadata::FillLatentEncodingConstants(constants->highResEncoding,
-            latentShape.highResFeatures, latentShape.highResQuantBits, weightType);
-        TextureSetMetadata::FillLatentEncodingConstants(constants->lowResEncoding,
-            latentShape.lowResFeatures, latentShape.lowResQuantBits, weightType);
-        textureSetMetadata->GetWeightOffsets(weightType, constants->networkWeightOffsets,
-            constants->networkScaleBiasOffset);
-
-        constants->imageWidth = textureSetDesc.width;
-        constants->imageHeight = textureSetDesc.height;
-        constants->imageMips = textureSetDesc.mips;
-        constants->validChannelMask = textureSetMetadata->GetValidChannelMask();
-        constants->channelColorSpaces = textureSetMetadata->GetPackedColorSpaces();
-    }
-
-    for (int colorMip = 0; colorMip < textureSetDesc.mips; ++colorMip)
-    {
-        bool const validColorMip = colorMip >= firstMipLevel && colorMip < firstMipLevel + numMipLevels;
-
-        if (constants)
-        {
-            textureSetMetadata->FillColorMipConstants(constants->colorMips[colorMip], colorMip);
-        }
-
-        if (!validColorMip)
-            continue;
-
-        // Process neural LODs only for the last mip level in a fused mip range, to stay conservative.
-        // The condition below detects either a change in neural LOD on the next mip or that it's the last mip.
-        int const neuralLod = textureSetMetadata->ColorMipToNeuralLod(colorMip);
-        if (colorMip < firstMipLevel + numMipLevels - 1 && 
-            neuralLod == textureSetMetadata->ColorMipToNeuralLod(colorMip + 1))
-            continue;
-
-        colorMipWidth = std::max(textureSetDesc.width >> colorMip, 1);
-        colorMipHeight = std::max(textureSetDesc.height >> colorMip, 1);
-
-        LatentImageDesc const* latentImage = textureSetMetadata->GetLatentImageDesc(neuralLod);
-        if (!latentImage)
-        {
-            // This shouldn't happen, but let's be sure
-            SetErrorMessage("latentImage is NULL");
-            return Status::InternalError;
-        }
-
-        int const deltaMip = colorMip - firstMipLevel;
-        int const colorSliceLeft = firstMipSlice.left >> deltaMip;
-        int const colorSliceTop = firstMipSlice.top >> deltaMip;
-        
-        // Calculate the right and bottom pixel positions for the mip slice, rounding up the division by power of 2.
-        int const colorSliceRight = ShiftRightRoundUp(firstMipSlice.left + firstMipSlice.width, deltaMip) - 1;
-        int const colorSliceBottom = ShiftRightRoundUp(firstMipSlice.top + firstMipSlice.height, deltaMip) - 1;
-
-        // Calculates the range of latents (min, size) in one dimension for the given range of color pixels.
-        auto calculateLatentRange = [](int colorMin, int colorMax, int colorSize, int latentSize, int bitsPerElement,
-            int& outMin, int& outSize)
-        {
-            // Instead of adding 0.5 on both ends like the sampling math does, use the left and right extents.
-            // This allows us to calculate a conservative extent that covers this mip level and more detailed ones too.
-            // When downsampling extents, sometimes the center positions go up and sometimes they go down.
-            float umin = float(colorMin) / float(colorSize);
-            float umax = float(colorMax + 1) / float(colorSize);
-            int lmin = std::max(int(umin * float(latentSize) - 0.5f), 0);
-            int lmax = std::min(int(umax * float(latentSize) - 0.5f) + 1, latentSize - 1);
-            outMin = lmin;
-            outSize = lmax - lmin + 1;
-            
-            // If the elements (pixels or rows) are occupying an odd number of 4-bit nibbles, make sure that we cut out
-            // an even number of those elements at an even offset, so that we're operating on whole bytes.
-            if ((bitsPerElement & 4) != 0)
-            {
-                if ((outMin & 1) != 0)
-                {
-                    outMin -= 1;
-                    outSize += 1;
-                }
-                outSize = std::min((outSize + 1) & ~1, latentSize);
-            }
-        };
-
-        Rect highResLatentSlice;
-        Rect lowResLatentSlice;
-        calculateLatentRange(colorSliceLeft, colorSliceRight, colorMipWidth, latentImage->highResWidth,
-            highResBitsPerLatentPixel, highResLatentSlice.left, highResLatentSlice.width);
-        calculateLatentRange(colorSliceTop, colorSliceBottom, colorMipHeight, latentImage->highResHeight,
-            highResBitsPerLatentPixel * latentImage->highResWidth, highResLatentSlice.top, highResLatentSlice.height);
-        calculateLatentRange(colorSliceLeft, colorSliceRight, colorMipWidth, latentImage->lowResWidth,
-            lowResBitsPerLatentPixel, lowResLatentSlice.left, lowResLatentSlice.width);
-        calculateLatentRange(colorSliceTop, colorSliceBottom, colorMipHeight, latentImage->lowResHeight,
-            lowResBitsPerLatentPixel * latentImage->lowResWidth, lowResLatentSlice.top, lowResLatentSlice.height);
-
-        size_t const highResLatentPixels = size_t(highResLatentSlice.width) * size_t(highResLatentSlice.height);
-        size_t const lowResLatentPixels = size_t(lowResLatentSlice.width) * size_t(lowResLatentSlice.height);
-        size_t const highResBytes = RoundUp4((highResLatentPixels * highResBitsPerLatentPixel) >> 3);
-        size_t const lowResBytes = RoundUp4((lowResLatentPixels * lowResBitsPerLatentPixel) >> 3);
-        size_t const currentOffset = totalLatentSize;
-        totalLatentSize += highResBytes + lowResBytes;
-
-        if (totalLatentSize <= latentBufferSize)
-        {
-            auto readLatentSlice = [this, inputStream, pOutLatentData, textureSetMetadata, latentImage, latentBufferSize]
-                (bool highRes, Rect slice, int bitsPerPixel, size_t destOffset)
-            {
-                StreamRange const location = highRes
-                    ? latentImage->highResRange
-                    : latentImage->lowResRange;
-                int const sourceWidth = highRes
-                    ? latentImage->highResWidth
-                    : latentImage->lowResWidth;
-
-                size_t const bytesPerDstRow = (size_t(slice.width) * size_t(bitsPerPixel)) >> 3;
-
-                for (int row = slice.top; row < slice.top + slice.height; ++row)
-                {
-                    uint64_t const firstPixel = uint64_t(row) * uint64_t(sourceWidth) + uint64_t(slice.left);
-                    uint64_t const sourceOffset = location.offset + ((firstPixel * uint64_t(bitsPerPixel)) >> 3);
-
-                    if (!inputStream->Seek(sourceOffset))
-                        return false;
-
-                    size_t const destRowOffset = destOffset + size_t(row - slice.top) * bytesPerDstRow;
-                    
-                    void* pDest = reinterpret_cast<uint8_t*>(pOutLatentData) + destRowOffset;
-
-                    assert(destRowOffset + bytesPerDstRow <= latentBufferSize);
-
-                    if (!inputStream->Read(pDest, bytesPerDstRow))
-                        return false;
-                }
-
-                return true;
-            };
-
-            // Read the high-res latent slice
-            if (!readLatentSlice(true, highResLatentSlice, highResBitsPerLatentPixel, currentOffset))
-                return Status::IOError;
-
-            // Read the low-res latent slice
-            if (!readLatentSlice(false, lowResLatentSlice, lowResBitsPerLatentPixel, currentOffset + highResBytes))
-                return Status::IOError;
-        }
-
-        if (constants)
-        {
-            NtcNeuralMipConstants& highResLatents = constants->highResNeuralMips[neuralLod];
-            highResLatents.dataOffset = uint32_t(currentOffset);
-            highResLatents.imageWidth = uint16_t(latentImage->highResWidth);
-            highResLatents.imageHeight = uint16_t(latentImage->highResHeight);
-            highResLatents.sliceWidth = uint16_t(highResLatentSlice.width);
-            highResLatents.sliceHeight = uint16_t(highResLatentSlice.height);
-            highResLatents.sliceLeft = uint16_t(highResLatentSlice.left);
-            highResLatents.sliceTop = uint16_t(highResLatentSlice.top);
-
-            NtcNeuralMipConstants& lowResLatents = constants->lowResNeuralMips[neuralLod];
-            lowResLatents.dataOffset = uint32_t(currentOffset + highResBytes);
-            lowResLatents.imageWidth = uint16_t(latentImage->lowResWidth);
-            lowResLatents.imageHeight = uint16_t(latentImage->lowResHeight);
-            lowResLatents.sliceWidth = uint16_t(lowResLatentSlice.width);
-            lowResLatents.sliceHeight = uint16_t(lowResLatentSlice.height);
-            lowResLatents.sliceLeft = uint16_t(lowResLatentSlice.left);
-            lowResLatents.sliceTop = uint16_t(lowResLatentSlice.top);
-        }
-    }
-
-    if (pOutInferenceData && totalLatentSize > latentBufferSize)
-    {
-        SetErrorMessage("The provided buffer (%zu bytes) is too small for the requested range of latents. "
-            "It need to be at least %zu bytes large.", latentBufferSize, totalLatentSize);
-        return Status::OutOfRange;
-    }
-
-    // Return the buffer size required or used for this operation
-    *pInOutLatentSize = totalLatentSize;
-    if (!pOutInferenceData)
-        return Status::Incomplete;
-
-
-    return Status::Ok;
-}
-
-Status Context::GetConservativeLatentBufferSize(ITextureSetMetadata* _textureSetMetadata,
-    int firstMipLevel, int numMipLevels, int firstMipSliceWidth, int firstMipSliceHeight, int sliceAlignment,
-    size_t* pOutLatentSize) const
-{
-    if (!pOutLatentSize)
-    {
-        SetErrorMessage("pOutLatentSize is NULL");
-        return Status::InvalidArgument;
-    }
-
-    TextureSetMetadata* textureSetMetadata = dynamic_cast<TextureSetMetadata*>(_textureSetMetadata);
-    if (!textureSetMetadata)
-    {
-        SetErrorMessage("textureSetMetadata is NULL or points at a wrong object type");
-        return Status::InvalidArgument;
-    }
-
-    TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
-    LatentShape const& latentShape = textureSetMetadata->GetLatentShape();
-
-    if (firstMipLevel < 0 || numMipLevels <= 0 || firstMipLevel + numMipLevels > textureSetDesc.mips)
-    {
-        SetErrorMessage("firstMipLevel (%d) and numMipLevels (%d) must describe a valid range within 0-%d",
-            firstMipLevel, numMipLevels, textureSetDesc.mips - 1);
-        return Status::OutOfRange;
-    }
-    
-    int colorMipWidth = std::max(textureSetDesc.width >> firstMipLevel, 1);
-    int colorMipHeight = std::max(textureSetDesc.height >> firstMipLevel, 1);
-    
-    if (firstMipSliceWidth <= 0 || firstMipSliceWidth > colorMipWidth ||
-        firstMipSliceHeight <= 0 || firstMipSliceHeight > colorMipHeight)
-    {
-        SetErrorMessage("firstMipSliceWidth (%d) and firstMipSliceHeight (%d) must be between 1 and (%d, %d)",
-            firstMipSliceWidth, firstMipSliceHeight, colorMipWidth, colorMipHeight);
-        return Status::OutOfRange;
-    }
-
-    if (sliceAlignment < 1)
-    {
-        SetErrorMessage("sliceAlignment (%d) must be 1 or more", sliceAlignment);
-        return Status::OutOfRange;
-    }
-
-    // We can only use power-of-2 alignments productively.
-    if (!IsPowerOf2(sliceAlignment))
-    {
-        sliceAlignment = 1;
-    }
-
-    int const highResBitsPerLatentPixel = latentShape.highResFeatures * latentShape.highResQuantBits;
-    int const lowResBitsPerLatentPixel = latentShape.lowResFeatures * latentShape.lowResQuantBits;
-
-    size_t totalLatentSize = 0;
-
-    // Mirroring the logic in MakePartialInferenceData, we go over the color mips to find the last requested color mip
-    // in every neural LOD.
-    for (int colorMip = firstMipLevel; colorMip < firstMipLevel + numMipLevels; ++colorMip)
-    {
-        int const neuralLod = textureSetMetadata->ColorMipToNeuralLod(colorMip);
-        if (colorMip < firstMipLevel + numMipLevels - 1 && 
-            neuralLod == textureSetMetadata->ColorMipToNeuralLod(colorMip + 1))
-            continue;
-
-        colorMipWidth = std::max(textureSetDesc.width >> colorMip, 1);
-        colorMipHeight = std::max(textureSetDesc.height >> colorMip, 1);
-
-        LatentImageDesc const* latentImage = textureSetMetadata->GetLatentImageDesc(neuralLod);
-        if (!latentImage)
-        {
-            // This shouldn't happen, but let's be sure
-            SetErrorMessage("latentImage is NULL");
-            return Status::InternalError;
-        }
-
-        // To calculate the size of the color slice, we assume the worst case positioning.
-        // When generating 'deltaMip' mip levels, the top level pixel has size of (1 << deltaMip).
-        // Worst case positioning is when the slice starts at (1 << deltaMip) - 1 because then it touches
-        // the most pixels in coarser mips. Since the caller provides us with the alignment constraint,
-        // we can use that to make the worst case better.
-        int const deltaMip = colorMip - firstMipLevel;        
-        int const mipSliceAlignment = ShiftRightRoundUp(sliceAlignment, deltaMip);
-        int const worstCaseOffset = std::max((1 << deltaMip) - mipSliceAlignment, 0);
-        int const colorSliceWidth = ShiftRightRoundUp(worstCaseOffset + firstMipSliceWidth, deltaMip);
-        int const colorSliceHeight = ShiftRightRoundUp(worstCaseOffset + firstMipSliceHeight, deltaMip);
-
-        // This function calculates the maximum size of latent slice in one dimension (width or height)
-        // for a given dimension of the color slice.
-        auto calculateLatentSlice = [mipSliceAlignment](int colorSlice, int colorSize,
-            int latentSize, int bitsPerElement)
-        {
-            // Check if the slice will be aligned to integer latent pixels.
-            // If not, an extra pixel will be added to 'colorSlice' below to account for different positions.
-            float const latentAlignment = float(mipSliceAlignment) * float(latentSize) / float(colorSize);
-            bool const aligned = floorf(latentAlignment) == latentAlignment;
-
-            // Calculate the size of the latent image slice matching the given color slice.
-            float uslice = (float(colorSlice + int(!aligned))) / float(colorSize);
-            int lslice = int(ceilf(uslice * float(latentSize))) + 2; // +2 for the linear filtering margin
-            
-            // If the latent pixels occupy an odd number of 4-bit nibbles, add 1 latent pixel of padding
-            // and then round up to even. The padding accounts for the offset down (outMin -= 1)
-            // in MakePartialInferenceData.
-            if ((bitsPerElement & 4) != 0)
-            {
-                lslice = (lslice + 2) & ~1;
-            }
-
-            // Clamp to the latent image dimensions.
-            lslice = std::min(lslice, latentSize);
-
-            return lslice;
-        };
-
-        int const highResLatentSliceWidth = calculateLatentSlice(colorSliceWidth, colorMipWidth,
-            latentImage->highResWidth, highResBitsPerLatentPixel);
-        int const highResLatentSliceHeight = calculateLatentSlice(colorSliceHeight, colorMipHeight,
-            latentImage->highResHeight, 0);
-        int const lowResLatentSliceWidth = calculateLatentSlice(colorSliceWidth, colorMipWidth,
-            latentImage->lowResWidth, lowResBitsPerLatentPixel);
-        int const lowResLatentSliceHeight = calculateLatentSlice(colorSliceHeight, colorMipHeight,
-            latentImage->lowResHeight, 0);
-        
-        size_t const highResLatentPixels = size_t(highResLatentSliceWidth) * size_t(highResLatentSliceHeight);
-        size_t const lowResLatentPixels = size_t(lowResLatentSliceWidth) * size_t(lowResLatentSliceHeight);
-        size_t const highResBytes = RoundUp4((highResLatentPixels * highResBitsPerLatentPixel) >> 3);
-        size_t const lowResBytes = RoundUp4((lowResLatentPixels * lowResBitsPerLatentPixel) >> 3);
-
-        totalLatentSize += highResBytes + lowResBytes;
-    }
-
-    *pOutLatentSize = totalLatentSize;
-    return Status::Ok;
-}
-
-bool Context::IsCooperativeVectorInt8Supported() const
+bool Context::IsCooperativeVectorSupported() const
 {
     if (m_graphicsResources)
-        return m_graphicsResources->IsCoopVecInt8Supported();
+        return m_graphicsResources->IsCoopVecSupported();
 
     return false;
 }
 
-bool Context::IsCooperativeVectorFP8Supported() const
+WeightLayout const* Context::GetWeightLayout(InferenceWeightType weightType) const
 {
-    if (m_graphicsResources)
-        return m_graphicsResources->IsCoopVecFP8Supported();
-
-    return false;
-}
-
-WeightLayout const* Context::GetWeightLayout(int networkVersion, InferenceWeightType weightType) const
-{
-    int const index = GetWeightLayoutArrayIndex(networkVersion, weightType);
+    int const index = GetWeightLayoutArrayIndex(weightType);
     if (index < 0)
         return nullptr;
 
@@ -1344,16 +883,12 @@ WeightLayout const* Context::GetWeightLayout(int networkVersion, InferenceWeight
     return nullptr;
 }
 
-int Context::GetWeightLayoutArrayIndex(int networkVersion, InferenceWeightType weightType)
+int Context::GetWeightLayoutArrayIndex(InferenceWeightType weightType)
 {
-    if (networkVersion < NTC_NETWORK_SMALL || networkVersion > NTC_NETWORK_XLARGE)
-        return -1;
-
     if (weightType < InferenceWeightType::GenericInt8 || weightType > InferenceWeightType::CoopVecFP8)
         return -1;
 
-    return (networkVersion - NTC_NETWORK_SMALL) * (int(InferenceWeightType::Count) - 1)
-        + int(weightType) - int(InferenceWeightType::GenericInt8);
+    return int(weightType) - int(InferenceWeightType::GenericInt8);
 }
 
 }

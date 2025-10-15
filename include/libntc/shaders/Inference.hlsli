@@ -16,16 +16,6 @@
 #include "InferenceConstants.h"
 #include "ColorSpaces.hlsli"
 
-// Define this macro before including the header to set the DP4a support flag for compatibility with older GPUs
-#ifndef NTC_USE_DP4A
-    #define NTC_USE_DP4A 1
-#endif
-
-// Define this macro before including the header to set the FP16 support flag for compatibility with older GPUs
-#ifndef NTC_USE_FLOAT16
-    #define NTC_USE_FLOAT16 1
-#endif
-
 // Helper macros used to declare templated functions with different t-parameter counts in Slang and HLSL.
 #if __SLANG__
 #define NTC_TEMPLATE_FN_1(ReturnType, FnName, ArgType1, ArgName1) \
@@ -43,40 +33,6 @@
     template<ArgType1 ArgName1, ArgType2 ArgName2, ArgType3 ArgName3> ReturnType FnName
 #endif
 
-// The NtcNetworkParams structure is used to derive the MLP geometry from network version
-#if __SLANG__
-struct NtcNetworkParams<let _NETWORK_VERSION: int>
-#else
-template<int _NETWORK_VERSION> struct NtcNetworkParams
-#endif
-{
-    static const int INPUT_CHANNELS = 
-        (_NETWORK_VERSION == NTC_NETWORK_SMALL) ? NTC_MLP_INPUT_CHANNELS_SMALL :
-        (_NETWORK_VERSION == NTC_NETWORK_MEDIUM) ? NTC_MLP_INPUT_CHANNELS_MEDIUM :
-        (_NETWORK_VERSION == NTC_NETWORK_LARGE) ? NTC_MLP_INPUT_CHANNELS_LARGE :
-        (_NETWORK_VERSION == NTC_NETWORK_XLARGE) ? NTC_MLP_INPUT_CHANNELS_XLARGE :
-        0; // Unsupported value
-
-    static const int HR_FEATURES = 
-        (_NETWORK_VERSION == NTC_NETWORK_SMALL) ? NTC_MLP_HR_FEATURES_SMALL :
-        (_NETWORK_VERSION == NTC_NETWORK_MEDIUM) ? NTC_MLP_HR_FEATURES_MEDIUM :
-        (_NETWORK_VERSION == NTC_NETWORK_LARGE) ? NTC_MLP_HR_FEATURES_LARGE :
-        (_NETWORK_VERSION == NTC_NETWORK_XLARGE) ? NTC_MLP_HR_FEATURES_XLARGE :
-        0; // Unsupported value
-
-    static const int LR_FEATURES = NTC_MLP_LR_FEATURES;
-
-    static const int SAMPLED_FEATURES_HR = HR_FEATURES * 4;
-    static const int SAMPLED_FEATURES_LR = LR_FEATURES;
-
-    static const int HIDDEN_LAYER_CHANNELS = NTC_MLP_HIDDEN_CHANNELS;
-
-    static const int OUTPUT_CHANNELS = NTC_MLP_OUTPUT_CHANNELS;
-};
-
-// The pack_clamp_s8 intrinsic should map well to an I2IP instruction on NV GPUs, but using it causes major slowdowns on Intel.
-#define USE_PACKING_INTRINSICS 0
-
 float16_t2 NtcUintToHalf2(uint u)
 {
     return asfloat16(uint16_t2(uint16_t(u), uint16_t(u >> 16)));
@@ -88,92 +44,12 @@ uint NtcHalf2ToUint(float16_t2 h)
     return uint(u.x) | (uint(u.y) << 16);
 }
 
-uint NtcFloatToInt8(float h, float scale)
-{
-    return uint(int(clamp(h * scale, -128.f, 127.f)) & 0xff);
-}
-
-uint NtcPackFloat4(float4 h, float scale)
-{
-    return NtcFloatToInt8(h.x, scale)
-        | (NtcFloatToInt8(h.y, scale) << 8)
-        | (NtcFloatToInt8(h.z, scale) << 16)
-        | (NtcFloatToInt8(h.w, scale) << 24);
-}
-
 uint NtcPackInt8x4(int4 vec)
 {    
-    #if USE_PACKING_INTRINSICS
-    {
-        return pack_s8(vec);
-    }
-    #else
-    {
-        return uint(vec.x & 0xff) 
-            | (uint(vec.y & 0xff) << 8) 
-            | (uint(vec.z & 0xff) << 16) 
-            | (uint(vec.w) << 24);
-    }
-    #endif
-}
-
-int4 NtcUnpackInt8x4(uint packed)
-{
-    #if USE_PACKING_INTRINSICS
-    {
-        return unpack_s8s32(packed);
-    }
-    #else
-    {
-        int4 result;
-        result.x = (int(packed) << 24) >> 24;
-        result.y = (int(packed) << 16) >> 24;
-        result.z = (int(packed) << 8) >> 24;
-        result.w = int(packed) >> 24;
-        return result;
-    }
-    #endif
-}
-
-// Software emulation of the dot4add_i8packed intrinsic
-int NtcDotProductInt8x4(uint32_t a, uint32_t b)
-{
-    int ia = a;
-    int ib = b;
-
-    return (ia >> 24) * (ib >> 24)
-        + ((ia << 8) >> 24) * ((ib << 8) >> 24)
-        + ((ia << 16) >> 24) * ((ib << 16) >> 24)
-        + ((ia << 24) >> 24) * ((ib << 24) >> 24);
-}
-
-// Converts the int4 packed version of LatentEncodingConstants into a struct
-NtcLatentEncodingConstants NtcUnpackLatentEncodingConstants(int4 i[2])
-{
-    NtcLatentEncodingConstants result;
-    result.numFeatures = i[0].x;
-    result.quantBits = i[0].y;
-    result.logElementsPerUint = i[0].z;
-    result.pad = i[0].w;
-    result.addressMask = uint(i[1].x);
-    result.dataMask  = uint(i[1].y);
-    result.quantizedScale = i[1].z;
-    result.quantizedBias = i[1].w;
-    return result;
-}
-
-// Converts the int4 packed version of NeuralMipConstants into a struct
-NtcNeuralMipConstants NtcUnpackNeuralMipConstants(int4 i)
-{
-    NtcNeuralMipConstants result;
-    result.dataOffset = uint(i.x);
-    result.imageWidth = uint(i.y) & 0xffff;
-    result.imageHeight = uint(i.y) >> 16;
-    result.sliceLeft = uint(i.z) & 0xffff;
-    result.sliceTop = uint(i.z) >> 16;
-    result.sliceWidth = uint(i.w) & 0xffff;
-    result.sliceHeight = uint(i.w) >> 16;
-    return result;
+    return uint(vec.x & 0xff) 
+        | (uint(vec.y & 0xff) << 8) 
+        | (uint(vec.z & 0xff) << 16) 
+        | (uint(vec.w) << 24);
 }
 
 // Converts the int4 packed version of ColorMipConstants into a struct
@@ -189,158 +65,64 @@ NtcColorMipConstants NtcUnpackColorMipConstants(int4 i)
 
 static const float c_InputScale = 127.5f; // Inputs are in the [-1, 1] range, scale matches tin::InputQuant
 
-uint4 NtcLoadFourRawLatents(
-    ByteAddressBuffer buffer,
-    uint bufferOffset,
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    int addr)
-{
-    uint word = buffer.Load(bufferOffset + neuralMip.dataOffset + (addr >> encoding.logElementsPerUint) * 4);
-    const uint firstOffset = (addr & encoding.addressMask) * encoding.quantBits;
-
-    word = word >> firstOffset;
-    const uint bits0 = word & encoding.dataMask; word = word >> encoding.quantBits;
-    const uint bits1 = word & encoding.dataMask; word = word >> encoding.quantBits;
-    const uint bits2 = word & encoding.dataMask; word = word >> encoding.quantBits;
-    const uint bits3 = word & encoding.dataMask;
-
-    return uint4(bits0, bits1, bits2, bits3);
-}
-
-int4 NtcLoadFourInputQuantizedLatents(
-    ByteAddressBuffer buffer,
-    uint bufferOffset,
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    int addr)
-{
-    uint4 bits = NtcLoadFourRawLatents(buffer, bufferOffset, encoding, neuralMip, addr);
-
-    return int4(bits.xyzw) * encoding.quantizedScale + encoding.quantizedBias;
-}
-
-void NtcSetupLatentBilinearFilter(
-    NtcNeuralMipConstants neuralMip,
+bool NtcSampleLatentGrid(
+    Texture2DArray latentTexture,
+    SamplerState latentSampler,
     float2 uv,
-    out int2 topLeftPos,
-    out float4 weights)
+    int neuralLod,
+    int featureOffset,
+    inout uint outputArray[NTC_MLP_INPUT_CHANNELS / 4])
 {
-    const float2 pixelPos = uv * float2(neuralMip.imageWidth, neuralMip.imageHeight)
-        - float2(neuralMip.sliceLeft, neuralMip.sliceTop) - 0.5f;
+    int width, height, arraySize;
+    latentTexture.GetDimensions(width, height, arraySize);
 
-    topLeftPos = int2(floor(pixelPos));
-
-    const float dx = pixelPos.x - topLeftPos.x;
-    const float dy = pixelPos.y - topLeftPos.y;
-    const float dxn = 1 - dx;
-    const float dyn = 1 - dy;
-
-    weights.x = dxn * dyn;
-    weights.y = dx * dyn;
-    weights.z = dxn * dy;
-    weights.w = dx * dy;
-}
-
-NTC_TEMPLATE_FN_3(bool, NtcSampleLatentGrid, int, NUM_FEATURES, bool, ALL_CORNERS, int, OUTPUT_SIZE)
-    (ByteAddressBuffer buffer,
-    uint bufferOffset,
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    float2 uv,
-    int outputOffset,
-    inout uint outputArray[OUTPUT_SIZE])
-{
-    if (neuralMip.sliceWidth == 0 || neuralMip.sliceHeight == 0)
-        return false;
-
-    int2 topLeftPos;
-    float4 weights;
-    NtcSetupLatentBilinearFilter(neuralMip, uv, topLeftPos, weights);
-    int4 iweights = int4(weights * 256.f);
-
-    // Shift right the interpolated weights by 8 to undo the 256 factor above
-    const int normalizationShift = 8;
-
-    const int x0 = min(max(topLeftPos.x, 0), neuralMip.sliceWidth - 1);
-    const int y0 = min(max(topLeftPos.y, 0), neuralMip.sliceHeight - 1);
-    const int x1 = min(max(topLeftPos.x + 1, 0), neuralMip.sliceWidth - 1);
-    const int y1 = min(max(topLeftPos.y + 1, 0), neuralMip.sliceHeight - 1);
-
-    int a00 = (y0 * neuralMip.sliceWidth + x0) * encoding.numFeatures;
-    int a01 = (y0 * neuralMip.sliceWidth + x1) * encoding.numFeatures;
-    int a10 = (y1 * neuralMip.sliceWidth + x0) * encoding.numFeatures;
-    int a11 = (y1 * neuralMip.sliceWidth + x1) * encoding.numFeatures;
-
-#if __SLANG__
-    [ForceUnroll]
-#else
     [unroll]
-#endif
-    for (int i = 0; i < NUM_FEATURES / 4; i++)
+    for (int layerIndex = 0; layerIndex < NTC_MLP_FEATURES / NTC_FEATURES_PER_LAYER; ++layerIndex)
     {
-        if (i >= encoding.numFeatures / 4)
-            break;
+        const bool mask = (layerIndex == 0) || (layerIndex < arraySize);
+        
+        float4 sampledValue = latentTexture.SampleLevel(latentSampler, float3(uv, layerIndex), neuralLod);
+        sampledValue = sampledValue.bgra; // The texture format is BGRA4, unswizzle that
+        sampledValue = mask ? sampledValue * (2.f * c_InputScale) - c_InputScale : 0.f;
 
-        const int4 x00 = NtcLoadFourInputQuantizedLatents(buffer, bufferOffset, encoding, neuralMip, a00) * iweights.x; a00 += 4;
-        const int4 x01 = NtcLoadFourInputQuantizedLatents(buffer, bufferOffset, encoding, neuralMip, a01) * iweights.y; a01 += 4;
-        const int4 x10 = NtcLoadFourInputQuantizedLatents(buffer, bufferOffset, encoding, neuralMip, a10) * iweights.z; a10 += 4;
-        const int4 x11 = NtcLoadFourInputQuantizedLatents(buffer, bufferOffset, encoding, neuralMip, a11) * iweights.w; a11 += 4;
-
-        if (ALL_CORNERS)
-        {
-            // Copy the latents for the 4 pixels into the network inputs.
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 0] = NtcPackInt8x4(x00 >> normalizationShift);
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 1] = NtcPackInt8x4(x01 >> normalizationShift);
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 2] = NtcPackInt8x4(x10 >> normalizationShift);
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 3] = NtcPackInt8x4(x11 >> normalizationShift);
-        }
-        else
-        {
-            // Blend the features of the 4 pixels.
-            int4 d = (x00 + x01 + x10 + x11) >> normalizationShift;
-            outputArray[outputOffset + i] = NtcPackInt8x4(d);
-        }
+        const uint packedValues = NtcPackInt8x4(int4(sampledValue));
+        outputArray[featureOffset / 4 + layerIndex] = packedValues;
     }
 
     return true;
 }
 
-float4 NtcEvaluatePositionalEncoding(float2 posf, float iscale)
+float4 NtcEvaluatePositionalEncoding(float2 posf)
 {
     float4 result;
 
-    result.x = frac(posf.x * iscale) * 4;
-    result.x = abs(result.x - 2) - 1;
-    result.y = frac(posf.y * iscale) * 4;
-    result.y = abs(result.y - 2) - 1;
-
-    result.z = frac(posf.x * iscale + 0.25f) * 4;
-    result.z = abs(result.z - 2) - 1;
-    result.w = frac(posf.y * iscale + 0.25f) * 4;
-    result.w = abs(result.w - 2) - 1;
+    result.x = frac(posf.x) * 2 - 1;
+    result.y = frac(posf.y) * 2 - 1;
+    result.z = frac(posf.x + 0.25f) * 2 - 1;
+    result.w = frac(posf.y + 0.25f) * 2 - 1;
 
     return result;
 }
 
-NTC_TEMPLATE_FN_1(void, NtcEncodeSamplePosition, int, OUTPUT_SIZE)
-    (float2 posf, float lod, int offset, inout uint outputArray[OUTPUT_SIZE])
+void NtcEncodeSamplePosition(
+    float2 posf, float lod, int featureOffset,
+    inout uint outputArray[NTC_MLP_INPUT_CHANNELS / 4])
 {
-    int idx = offset;
-    int scale = NTC_MLP_POS_ENC_SCALE;
-    float iscale = 1.f / scale;
+    int idx = featureOffset / 4;
     
     [unroll]
-    for (; scale > 1; scale >>= 1)
+    for (int wave = 0; wave < NTC_MLP_POS_ENC_WAVES; ++wave)
     {
-        float4 enc = NtcEvaluatePositionalEncoding(posf, iscale);
-        outputArray[idx] = NtcPackFloat4(enc, c_InputScale);
-
-        idx++;
-        iscale *= 2;
+        float4 enc = NtcEvaluatePositionalEncoding(posf);
+        uint packedPositionalEncoding = NtcPackInt8x4(int4(enc * c_InputScale));
+        outputArray[idx] = packedPositionalEncoding;
+        ++idx;
+        posf *= 2.f;
     }
-    
-    outputArray[idx] = NtcPackFloat4(float4(lod.xx, 0, 0), c_InputScale);
+
+    int iLod = int(lod * c_InputScale);
+    uint packedLod = NtcPackInt8x4(int4(iLod.xx, 0, 0));
+    outputArray[idx] = packedLod;
 }
 
 struct NtcHGELUParams
@@ -397,15 +179,12 @@ int4 NtcHGELUClamp_QuantizeFloat(float4 x)
 NTC_TEMPLATE_FN_3(void, NtcEvaluateLayerINT8, int, IN, int, OUT, bool, OUTPUT_LAYER)
     (ByteAddressBuffer weightBuffer,
     int weightOffset,
-    inout int scaleBiasOffset,
+    int biasOffset,
+    int scaleOffset,
     int totalChannels,
     bool activation,
     uint inputArray[IN / 4],
-#if NTC_USE_FLOAT16
     out uint outputArray[OUTPUT_LAYER ? OUT / 2 : OUT / 4]
-#else
-    out uint outputArray[OUTPUT_LAYER ? OUT : OUT / 4]
-#endif
 )
 {
     // See the comment block in the beginning of TextureSet.cpp for the weight layouts
@@ -416,7 +195,7 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayerINT8, int, IN, int, OUT, bool, OUTPUT_LA
     // and the resulting code works slower than a regular loop.
     for (uint c = 0; c < OUT; c += 4)
     {
-        int4 biases = weightBuffer.Load<int4>(scaleBiasOffset + (totalChannels + c) * 4);
+        int4 biases = weightBuffer.Load<int4>(biasOffset + c * 4);
         int acc0 = biases.x;
         int acc1 = biases.y;
         int acc2 = biases.z;
@@ -430,23 +209,15 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayerINT8, int, IN, int, OUT, bool, OUTPUT_LA
             const uint weights2 = weightBuffer.Load(weightOffset + (c + 2) * IN + k * 4);
             const uint weights3 = weightBuffer.Load(weightOffset + (c + 3) * IN + k * 4);
             
-#if NTC_USE_DP4A
             acc0 = dot4add_i8packed(inputArray[k], weights0, acc0);
             acc1 = dot4add_i8packed(inputArray[k], weights1, acc1);
             acc2 = dot4add_i8packed(inputArray[k], weights2, acc2);
             acc3 = dot4add_i8packed(inputArray[k], weights3, acc3);
-#else
-            acc0 += DotProductInt8x4(inputArray[k], weights0);
-            acc1 += DotProductInt8x4(inputArray[k], weights1);
-            acc2 += DotProductInt8x4(inputArray[k], weights2);
-            acc3 += DotProductInt8x4(inputArray[k], weights3);
-#endif
         }
         
         float4 results = float4(acc0, acc1, acc2, acc3);
-        float4 scales = weightBuffer.Load<float4>(scaleBiasOffset + c * 4);
+        float4 scales = weightBuffer.Load<float4>(scaleOffset + c * 4);
 
-#if NTC_USE_FLOAT16
         float16_t4 hresults = float16_t4(results * scales);
         
         if (activation)
@@ -465,32 +236,7 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayerINT8, int, IN, int, OUT, bool, OUTPUT_LA
 
             outputArray[c / 4] = NtcPackInt8x4(iresults);
         }
-#else
-        float4 hresults = results * scales;
-        
-        if (activation)
-        {
-            hresults = NtcHGELUClamp_ForwardFloat(hresults);
-        }
-
-        if (OUTPUT_LAYER)
-        {
-            outputArray[c + 0] = asuint(hresults.x);
-            outputArray[c + 1] = asuint(hresults.y);
-            outputArray[c + 2] = asuint(hresults.z);
-            outputArray[c + 3] = asuint(hresults.w);
-        }
-        else
-        {
-            int4 iresults = NtcHGELUClamp_QuantizeFloat(hresults);
-
-            outputArray[c / 4] = PackInt8x4(iresults);
-        }
-#endif
     }
-
-    // Advance the input offsets to point at the next layer.
-    scaleBiasOffset += OUT * sizeof(float);
 }
 
 int2 NtcGetTextureDimensions(NtcTextureSetConstants desc, int mipLevel)
@@ -522,51 +268,55 @@ bool NtcTextureSetHasChannels(NtcTextureSetConstants desc, int firstChannel, int
     return (NtcGetValidChannelMask(desc) & mask) == mask;
 }
 
-NTC_TEMPLATE_FN_1(bool, NtcPrepareNetworkInputs, int, VERSION)
-    (NtcTextureSetConstants desc,
-    ByteAddressBuffer latentsBuffer,
-    uint latentsOffset,
+bool NtcPrepareNetworkInputsInternal(
+    Texture2DArray latentTexture,
+    SamplerState latentSampler,
+    int2 texel,
+    float2 uv,
+    const NtcColorMipConstants colorMip,
+    out uint networkInputs[NTC_MLP_INPUT_CHANNELS / 4])
+{
+    // Zero init the array
+    [unroll]
+    for (int i = 0; i < NTC_MLP_INPUT_CHANNELS / 4; ++i)
+        networkInputs[i] = 0;
+
+    if (colorMip.neuralMip < 0)
+        return false;
+
+    // Sample the latent grids
+    if (!NtcSampleLatentGrid(latentTexture, latentSampler, uv, colorMip.neuralMip, 0, networkInputs))
+        return false;
+
+    if (!NtcSampleLatentGrid(latentTexture, latentSampler, uv, colorMip.neuralMip + 1, NTC_MLP_FEATURES, networkInputs))
+        return false;
+
+    // Encode the sample position
+    NtcEncodeSamplePosition(float2(texel) * colorMip.positionScale,
+        colorMip.positionLod, NTC_MLP_FEATURES * 2, networkInputs);
+
+    return true;
+}
+
+bool NtcPrepareNetworkInputs(
+    NtcTextureSetConstants desc,
+    Texture2DArray latentTexture,
+    SamplerState latentSampler,
     int2 texel,
     int mipLevel,
-    out uint networkInputs[NtcNetworkParams<VERSION>::INPUT_CHANNELS / 4])
+    out uint networkInputs[NTC_MLP_INPUT_CHANNELS / 4])
 {
-    typedef NtcNetworkParams<VERSION> Params;
-
     const int2 imageSize = NtcGetTextureDimensions(desc, mipLevel);
     const float2 uv = (float2(texel) + 0.5) / imageSize;
 
     // Zero init the array - in some cases, OUTPUT_SIZE is rounded up from the actual used size.
     [unroll]
-    for (int i = 0; i < Params::INPUT_CHANNELS / 4; ++i)
+    for (int i = 0; i < NTC_MLP_INPUT_CHANNELS / 4; ++i)
         networkInputs[i] = 0;
 
     const NtcColorMipConstants colorMip = NtcUnpackColorMipConstants(desc.colorMips[mipLevel]);
 
-    if (colorMip.neuralMip < 0)
-        return false;
-
-    int inputOffset = 0;
-
-    // Sample the latent grids
-    if (!NtcSampleLatentGrid<Params::HR_FEATURES, true, Params::INPUT_CHANNELS / 4>(latentsBuffer, latentsOffset,
-        NtcUnpackLatentEncodingConstants(desc.highResEncoding),
-        NtcUnpackNeuralMipConstants(desc.highResNeuralMips[colorMip.neuralMip]),
-        uv, inputOffset, networkInputs))
-        return false;
-    inputOffset += Params::SAMPLED_FEATURES_HR / 4;
-
-    if (!NtcSampleLatentGrid<Params::LR_FEATURES, false, Params::INPUT_CHANNELS / 4>(latentsBuffer, latentsOffset,
-        NtcUnpackLatentEncodingConstants(desc.lowResEncoding),
-        NtcUnpackNeuralMipConstants(desc.lowResNeuralMips[colorMip.neuralMip]),
-        uv, inputOffset, networkInputs))
-        return false;
-    inputOffset += Params::SAMPLED_FEATURES_LR / 4;
-
-    // Encode the sample position
-    NtcEncodeSamplePosition<Params::INPUT_CHANNELS / 4>(float2(texel) * colorMip.positionScale,
-        colorMip.positionLod, inputOffset, networkInputs);
-
-    return true;
+    return NtcPrepareNetworkInputsInternal(latentTexture, latentSampler, texel, uv, colorMip, networkInputs);
 }
 
 float NtcConvertChannelToLinearColorSpace(NtcTextureSetConstants desc, int channel, float storedValue)
@@ -585,60 +335,63 @@ float NtcConvertChannelToLinearColorSpace(NtcTextureSetConstants desc, int chann
 }
 
 // NtcSampleTextureSet - this is the main NTC function for applications.
-// Use like NtcSampleTextureSet<NETWORK_VERSION>(Constants, LatentsBuffer, ...)
+// Use like NtcSampleTextureSet(Constants, LatentsBuffer, ...)
 // Returns true if the mip level is valid; out-of-bounds texel positions are clamped.
-NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet, int, VERSION)
-    (NtcTextureSetConstants desc,
-    ByteAddressBuffer latentsBuffer,
-    uint latentsOffset, // Offset of the latents chunk in latentsBuffer if packing multiple textures together
+bool NtcSampleTextureSet(
+    NtcTextureSetConstants desc,
+    Texture2DArray latentTexture,
+    SamplerState latentSampler,
     ByteAddressBuffer weightsBuffer,
     uint weightsOffset, // Offset of the weight chunk in weightsBuffer if packing multiple textures together
     int2 texel,
     int mipLevel,
     bool convertToLinearColorSpace,
-    inout float outputs[NtcNetworkParams<VERSION>::OUTPUT_CHANNELS])
+    inout float outputs[NTC_MLP_OUTPUT_CHANNELS])
 {
-    typedef NtcNetworkParams<VERSION> Params;
-
-    uint networkInputs[Params::INPUT_CHANNELS / 4];
-    if (!NtcPrepareNetworkInputs<VERSION>(desc, latentsBuffer, latentsOffset, texel, mipLevel, networkInputs))
+    uint networkInputs[NTC_MLP_INPUT_CHANNELS / 4];
+    if (!NtcPrepareNetworkInputs(desc, latentTexture, latentSampler, texel, mipLevel, networkInputs))
         return false;
 
-    int scaleBiasOffset = weightsOffset + desc.networkScaleBiasOffset;
-
     // Evaluate the MLP layers:
-    const int totalChannels = Params::HIDDEN_LAYER_CHANNELS * 3 + Params::OUTPUT_CHANNELS;
+    const int totalChannels = NTC_MLP_HIDDEN_CHANNELS * 3 + NTC_MLP_OUTPUT_CHANNELS;
 
     // Input layer
-    uint hiddenOutput1[Params::HIDDEN_LAYER_CHANNELS / 4];
-    NtcEvaluateLayerINT8<Params::INPUT_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, false>
-        (weightsBuffer, weightsOffset + desc.networkWeightOffsets.x, scaleBiasOffset,
+    uint hiddenOutput1[NTC_MLP_HIDDEN_CHANNELS / 4];
+    NtcEvaluateLayerINT8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.x,
+        weightsOffset + desc.networkBiasOffsets.x,
+        weightsOffset + desc.networkScaleOffsets.x,
         totalChannels, true, networkInputs, hiddenOutput1);
 
     // Hidden layer 1
-    uint hiddenOutput2[Params::HIDDEN_LAYER_CHANNELS / 4];
-    NtcEvaluateLayerINT8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, false>
-        (weightsBuffer, weightsOffset + desc.networkWeightOffsets.y, scaleBiasOffset,
+    uint hiddenOutput2[NTC_MLP_HIDDEN_CHANNELS / 4];
+    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.y,
+        weightsOffset + desc.networkBiasOffsets.y,
+        weightsOffset + desc.networkScaleOffsets.y,
         totalChannels, true, hiddenOutput1, hiddenOutput2);
 
     // Hidden layer 2
-    NtcEvaluateLayerINT8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, false>
-        (weightsBuffer, weightsOffset + desc.networkWeightOffsets.z, scaleBiasOffset,
+    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.z,
+        weightsOffset + desc.networkBiasOffsets.z,
+        weightsOffset + desc.networkScaleOffsets.z,
         totalChannels, true, hiddenOutput2, hiddenOutput1);
 
     // Output layer
-#if NTC_USE_FLOAT16
-    uint networkOutputs[Params::OUTPUT_CHANNELS / 2];
-#else
-    uint networkOutputs[Params::OUTPUT_CHANNELS];
-#endif
-    NtcEvaluateLayerINT8<Params::HIDDEN_LAYER_CHANNELS, Params::OUTPUT_CHANNELS, true>
-        (weightsBuffer, weightsOffset + desc.networkWeightOffsets.w, scaleBiasOffset,
+    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS / 2];
+    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.w,
+        weightsOffset + desc.networkBiasOffsets.w,
+        weightsOffset + desc.networkScaleOffsets.w,
         totalChannels, false, hiddenOutput1, networkOutputs);
 
-#if NTC_USE_FLOAT16
     [unroll]
-    for (int ch = 0; ch < Params::OUTPUT_CHANNELS/2; ++ch)
+    for (int ch = 0; ch < NTC_MLP_OUTPUT_CHANNELS / 2; ++ch)
     {
         uint twoCh = networkOutputs[ch];
         int ch0 = ch * 2 + 0;
@@ -652,18 +405,6 @@ NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet, int, VERSION)
             outputs[ch1] = NtcConvertChannelToLinearColorSpace(desc, ch1, outputs[ch1]);
         }
     }
-#else
-    [unroll]
-    for (int ch = 0; ch < Params::OUTPUT_CHANNELS; ++ch)
-    {
-        outputs[ch] = asfloat(networkOutputs[ch]);
-
-        if (convertToLinearColorSpace)
-        {
-            outputs[ch] = NtcConvertChannelToLinearColorSpace(desc, ch, outputs[ch]);
-        }
-    }
-#endif
     
     return true;
 }

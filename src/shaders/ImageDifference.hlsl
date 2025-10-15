@@ -11,16 +11,17 @@
  */
 
 #include "libntc/shaders/ImageDifferenceConstants.h"
-#include "Vulkan.hlsli"
+#include "libntc/shaders/Bindings.h"
+#include "BindingHelpers.hlsli"
 
 #ifdef __cplusplus
 static const NtcImageDifferenceConstants g_Const;
 #else
-VK_BINDING(0, 0) ConstantBuffer<NtcImageDifferenceConstants> g_Const : register(b0);
+NTC_DECLARE_CBUFFER(ConstantBuffer<NtcImageDifferenceConstants> g_Const, NTC_BINDING_IMAGE_DIFF_CONSTANT_BUFFER, 0);
 #endif
-VK_BINDING(1, 0) Texture2D<float4> t_Input1 : register(t1);
-VK_BINDING(2, 0) Texture2D<float4> t_Input2 : register(t2);
-VK_BINDING(3, 0) RWByteAddressBuffer u_Output : register(u3);
+NTC_DECLARE_SRV(Texture2D<float4> t_Input1,   NTC_BINDING_IMAGE_DIFF_INPUT_TEXTURE_A, 0);
+NTC_DECLARE_SRV(Texture2D<float4> t_Input2,   NTC_BINDING_IMAGE_DIFF_INPUT_TEXTURE_B, 0);
+NTC_DECLARE_UAV(RWByteAddressBuffer u_Output, NTC_BINDING_IMAGE_DIFF_OUTPUT_BUFFER, 0);
 
 // Storage for error reduction - enough for the worst case of 4-lane SIMD.
 groupshared float4 s_Error[IMAGE_DIFFERENCE_CS_BLOCK_WIDTH * IMAGE_DIFFERENCE_CS_BLOCK_HEIGHT / 4];

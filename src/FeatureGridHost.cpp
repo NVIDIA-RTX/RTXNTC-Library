@@ -14,87 +14,65 @@
 #include "Quantizer.h"
 #include "CudaRandomGen.h"
 #include <cmath>
+#include <cassert>
 #include <random>
 
 namespace ntc
 {
 
 FeatureGrid::FeatureGrid(IAllocator* allocator)
-    : m_encodedLatentsMemory(allocator)
+    : m_encodedPixelsMemory(allocator)
 { }
 
-Status FeatureGrid::Initialize(int imageWidth, int imageHeight, int imageMips, int highResGridScale, int highResFeatures, int lowResFeatures,
-    int highResQuantBits, int lowResQuantBits, bool enableCompression)
+Status FeatureGrid::Initialize(int imageWidth, int imageHeight, int imageMips, int gridScale, int numFeatures,
+    bool enableCompression)
 {
-    m_highResGridScale = highResGridScale;
-    m_highResQuantBits = highResQuantBits;
-    m_lowResQuantBits = lowResQuantBits;
-    m_highResFeatures = highResFeatures;
-    m_lowResFeatures = lowResFeatures;
+    m_numFeatures = numFeatures;
+    m_gridScale = gridScale;
 
-    m_numNeuralMipLevels = CalculateNumNeuralMipLevels(imageWidth, imageHeight, highResGridScale);
+    m_numNeuralMipLevels = CalculateNumNeuralMipLevels(imageWidth, imageHeight, gridScale);
 
-    // Clamp the theoretical mip count with the one that will be used for this texture
-    const int lastNeuralMip = FeatureGridMath::LodToNeuralLod(imageMips - 1, highResGridScale, NTC_MAX_NEURAL_MIPS);
-    m_numNeuralMipLevels = std::min(m_numNeuralMipLevels, lastNeuralMip + 1);
+    // Clamp the theoretical mip count with the one that will be used for this texture set
+    const int lastNeuralMip = FeatureGridMath::LodToNeuralLod(imageMips - 1, gridScale, NTC_MAX_NEURAL_MIPS);
+    m_numNeuralMipLevels = std::min(m_numNeuralMipLevels, lastNeuralMip + 2);
 
-    m_totalHighResLatentCount = 0;
-    m_totalLowResLatentCount = 0;
-    m_totalLatentCount = 0;
-    size_t quantizedLatentUintCount = 0;
-    size_t totalMaskItemCount = 0;
+    assert(m_numNeuralMipLevels > 0);
+    assert((m_numNeuralMipLevels & 1) == 0); // Must be even
+    assert(m_numNeuralMipLevels <= NTC_MAX_NEURAL_MIPS);
 
-    for (int mip = 0; mip < m_numNeuralMipLevels; mip++)
-    {
-        size_t const latentPixelsInThisMip = CalculateNumLatentsInNeuralMip(Grid::HighRes, imageWidth, imageHeight,
-            highResGridScale, mip);
-        size_t const latentCountInThisMip = latentPixelsInThisMip * highResFeatures;
+    m_numLayers = FeatureGridMath::GetNumLayers(numFeatures);
 
-        m_highResLatentCounts[mip] = latentCountInThisMip;
-        m_highResLatentOffsets[mip] = m_totalLatentCount;
-        m_totalHighResLatentCount += latentCountInThisMip;
-        m_totalLatentCount += latentCountInThisMip;
-
-        m_highResMaskOffsets[mip] = totalMaskItemCount;
-        totalMaskItemCount += (latentPixelsInThisMip + 31) / 32;
-
-        int quantizedSizeInThisMip = GetQuantizedLatentSizeUints(latentCountInThisMip, m_highResQuantBits);
-        m_highResQuantizedGridOffsets[mip] = quantizedLatentUintCount;
-        quantizedLatentUintCount += quantizedSizeInThisMip;
-    }
+    m_totalPixels = 0;
 
     for (int mip = 0; mip < m_numNeuralMipLevels; mip++)
     {
-        size_t const latentPixelsInThisMip = CalculateNumLatentsInNeuralMip(Grid::LowRes, imageWidth, imageHeight,
-            highResGridScale, mip);
-        size_t const latentCountInThisMip = latentPixelsInThisMip * lowResFeatures;
+        int const mipWidth = GetGridDimension(imageWidth, mip, gridScale);
+        int const mipHeight = GetGridDimension(imageHeight, mip, gridScale);
 
-        m_lowResLatentCounts[mip] = latentCountInThisMip;
-        m_lowResLatentOffsets[mip] = m_totalLatentCount;
-        m_totalLowResLatentCount += latentCountInThisMip;
-        m_totalLatentCount += latentCountInThisMip;
-
-        m_lowResMaskOffsets[mip] = totalMaskItemCount;
-        totalMaskItemCount += (latentPixelsInThisMip + 31) / 32;
-
-        int quantizedSizeInThisMip = GetQuantizedLatentSizeUints(latentCountInThisMip, m_lowResQuantBits);
-        m_lowResQuantizedGridOffsets[mip] = quantizedLatentUintCount;
-        quantizedLatentUintCount += quantizedSizeInThisMip;
+        size_t const pixelsInThisMip = size_t(mipWidth) * size_t(mipHeight);
+        
+        m_mipSizesInPixels[mip] = pixelsInThisMip;
+        m_mipOffsetsInPixels[mip] = m_totalPixels;
+        m_totalPixels += pixelsInThisMip;
     }
 
-    if (!m_quantizedLatentsMemory.Allocate(m_totalLatentCount))
+    size_t const totalMaskUints = (m_totalPixels + 31) / 32; // Round up to the nearest multiple of 32 bits
+    size_t const totalPixelsInAllLayers = m_totalPixels * size_t(m_numLayers);
+    
+    size_t const totalLatents = totalPixelsInAllLayers * FeaturesPerLayer;
+    if (!m_quantizedLatentsMemory.Allocate(totalLatents))
         return Status::OutOfMemory;
 
-    if (!m_encodedLatentsMemory.Allocate(quantizedLatentUintCount))
+    if (!m_encodedPixelsMemory.Allocate(totalPixelsInAllLayers * BytesPerLatentPixel))
         return Status::OutOfMemory;
 
     if (enableCompression)
     {
-        if (!m_baseLatentsMemory.Allocate(m_totalLatentCount))  return Status::OutOfMemory;
-        if (!m_gradientMemory.Allocate(m_totalLatentCount))     return Status::OutOfMemory;
-        if (!m_moment1Memory.Allocate(m_totalLatentCount))      return Status::OutOfMemory;
-        if (!m_moment2Memory.Allocate(m_totalLatentCount))      return Status::OutOfMemory;
-        if (!m_gradientMaskMemory.Allocate(totalMaskItemCount)) return Status::OutOfMemory;
+        if (!m_baseLatentsMemory.Allocate(totalLatents))    return Status::OutOfMemory;
+        if (!m_gradientMemory.Allocate(totalLatents))       return Status::OutOfMemory;
+        if (!m_moment1Memory.Allocate(totalLatents))        return Status::OutOfMemory;
+        if (!m_moment2Memory.Allocate(totalLatents))        return Status::OutOfMemory;
+        if (!m_gradientMaskMemory.Allocate(totalMaskUints)) return Status::OutOfMemory;
     }
 
     return Status::Ok;
@@ -103,8 +81,8 @@ Status FeatureGrid::Initialize(int imageWidth, int imageHeight, int imageMips, i
 void FeatureGrid::Deallocate()
 {
     m_quantizedLatentsMemory.Deallocate();
-    m_encodedLatentsMemory.Deallocate();
     m_baseLatentsMemory.Deallocate();
+    m_encodedPixelsMemory.Deallocate();
     m_gradientMemory.Deallocate();
     m_moment1Memory.Deallocate();
     m_moment2Memory.Deallocate();
@@ -113,17 +91,15 @@ void FeatureGrid::Deallocate()
 
 void FeatureGrid::Fill(CudaRandomGen& rng)
 {
-    const float threshold = 1.f;
-    const float scale = 0.5f / sqrtf(float(m_lowResFeatures));
-
     rng.FillRandomNormalHalf(m_baseLatentsMemory.DevicePtr(),
         uint32_t(m_baseLatentsMemory.Length()),
-        scale, 0.f, -threshold, threshold);
+        0.25f, 0.5f, 0.f, 1.f);
 
-    cudaMemcpy(m_quantizedLatentsMemory.DevicePtr(), m_baseLatentsMemory.DevicePtr(), m_baseLatentsMemory.Size(), cudaMemcpyDeviceToDevice);
-    cudaMemset(m_gradientMemory.DevicePtr(), 0, m_totalLatentCount * sizeof(float));
-    cudaMemset(m_moment1Memory.DevicePtr(), 0, m_totalLatentCount * sizeof(float));
-    cudaMemset(m_moment2Memory.DevicePtr(), 0, m_totalLatentCount * sizeof(float));
+    cudaMemcpy(m_quantizedLatentsMemory.DevicePtr(), m_baseLatentsMemory.DevicePtr(),
+        m_baseLatentsMemory.Size(), cudaMemcpyDeviceToDevice);
+    cudaMemset(m_gradientMemory.DevicePtr(), 0, m_gradientMemory.Size());
+    cudaMemset(m_moment1Memory.DevicePtr(), 0, m_moment1Memory.Size());
+    cudaMemset(m_moment2Memory.DevicePtr(), 0, m_moment2Memory.Size());
 }
 
 void FeatureGrid::ClearGradientMask()
@@ -133,78 +109,76 @@ void FeatureGrid::ClearGradientMask()
 
 int FeatureGrid::LodToNeuralLod(int lod) const
 {
-    return FeatureGridMath::LodToNeuralLod(lod, m_highResGridScale, m_numNeuralMipLevels);
+    return FeatureGridMath::LodToNeuralLod(lod, m_gridScale, m_numNeuralMipLevels);
 }
 
-half* FeatureGrid::GetBaseLatentsDevicePtr(Grid grid, int neuralLod)
+half* FeatureGrid::GetBaseLatentsDevicePtr(int neuralLod)
 {
-    return m_baseLatentsMemory.DevicePtr() ? m_baseLatentsMemory.DevicePtr() + GetLatentOffset(grid, neuralLod) : nullptr;
+    return m_baseLatentsMemory.DevicePtrOffset(GetLatentOffset(neuralLod));
 }
 
-half* FeatureGrid::GetQuantizedLatentsDevicePtr(Grid grid, int neuralLod)
+half* FeatureGrid::GetQuantizedLatentsDevicePtr(int neuralLod)
 {
-    return m_quantizedLatentsMemory.DevicePtr() ? m_quantizedLatentsMemory.DevicePtr() + GetLatentOffset(grid, neuralLod) : nullptr;
+    return m_quantizedLatentsMemory.DevicePtrOffset(GetLatentOffset(neuralLod));
 }
 
-float* FeatureGrid::GetMoment1DevicePtr(Grid grid, int neuralLod)
+float* FeatureGrid::GetMoment1DevicePtr()
 {
-    return m_moment1Memory.DevicePtr() ? m_moment1Memory.DevicePtr() + GetLatentOffset(grid, neuralLod) : nullptr;
+    return m_moment1Memory.DevicePtr();
 }
 
-float* FeatureGrid::GetMoment2DevicePtr(Grid grid, int neuralLod)
+float* FeatureGrid::GetMoment2DevicePtr()
 {
-    return m_moment2Memory.DevicePtr() ? m_moment2Memory.DevicePtr() + GetLatentOffset(grid, neuralLod) : nullptr;
+    return m_moment2Memory.DevicePtr();
 }
 
-uint32_t* FeatureGrid::GetEncodedLatentsDevicePtr(Grid grid, int neuralLod)
+void* FeatureGrid::GetGradientsDevicePtr()
 {
-    size_t offset = grid == Grid::HighRes ? m_highResQuantizedGridOffsets[neuralLod] : m_lowResQuantizedGridOffsets[neuralLod];
-    return m_encodedLatentsMemory.DevicePtr() ? m_encodedLatentsMemory.DevicePtr() + offset : nullptr;
+    return m_gradientMemory.DevicePtr();
 }
 
-uint32_t* FeatureGrid::GetEncodedLatentsHostPtr(Grid grid, int neuralLod)
+uint16_t* FeatureGrid::GetEncodedPixelsDevicePtr(int neuralLod)
 {
-    size_t offset = grid == Grid::HighRes ? m_highResQuantizedGridOffsets[neuralLod] : m_lowResQuantizedGridOffsets[neuralLod];
-    return m_encodedLatentsMemory.HostPtr() ? m_encodedLatentsMemory.HostPtr() + offset : nullptr;
+    assert(neuralLod < m_numNeuralMipLevels);
+    size_t offset = m_mipOffsetsInPixels[neuralLod] * size_t(m_numLayers) * BytesPerLatentPixel;
+    assert((offset % 2) == 0);
+    return (uint16_t*)m_encodedPixelsMemory.DevicePtrOffset(offset);
 }
 
-size_t FeatureGrid::GetQuantizedLatentsSize(Grid grid, int neuralLod)
+uint16_t* FeatureGrid::GetEncodedPixelsHostPtr(int neuralLod)
 {
-    size_t count = grid == Grid::HighRes ? m_highResLatentCounts[neuralLod] : m_lowResLatentCounts[neuralLod];
-    int bits = grid == Grid::HighRes ? m_highResQuantBits : m_lowResQuantBits;
-    return GetQuantizedLatentSizeUints(count, bits) * sizeof(uint32_t);
+    assert(neuralLod < m_numNeuralMipLevels);
+    size_t offset = m_mipOffsetsInPixels[neuralLod] * size_t(m_numLayers) * BytesPerLatentPixel;
+    assert((offset % 2) == 0);
+    return (uint16_t*)m_encodedPixelsMemory.HostPtrOffset(offset);
 }
 
-uint32_t* FeatureGrid::GetGradientMaskDevicePtr(Grid grid, int neuralLod)
+size_t FeatureGrid::GetEncodedPixelsSize(int neuralLod)
 {
-    size_t const offset = (grid == Grid::HighRes) ? m_highResMaskOffsets[neuralLod] : m_lowResMaskOffsets[neuralLod];
-    return m_gradientMaskMemory.DevicePtr() ? m_gradientMaskMemory.DevicePtr() + offset : nullptr;
+    assert(neuralLod < m_numNeuralMipLevels);
+    return m_mipSizesInPixels[neuralLod] * size_t(m_numLayers) * BytesPerLatentPixel;
 }
 
-DeviceAndHostArray<uint32_t>& FeatureGrid::GetEncodedLatentsArray()
+uint32_t* FeatureGrid::GetGradientMaskDevicePtr()
 {
-    return m_encodedLatentsMemory;
+    return m_gradientMaskMemory.DevicePtr();
 }
 
-size_t FeatureGrid::GetLatentOffset(Grid grid, int neuralLod)
+DeviceAndHostArray<uint8_t>& FeatureGrid::GetEncodedPixelsArray()
 {
-    return grid == Grid::HighRes ? m_highResLatentOffsets[neuralLod] : m_lowResLatentOffsets[neuralLod];
+    return m_encodedPixelsMemory;
 }
 
-size_t FeatureGrid::GetLatentCount(Grid grid, int neuralLod)
+size_t FeatureGrid::GetLatentOffset(int neuralLod)
 {
-    return grid == Grid::HighRes ? m_highResLatentCounts[neuralLod] : m_lowResLatentCounts[neuralLod];
+    assert(neuralLod < m_numNeuralMipLevels);
+    return m_mipOffsetsInPixels[neuralLod] * FeaturesPerGroup;
 }
 
-size_t FeatureGrid::GetLatentCount(Grid grid) const
-{
-    return grid == Grid::HighRes ? m_totalHighResLatentCount : m_totalLowResLatentCount;
+size_t FeatureGrid::GetMaskOffset(int neuralLod) const
+{ 
+    assert(neuralLod < m_numNeuralMipLevels);
+    return m_mipOffsetsInPixels[neuralLod];
 }
-
-int FeatureGrid::GetNumMipLevels() const 
-{
-    return m_numNeuralMipLevels;
-}
-
 
 }

@@ -37,7 +37,6 @@ static DataType GetDataTypeForWeights(InferenceWeightType weightType)
     switch (weightType)
     {
     case InferenceWeightType::GenericInt8:
-    case InferenceWeightType::CoopVecInt8:
         return DataType::Int8;
     case InferenceWeightType::GenericFP8:
     case InferenceWeightType::CoopVecFP8:
@@ -75,7 +74,7 @@ static VkConvertCooperativeVectorMatrixInfoNV GetVkConvertLayerDesc(DataType typ
 {
     size_t const componentSize = GetDataTypeSize(type);
 
-    VkConvertCooperativeVectorMatrixInfoNV layoutInfo;
+    VkConvertCooperativeVectorMatrixInfoNV layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_CONVERT_COOPERATIVE_VECTOR_MATRIX_INFO_NV;
     layoutInfo.srcSize = inputChannels * outputChannels * componentSize;
     layoutInfo.srcData.deviceAddress = srcData;
@@ -176,8 +175,7 @@ bool CoopVecWeightConverter::IsConversionSupported(GraphicsResources const* reso
 
     switch (weightType)
     {
-    case InferenceWeightType::CoopVecInt8: return resources->IsCoopVecInt8Supported();
-    case InferenceWeightType::CoopVecFP8: return resources->IsCoopVecFP8Supported();
+    case InferenceWeightType::CoopVecFP8: return resources->IsCoopVecSupported();
     default: return false;
     }
 }
@@ -284,7 +282,6 @@ bool CoopVecWeightConverter::GetWeightLayout(GraphicsResources const* resources,
         switch (weightType)
         {
         case InferenceWeightType::GenericInt8:
-        case InferenceWeightType::CoopVecInt8:
             scaleType = DataType::FP32;
             biasType = DataType::Int32;
             break;
@@ -321,7 +318,6 @@ bool CoopVecWeightConverter::GetWeightLayout(GraphicsResources const* resources,
     switch (weightType)
     {
     case InferenceWeightType::GenericInt8:
-    case InferenceWeightType::CoopVecInt8:
         // All scale vectors one after another, then all bias vectors
         outLayout.scales[0].offset = outLayout.combinedScaleBias.offset;
         outLayout.biases[0].offset = outLayout.combinedScaleBias.offset + totalScaleSize;
@@ -447,16 +443,13 @@ void CoopVecWeightConverter::ConvertWeights(GraphicsResources const* resources, 
 
 bool CoopVecWeightConverter::IsCoopVecWeightType(InferenceWeightType weightType)
 {
-    return weightType == InferenceWeightType::CoopVecInt8 ||
-        weightType == InferenceWeightType::CoopVecFP8;
+    return weightType == InferenceWeightType::CoopVecFP8;
 }
 
 InferenceWeightType CoopVecWeightConverter::GetGenericWeightType(InferenceWeightType weightType)
 {
     switch (weightType)
     {
-    case InferenceWeightType::CoopVecInt8:
-        return InferenceWeightType::GenericInt8;
     case InferenceWeightType::CoopVecFP8:
         return InferenceWeightType::GenericFP8;
     default:
@@ -466,11 +459,9 @@ InferenceWeightType CoopVecWeightConverter::GetGenericWeightType(InferenceWeight
 }
 
 #if NTC_WITH_DX12
-void CoopVecWeightConverter::IsDX12CoopVecSupported(GraphicsResources const* resources,
-    bool& outInt8Supported, bool& outFP8Supported)
+void CoopVecWeightConverter::IsDX12CoopVecSupported(GraphicsResources const* resources, bool& outSupported)
 {
-    outInt8Supported = false;
-    outFP8Supported = false;
+    outSupported = false;
 
     // Get the general cooperative vector support tier
     D3D12_FEATURE_DATA_D3D12_OPTIONS_EXPERIMENTAL experimentalOptions{};
@@ -498,22 +489,15 @@ void CoopVecWeightConverter::IsDX12CoopVecSupported(GraphicsResources const* res
         return;
 
     // Go over the properties and see if there are formats that we need in the list
-    bool int8InputLayerSupported = false;
-    bool int8OtherLayersSupported = false;
+    bool int8LayerSupported = false;
     bool fp8LayersSupported = false;
     for (const auto& prop : properties)
     {
-        if (prop.InputType == D3D12_LINEAR_ALGEBRA_DATATYPE_UINT32 &&
-            prop.InputInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8_T4_PACKED &&
-            prop.MatrixInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8 &&
-            prop.OutputType == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32)
-            int8InputLayerSupported = true;
-            
         if (prop.InputType == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32 &&
             prop.InputInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8 &&
             prop.MatrixInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8 &&
             prop.OutputType == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32)
-            int8OtherLayersSupported = true;
+            int8LayerSupported = true;
 
         if (prop.InputType == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16 &&
             prop.InputInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT_E4M3 &&
@@ -522,21 +506,22 @@ void CoopVecWeightConverter::IsDX12CoopVecSupported(GraphicsResources const* res
             fp8LayersSupported = true;
     }
 
-    outInt8Supported = int8InputLayerSupported && int8OtherLayersSupported;
-    outFP8Supported = int8OtherLayersSupported && fp8LayersSupported;
+    outSupported = int8LayerSupported && fp8LayersSupported;
 }
 #endif
 
 #if NTC_WITH_VULKAN
 void CoopVecWeightConverter::IsVkCoopVecSupported(GraphicsResources const* resources,
-    bool& outInt8Supported, bool& outFP8Supported)
+    bool& outSupported)
 {
-    outInt8Supported = false;
-    outFP8Supported = false;
+    outSupported = false;
 
     VkPhysicalDevice vkPhysicalDevice = resources->GetVulkanPhysicalDevice();
 
-    if (!resources->pfn_vkGetPhysicalDeviceCooperativeVectorPropertiesNV || !vkPhysicalDevice)
+    if (!resources->pfn_vkGetPhysicalDeviceCooperativeVectorPropertiesNV ||
+        !resources->pfn_vkConvertCooperativeVectorMatrixNV || 
+        !resources->pfn_vkCmdConvertCooperativeVectorMatrixNV ||
+        !vkPhysicalDevice)
         return;
 
     // Verify that the physical device we're on was made by NVIDIA.
@@ -562,24 +547,16 @@ void CoopVecWeightConverter::IsVkCoopVecSupported(GraphicsResources const* resou
         return;
 
     // Go over the properties and see if there are formats that we need in the list
-    bool int8InputLayerSupported = false;
-    bool int8OtherLayersSupported = false;
+    bool int8LayerSupported = false;
     bool fp8LayersSupported = false;
     for (const auto& prop : properties)
     {
-        if (prop.sType == VK_STRUCTURE_TYPE_COOPERATIVE_VECTOR_PROPERTIES_NV &&
-            prop.inputType == VK_COMPONENT_TYPE_UINT32_KHR &&
-            prop.inputInterpretation == VK_COMPONENT_TYPE_SINT8_PACKED_NV &&
-            prop.matrixInterpretation == VK_COMPONENT_TYPE_SINT8_KHR &&
-            prop.resultType == VK_COMPONENT_TYPE_SINT32_KHR)
-            int8InputLayerSupported = true;
-            
         if (prop.sType == VK_STRUCTURE_TYPE_COOPERATIVE_VECTOR_PROPERTIES_NV &&
             prop.inputType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
             prop.inputInterpretation == VK_COMPONENT_TYPE_SINT8_KHR &&
             prop.matrixInterpretation == VK_COMPONENT_TYPE_SINT8_KHR &&
             prop.resultType == VK_COMPONENT_TYPE_SINT32_KHR)
-            int8OtherLayersSupported = true;
+            int8LayerSupported = true;
 
         if (prop.sType == VK_STRUCTURE_TYPE_COOPERATIVE_VECTOR_PROPERTIES_NV &&
             prop.inputType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
@@ -589,8 +566,7 @@ void CoopVecWeightConverter::IsVkCoopVecSupported(GraphicsResources const* resou
             fp8LayersSupported = true;
     }
 
-    outInt8Supported = int8InputLayerSupported && int8OtherLayersSupported;
-    outFP8Supported = int8OtherLayersSupported && fp8LayersSupported;
+    outSupported = int8LayerSupported && fp8LayersSupported;
 }
 #endif
 
