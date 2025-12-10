@@ -94,6 +94,21 @@ bool SerializeContext::SerializeObject(void const* object, AbstractObjectSchema 
             break;
         }
 
+        case Field::Type::ArrayOfInt: {
+            auto const& vector = GetObjectField<Vector<int>>(object, field.offset);
+            if (!vector.empty())
+            {
+                writer.Key(field.name);
+                writer.StartArray();
+                for (int value : vector)
+                {
+                    writer.Int(value);
+                }
+                writer.EndArray();
+            }
+            break;
+        }
+
         case Field::Type::OptionalInt: {
             auto const& optional = GetObjectField<std::optional<int32_t>>(object, field.offset);
             if (optional.has_value())
@@ -108,6 +123,21 @@ bool SerializeContext::SerializeObject(void const* object, AbstractObjectSchema 
             uint32_t value = GetObjectField<uint32_t>(object, field.offset);
             writer.Key(field.name);
             writer.Uint(value);
+            break;
+        }
+
+        case Field::Type::ArrayOfUInt: {
+            auto const& vector = GetObjectField<Vector<uint32_t>>(object, field.offset);
+            if (!vector.empty())
+            {
+                writer.Key(field.name);
+                writer.StartArray();
+                for (uint32_t value : vector)
+                {
+                    writer.Uint(value);
+                }
+                writer.EndArray();
+            }
             break;
         }
 
@@ -128,6 +158,21 @@ bool SerializeContext::SerializeObject(void const* object, AbstractObjectSchema 
             break;
         }
 
+        case Field::Type::ArrayOfUInt64: {
+            auto const& vector = GetObjectField<Vector<uint64_t>>(object, field.offset);
+            if (!vector.empty())
+            {
+                writer.Key(field.name);
+                writer.StartArray();
+                for (uint64_t value : vector)
+                {
+                    writer.Uint64(value);
+                }
+                writer.EndArray();
+            }
+            break;
+        }
+
         case Field::Type::OptionalUInt64: {
             auto const& optional = GetObjectField<std::optional<uint64_t>>(object, field.offset);
             if (optional.has_value())
@@ -145,6 +190,21 @@ bool SerializeContext::SerializeObject(void const* object, AbstractObjectSchema 
             break;
         }
 
+        case Field::Type::ArrayOfFloat: {
+            auto const& vector = GetObjectField<Vector<float>>(object, field.offset);
+            if (!vector.empty())
+            {
+                writer.Key(field.name);
+                writer.StartArray();
+                for (float value : vector)
+                {
+                    writer.Double(value);
+                }
+                writer.EndArray();
+            }
+            break;
+        }
+
         case Field::Type::OptionalFloat: {
             auto const& optional = GetObjectField<std::optional<float>>(object, field.offset);
             if (optional.has_value())
@@ -159,6 +219,21 @@ bool SerializeContext::SerializeObject(void const* object, AbstractObjectSchema 
             double value = GetObjectField<double>(object, field.offset);
             writer.Key(field.name);
             writer.Double(value);
+            break;
+        }
+
+        case Field::Type::ArrayOfDouble: {
+            auto const& vector = GetObjectField<Vector<double>>(object, field.offset);
+            if (!vector.empty())
+            {
+                writer.Key(field.name);
+                writer.StartArray();
+                for (double value : vector)
+                {
+                    writer.Double(value);
+                }
+                writer.EndArray();
+            }
             break;
         }
 
@@ -372,6 +447,17 @@ bool ParseHandler::Int64(int64_t i)
             outOfRange = true;
         break;
     }
+    case Field::Type::ArrayOfInt: {
+        if (int64_t(int32_t(i)) == i)
+        {
+            auto& vector = GetObjectField<ntc::Vector<int32_t>>(ctx->object, ctx->currentField->offset);
+            vector.push_back(int32_t(i));
+            success = true;
+        }
+        else
+            outOfRange = true;
+        break;
+    }
     case Field::Type::OptionalInt: {
         auto& optional = GetObjectField<std::optional<int32_t>>(ctx->object, field.offset);
         optional = int32_t(i);
@@ -386,6 +472,17 @@ bool ParseHandler::Int64(int64_t i)
         value = uint32_t(i);
         if (int64_t(value) == i)
             success = true;
+        else
+            outOfRange = true;
+        break;
+    }
+    case Field::Type::ArrayOfUInt: {
+        if (int64_t(uint32_t(i)) == i)
+        {
+            auto& vector = GetObjectField<ntc::Vector<uint32_t>>(ctx->object, ctx->currentField->offset);
+            vector.push_back(uint32_t(i));
+            success = true;
+        }
         else
             outOfRange = true;
         break;
@@ -408,6 +505,17 @@ bool ParseHandler::Int64(int64_t i)
             outOfRange = true;
         break;
     }
+    case Field::Type::ArrayOfUInt64: {
+        if (i >= 0)
+        {
+            auto& vector = GetObjectField<ntc::Vector<uint64_t>>(ctx->object, ctx->currentField->offset);
+            vector.push_back(uint64_t(i));
+            success = true;
+        }
+        else
+            outOfRange = true;
+        break;
+    }
     case Field::Type::OptionalUInt64: {
         auto& optional = GetObjectField<std::optional<uint64_t>>(ctx->object, field.offset);
         optional = i;
@@ -423,6 +531,12 @@ bool ParseHandler::Int64(int64_t i)
         success = true;
         break;
     }
+    case Field::Type::ArrayOfFloat: {
+        auto& vector = GetObjectField<ntc::Vector<float>>(ctx->object, ctx->currentField->offset);
+        vector.push_back(float(i));
+        success = true;
+        break;
+    }
     case Field::Type::OptionalFloat: {
         auto& optional = GetObjectField<std::optional<float>>(ctx->object, field.offset);
         optional = float(i);
@@ -432,6 +546,12 @@ bool ParseHandler::Int64(int64_t i)
     case Field::Type::Double: {
         double& value = GetObjectField<double>(ctx->object, field.offset);
         value = double(i);
+        success = true;
+        break;
+    }
+    case Field::Type::ArrayOfDouble: {
+        auto& vector = GetObjectField<ntc::Vector<double>>(ctx->object, ctx->currentField->offset);
+        vector.push_back(double(i));
         success = true;
         break;
     }
@@ -473,7 +593,8 @@ bool ParseHandler::Int64(int64_t i)
             SetUnexpectedTypeMessage(ctx, "integer");
     }
 
-    ctx->currentField = nullptr;
+    if (!ctx->insideArray)
+        ctx->currentField = nullptr;
 
     return success;
 }
@@ -510,6 +631,12 @@ bool ParseHandler::Double(double d)
         success = true;
         break;
     }
+    case Field::Type::ArrayOfFloat: {
+        auto& vector = GetObjectField<ntc::Vector<float>>(ctx->object, ctx->currentField->offset);
+        vector.push_back(float(d));
+        success = true;
+        break;
+    }
     case Field::Type::OptionalFloat: {
         auto& optional = GetObjectField<std::optional<float>>(ctx->object, field.offset);
         optional = float(d);
@@ -519,6 +646,12 @@ bool ParseHandler::Double(double d)
     case Field::Type::Double: {
         double& value = GetObjectField<double>(ctx->object, field.offset);
         value = d;
+        success = true;
+        break;
+    }
+    case Field::Type::ArrayOfDouble: {
+        auto& vector = GetObjectField<ntc::Vector<double>>(ctx->object, ctx->currentField->offset);
+        vector.push_back(d);
         success = true;
         break;
     }
@@ -539,7 +672,8 @@ bool ParseHandler::Double(double d)
         SetUnexpectedTypeMessage(ctx, "double");
     }
 
-    ctx->currentField = nullptr;
+    if (!ctx->insideArray)
+        ctx->currentField = nullptr;
 
     return success;
 }
@@ -753,8 +887,13 @@ bool ParseHandler::StartArray()
 
     // Validate that we're expecting an array or processing an unknown field
     if (ctx && (!ctx->currentField || 
-                ctx->currentField->type == Field::Type::ArrayOfObject ||
-                ctx->currentField->type == Field::Type::ArrayOfString))
+                ctx->currentField->type == Field::Type::ArrayOfInt ||
+                ctx->currentField->type == Field::Type::ArrayOfUInt ||
+                ctx->currentField->type == Field::Type::ArrayOfUInt64 ||
+                ctx->currentField->type == Field::Type::ArrayOfFloat ||
+                ctx->currentField->type == Field::Type::ArrayOfDouble ||
+                ctx->currentField->type == Field::Type::ArrayOfString ||
+                ctx->currentField->type == Field::Type::ArrayOfObject))
     {
         ctx->insideArray = true;
         return true;
@@ -802,22 +941,27 @@ char const* ParseHandler::GetExpectedType(Context* ctx)
 
     case Field::Type::Int: 
     case Field::Type::OptionalInt:
+    case Field::Type::ArrayOfInt:
         return "integer";
 
     case Field::Type::UInt: 
     case Field::Type::OptionalUInt:
+    case Field::Type::ArrayOfUInt:
         return "uint";
 
     case Field::Type::UInt64:
     case Field::Type::OptionalUInt64:
+    case Field::Type::ArrayOfUInt64:
         return "uint64";
 
     case Field::Type::Float:
     case Field::Type::OptionalFloat:
+    case Field::Type::ArrayOfFloat:
         return "float";
 
     case Field::Type::Double:
     case Field::Type::OptionalDouble:
+    case Field::Type::ArrayOfDouble:
         return "double";
 
     case Field::Type::String:

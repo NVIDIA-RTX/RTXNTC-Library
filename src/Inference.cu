@@ -34,8 +34,7 @@ __global__ void InferenceKernel(InferenceKernelParams const params)
 
     FeatureGrid highResFeatureGrid(params.numFeatures, params.highResLatentWidth, params.highResLatentHeight, params.latentStride);
     FeatureGrid lowResFeatureGrid(params.numFeatures, params.lowResLatentWidth, params.lowResLatentHeight, params.latentStride);
-    using Network = tin::HMLP<NTC_MLP_LAYERS-2, NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS,
-        Activation, tin::ActNone, tin::ReducerUpdateMode::ATOMIC_ADD, WARPS_PER_TBLOCK * tin::WarpSize, float>;
+    using Network = MLP<Activation, tin::ReducerUpdateMode::ATOMIC_ADD, WARPS_PER_TBLOCK * tin::WarpSize, float>;
 
     // shared memory for loss reduction
     __shared__ float lossReductionShared[tin::Reducer<float, WARPS_PER_TBLOCK>::sharedmem_size()];
@@ -62,9 +61,9 @@ __global__ void InferenceKernel(InferenceKernelParams const params)
         tin::HVector<NTC_MLP_INPUT_CHANNELS> networkInputsVector(networkInputsArray);
         
         // Run network
-        // See the comment block in the beginning of TextureSet.cpp for the weight layouts
+        // See the comment block in the beginning of WeightLayout.cpp for the weight layouts
         const tin::Quantization quantization = params.useFP8Quantization ? tin::Quantization::FP8 : tin::Quantization::Int8;
-        Network mlp(params.mlpWeights, params.mlpWeights + Network::num_weights(), quantization, tin::Quantization::Int8);
+        Network mlp(params.mlpWeights, params.mlpWeights + MlpDesc::GetTotalWeightCount(), quantization, tin::Quantization::Int8);
 
         auto networkOutputsVector = mlp.forward(networkInputsVector);
         

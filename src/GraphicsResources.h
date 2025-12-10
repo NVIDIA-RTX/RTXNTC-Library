@@ -51,6 +51,7 @@ public:
 #define DECLARE_VULKAN_PFN(name) PFN_##name pfn_##name = nullptr
     DECLARE_VULKAN_PFN(vkCmdConvertCooperativeVectorMatrixNV);
     DECLARE_VULKAN_PFN(vkCmdCopyBuffer);
+    DECLARE_VULKAN_PFN(vkCmdDecompressMemoryNV);
     DECLARE_VULKAN_PFN(vkConvertCooperativeVectorMatrixNV);
     DECLARE_VULKAN_PFN(vkGetBufferDeviceAddress);
     DECLARE_VULKAN_PFN(vkGetPhysicalDeviceCooperativeVectorPropertiesNV);

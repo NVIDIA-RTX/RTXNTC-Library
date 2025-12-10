@@ -25,12 +25,12 @@ enum class InferenceMath
 #if NTC_WITH_PREBUILT_SHADERS
 #if NTC_WITH_DX12
 void GetDecompressDxilShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize);
-void GetBlockCompressDxilShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize);
+void GetBlockCompressDxilShaderBytecode(BlockCompressedFormat format, bool useModeBuffer, const void** pOutData, size_t* pOutSize);
 void GetImageDifferenceDxilShaderBytecode(const void** pOutData, size_t* pOutSize);
 #endif
 #if NTC_WITH_VULKAN
 void GetDecompressSpirvShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize);
-void GetBlockCompressSpirvShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize);
+void GetBlockCompressSpirvShaderBytecode(BlockCompressedFormat format, bool useModeBuffer, const void** pOutData, size_t* pOutSize);
 void GetImageDifferenceSpirvShaderBytecode(const void** pOutData, size_t* pOutSize);
 #endif
 #endif

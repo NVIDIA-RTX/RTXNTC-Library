@@ -18,12 +18,35 @@
 namespace ntc
 {
 
+class Context;
 class TextureSetMetadata;
+
+namespace json
+{
+    struct BufferView;
+}
+
+struct ModeBufferInfo
+{
+    Vector<uint8_t> data;
+
+    BufferFootprint footprint;
+
+    ModeBufferInfo(IAllocator* allocator)
+        : data(allocator)
+    { }
+
+    void Clear()
+    {
+        data.clear();
+        footprint = BufferFootprint();
+    }
+};
 
 class TextureMetadata : public ITextureMetadata
 {
 public:
-    TextureMetadata(IAllocator* allocator, TextureSetMetadata* parent);
+    TextureMetadata(IAllocator* allocator, Context const* context, TextureSetMetadata* parent);
 
     void SetName(const char* name) override;
     char const* GetName() const override;
@@ -46,26 +69,24 @@ public:
     void SetAlphaColorSpace(ColorSpace colorSpace) override;
     ColorSpace GetAlphaColorSpace() const override;
 
-    Status SetBlockCompressionAccelerationData(void const* pData, size_t size) override;
-    bool HasBlockCompressionAccelerationData() const override;
-    void SetBlockCompressionQuality(uint8_t quality) override;
-    uint8_t GetBlockCompressionQuality() const override;
+    Status MakeAndStoreBC7ModeBuffer(int mipLevel, int widthInBlocks, int heightInBlocks,
+        void const* blockData, size_t blockDataSize, size_t rowPitch) override;
 
-    void GetBlockCompressionModeHistogram(void const** ppData, size_t* pSize) const;
-    void SetBlockCompressionModeHistogram(void const* pData, size_t size);
-    bool GetAllowedBCModes(uint32_t* pData, size_t size, uint8_t quality) const;
+    void GetBC7ModeBuffer(int mipLevel, void const** outData, size_t* outSize) const override;
+
+    BufferFootprint GetBC7ModeBufferFootprint(int mipLevel) const override;
     
-private:
-    struct BCHistogramEntry
-    {
-        uint8_t mode;
-        uint8_t partition;
-        uint16_t frequency;
-    };
+    // Library internal methods
+    
+    void SetBC7ModeBufferFootprint(int mipLevel, json::BufferView const& view, uint64_t binaryChunkOffset);
+    Status LoadBC7ModeBuffers(IStream* inputStream);
+    ModeBufferInfo const* GetModeBufferInfo(int mipLevel) const;
+    TextureSetMetadata* GetParent() const { return m_parent; }
 
-    static_assert(sizeof(BCHistogramEntry) == 4, "BCHistogramEntry is supposed to pack into a uint32_t");
+private:
 
     IAllocator* m_allocator;
+    Context const* m_context;
     TextureSetMetadata* m_parent;
     String m_name;
     int m_firstChannel = 0;
@@ -74,8 +95,7 @@ private:
     BlockCompressedFormat m_bcFormat = BlockCompressedFormat::None;
     ColorSpace m_rgbColorSpace = ColorSpace::Linear;
     ColorSpace m_alphaColorSpace = ColorSpace::Linear;
-    Vector<BCHistogramEntry> m_bcHistogram;
-    uint8_t m_bcQuality = BlockCompressionMaxQuality;
+    Vector<ModeBufferInfo> m_modeBuffers;
 };
 
 

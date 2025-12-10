@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -12,9 +12,7 @@
 
 #pragma once
 
-#include <libntc/ntc.h>
 #include <libntc/shaders/InferenceConstants.h>
-#include <cstddef>
 
 namespace ntc
 {
@@ -23,54 +21,82 @@ namespace ntc
 // There used to be a few versions of the MLP in the library, now there is only one.
 struct MlpDesc
 {
-    int numFeatures;
-    int inputChannels;
-
-    int GetInputChannels() const { return inputChannels; }
-    int GetHiddenChannels() const;
-    int GetOutputChannels() const;
-    int GetHiddenLayers() const;
-
     // Returns the total number of weights in all layers.
-    int GetWeightCount() const;
+    static constexpr int GetTotalWeightCount()
+    {
+#if NTC_MLP_LAYERS == 4
+        return NTC_MLP_INPUT_CHANNELS * NTC_MLP_HIDDEN0_CHANNELS
+            + NTC_MLP_HIDDEN0_CHANNELS * NTC_MLP_HIDDEN1_CHANNELS
+            + NTC_MLP_HIDDEN1_CHANNELS * NTC_MLP_HIDDEN2_CHANNELS
+            + NTC_MLP_HIDDEN2_CHANNELS * NTC_MLP_OUTPUT_CHANNELS;
+#elif NTC_MLP_LAYERS == 3
+        return NTC_MLP_INPUT_CHANNELS * NTC_MLP_HIDDEN0_CHANNELS
+            + NTC_MLP_HIDDEN0_CHANNELS * NTC_MLP_HIDDEN1_CHANNELS
+            + NTC_MLP_HIDDEN1_CHANNELS * NTC_MLP_OUTPUT_CHANNELS;
+#else
+        #error "Unsupported NTC_MLP_LAYERS value"
+#endif
+    }
 
     // Returns the total number of outputs from all layers.
-    int GetLayerOutputCount() const;
+    static constexpr int GetTotalOutputCount()
+    {
+#if NTC_MLP_LAYERS == 4
+        return NTC_MLP_HIDDEN0_CHANNELS
+            + NTC_MLP_HIDDEN1_CHANNELS
+            + NTC_MLP_HIDDEN2_CHANNELS
+            + NTC_MLP_OUTPUT_CHANNELS;
+#elif NTC_MLP_LAYERS == 3
+        return NTC_MLP_HIDDEN0_CHANNELS
+            + NTC_MLP_HIDDEN1_CHANNELS
+            + NTC_MLP_OUTPUT_CHANNELS;
+#else
+        #error "Unsupported NTC_MLP_LAYERS value"
+#endif
+    }
 
     // Returns the number of inputs for a specific layer by index.
-    int GetLayerInputChannels(int layer) const;
+    static constexpr int GetLayerInputChannels(int layer)
+    {
+        switch(layer)
+        {
+            case 0:
+                return NTC_MLP_INPUT_CHANNELS;
+            case 1:
+                return NTC_MLP_HIDDEN0_CHANNELS;
+            case 2:
+                return NTC_MLP_HIDDEN1_CHANNELS;
+#if NTC_MLP_LAYERS == 4
+            case 3:
+                return NTC_MLP_HIDDEN2_CHANNELS;
+#endif
+            default:
+                return 0;
+        }
+    }
 
     // Returns the number of outputs for a specific layer by index.
-    int GetLayerOutputChannels(int layer) const;
-
-    static MlpDesc const& Get();
-};
-
-enum class DataType
-{
-    None,
-    Int8,
-    Int32,
-    FP8,
-    FP16,
-    FP32
-};
-
-struct Span
-{
-    size_t offset = 0;
-    size_t size = 0;
-    DataType type = DataType::None;
-};
-
-struct WeightLayout
-{
-    Span weights[NTC_MLP_LAYERS]{};
-    Span combinedWeights;
-    Span scales[NTC_MLP_LAYERS]{};
-    Span biases[NTC_MLP_LAYERS]{};
-    Span combinedScaleBias;
-    size_t bufferSize = 0;
+    static constexpr int GetLayerOutputChannels(int layer)
+    {
+        switch(layer)
+        {
+            case 0:
+                return NTC_MLP_HIDDEN0_CHANNELS;
+            case 1:
+                return NTC_MLP_HIDDEN1_CHANNELS;
+#if NTC_MLP_LAYERS == 4
+            case 2:
+                return NTC_MLP_HIDDEN2_CHANNELS;
+            case 3:
+                return NTC_MLP_OUTPUT_CHANNELS;
+#elif NTC_MLP_LAYERS == 3
+            case 2:
+                return NTC_MLP_OUTPUT_CHANNELS;
+#endif
+            default:
+                return 0;
+        }
+    }
 };
 
 }

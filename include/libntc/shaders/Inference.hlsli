@@ -181,13 +181,12 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayerINT8, int, IN, int, OUT, bool, OUTPUT_LA
     int weightOffset,
     int biasOffset,
     int scaleOffset,
-    int totalChannels,
     bool activation,
     uint inputArray[IN / 4],
     out uint outputArray[OUTPUT_LAYER ? OUT / 2 : OUT / 4]
 )
 {
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
+    // See the comment block in the beginning of WeightLayout.cpp for the weight layouts
 
     // Note: not unrolling the outer loop.
     // If we do, DXC/SPIR-V crashes.
@@ -353,42 +352,52 @@ bool NtcSampleTextureSet(
         return false;
 
     // Evaluate the MLP layers:
-    const int totalChannels = NTC_MLP_HIDDEN_CHANNELS * 3 + NTC_MLP_OUTPUT_CHANNELS;
-
     // Input layer
-    uint hiddenOutput1[NTC_MLP_HIDDEN_CHANNELS / 4];
-    NtcEvaluateLayerINT8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+    uint hiddenOutput0[NTC_MLP_HIDDEN0_CHANNELS / 4];
+    NtcEvaluateLayerINT8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN0_CHANNELS, false>(
         weightsBuffer,
         weightsOffset + desc.networkWeightOffsets.x,
         weightsOffset + desc.networkBiasOffsets.x,
         weightsOffset + desc.networkScaleOffsets.x,
-        totalChannels, true, networkInputs, hiddenOutput1);
+        true, networkInputs, hiddenOutput0);
 
     // Hidden layer 1
-    uint hiddenOutput2[NTC_MLP_HIDDEN_CHANNELS / 4];
-    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+    uint hiddenOutput1[NTC_MLP_HIDDEN1_CHANNELS / 4];
+    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN0_CHANNELS, NTC_MLP_HIDDEN1_CHANNELS, false>(
         weightsBuffer,
         weightsOffset + desc.networkWeightOffsets.y,
         weightsOffset + desc.networkBiasOffsets.y,
         weightsOffset + desc.networkScaleOffsets.y,
-        totalChannels, true, hiddenOutput1, hiddenOutput2);
+        true, hiddenOutput0, hiddenOutput1);
 
+#if NTC_MLP_LAYERS == 4
     // Hidden layer 2
-    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+    uint hiddenOutput2[NTC_MLP_HIDDEN2_CHANNELS / 4];
+    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_HIDDEN2_CHANNELS, false>(
         weightsBuffer,
         weightsOffset + desc.networkWeightOffsets.z,
         weightsOffset + desc.networkBiasOffsets.z,
         weightsOffset + desc.networkScaleOffsets.z,
-        totalChannels, true, hiddenOutput2, hiddenOutput1);
+        true, hiddenOutput1, hiddenOutput2);
 
     // Output layer
     uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS / 2];
-    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
+    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
         weightsBuffer,
         weightsOffset + desc.networkWeightOffsets.w,
         weightsOffset + desc.networkBiasOffsets.w,
         weightsOffset + desc.networkScaleOffsets.w,
-        totalChannels, false, hiddenOutput1, networkOutputs);
+        false, hiddenOutput2, networkOutputs);
+#else
+    // Output layer
+    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS / 2];
+    NtcEvaluateLayerINT8<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.z,
+        weightsOffset + desc.networkBiasOffsets.z,
+        weightsOffset + desc.networkScaleOffsets.z,
+        false, hiddenOutput1, networkOutputs);
+#endif
 
     [unroll]
     for (int ch = 0; ch < NTC_MLP_OUTPUT_CHANNELS / 2; ++ch)

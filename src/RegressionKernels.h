@@ -13,11 +13,11 @@
 #pragma once
 
 #include "RegressionCommon.h"
-#include "tin/tin_mlp.h"
-#include "tin/tin_reducer.h"
 #include "FeatureGridDevice.h"
+#include "CudaMLP.h"
 #include "CudaUtils.h"
 #include <libntc/ntc.h>
+#include "tin/tin_reducer.h"
 
 namespace ntc::cuda
 {
@@ -146,14 +146,13 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
     
     FeatureGrid highResFeatureGrid(params.numFeatures, mipInfo.highResLatentWidth, mipInfo.highResLatentHeight, params.latentStride);
     FeatureGrid lowResFeatureGrid(params.numFeatures, mipInfo.lowResLatentWidth, mipInfo.lowResLatentHeight, params.latentStride);
-    using Network = tin::HMLP<NTC_MLP_LAYERS-2, NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS,
-        Activation, tin::ActNone, REDUCE_MODE, WARPS_PER_TBLOCK * tin::WarpSize, NW_GRAD_TYPE>;
+    using Network = MLP<Activation, REDUCE_MODE, WARPS_PER_TBLOCK * tin::WarpSize, NW_GRAD_TYPE>;
 
     // Run network
     // 
     // shared memory for weight reduction
     __align__(16)
-    __shared__ half weightReductionShared[Network::smem_size()];
+    __shared__ half weightReductionShared[Network::GetSharedMemorySize()];
 
     // shared memory for loss reduction
     __shared__ float lossReductionShared[tin::Reducer<float, WARPS_PER_TBLOCK>::sharedmem_size()];
@@ -162,10 +161,10 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
     const int pixelsPerBatch = grid.dim_blocks().x * TILE_SIZE_X * TILE_SIZE_Y;
     const float lossNormalization = 1.f / float(pixelsPerBatch);
 
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
+    // See the comment block in the beginning of WeightLayout.cpp for the weight layouts
     const tin::Quantization quantization = params.useFP8Quantization ? tin::Quantization::FP8 : tin::Quantization::Int8;
-    Network mlp(params.networkWeights, params.networkWeights + Network::num_weights(), quantization, tin::Quantization::Int8, weightReductionShared,
-        networkGradientsTyped, networkGradientsTyped + Network::num_weights());
+    Network mlp(params.networkWeights, params.networkWeights + MlpDesc::GetTotalWeightCount(), quantization, tin::Quantization::Int8, weightReductionShared,
+        networkGradientsTyped, networkGradientsTyped + MlpDesc::GetTotalWeightCount());
     
     for (int iteration = 0; iteration < Y_ITERS; iteration++)
     {
@@ -264,9 +263,10 @@ __device__ void RegressionKernel(RegressionKernelParams const params)
         tin::HVector<NTC_MLP_OUTPUT_CHANNELS> lossGradientsVector(lossGradientsArray);
 
         // Backward pass with loss gradients
-        uint32_t grad_offset = NW_GRAD_ATOMICS ? 0 : (Y_ITERS * threadBlock.group_index().x + iteration) * Network::num_params();
+        uint32_t gradientOffset = NW_GRAD_ATOMICS ? 0 : (Y_ITERS * threadBlock.group_index().x + iteration) 
+            * (MlpDesc::GetTotalWeightCount() + MlpDesc::GetTotalOutputCount());
 
-        auto backwardOutputsVector = mlp.backward(lossGradientsVector, grad_offset, grad_offset);
+        auto backwardOutputsVector = mlp.backward(lossGradientsVector, gradientOffset);
         tin::HArray<NTC_MLP_INPUT_CHANNELS> backwardOutputsArray(backwardOutputsVector);
 
         // Store latent gradients from backward pass 

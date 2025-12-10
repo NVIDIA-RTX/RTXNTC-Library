@@ -12,13 +12,14 @@ cmake_minimum_required(VERSION 3.18)
 include(FetchContent)
 include(tools/ConfigureCompilers.cmake)
 
-set(LANGUAGES CXX)
+set(LANGUAGES C CXX)
 
 option(NTC_BUILD_SHARED "Build LibNTC as a shared library (DLL or .so)" ON)
 option(NTC_WITH_CUDA "Compile NTC with CUDA support" ON)
 option(NTC_WITH_DX12 "Compile NTC with DX12 support" "${WIN32}")
 option(NTC_WITH_VULKAN "Compile NTC with Vulkan support" ON)
 option(NTC_WITH_PREBUILT_SHADERS "Compile NTC with pre-built shaders for decompression etc." ON)
+option(NTC_DEBUG_SHADERS "Compile NTC shaders with debug information" OFF)
 
 if (NTC_WITH_CUDA)
     list(APPEND LANGUAGES CUDA)
@@ -33,7 +34,7 @@ project(
 # Version info
 
 set(NTC_VERSION_MAJOR 0)
-set(NTC_VERSION_MINOR 8)
+set(NTC_VERSION_MINOR 9)
 set(NTC_VERSION_POINT 0)
 
 # Read Git branch name into NTC_VERSION_BRANCH
@@ -71,7 +72,7 @@ if (NOT TARGET Vulkan-Headers AND NOT TARGET Vulkan::Headers AND NTC_WITH_VULKAN
     FetchContent_Declare(
         Vulkan-Headers
         GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-        GIT_TAG v1.4.307
+        GIT_TAG v1.4.328
     )
     FetchContent_MakeAvailable(Vulkan-Headers)
 endif()
@@ -94,7 +95,7 @@ if (NOT TARGET ShaderMake AND NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NT
     FetchContent_Declare(
         ShaderMake
         GIT_REPOSITORY https://github.com/NVIDIAGameWorks/ShaderMake.git
-        GIT_TAG de47d8677843ee2fd1a231b94970e71818252a62
+        GIT_TAG 18f5a344e7ca8fa65daaf079d07bc8ce38453e05
     )
     FetchContent_MakeAvailable(ShaderMake)
 endif()
@@ -103,5 +104,21 @@ if (MSVC AND NOT LIBNTC_IS_SUBMODULE)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3 /MP")
 endif()
 
+# Configure libdeflate build because it doesn't support CMake natively
+add_library(libdeflate STATIC)
+file(GLOB LIBDEFLATE_SOURCES
+    external/libdeflate/libdeflate.h
+    external/libdeflate/lib/*.c
+    external/libdeflate/lib/*.h
+    external/libdeflate/lib/*/cpu_features.c
+)
+target_sources(libdeflate PRIVATE ${LIBDEFLATE_SOURCES})
+target_include_directories(libdeflate PUBLIC external/libdeflate)
+
+# Add RapidJSON
 add_subdirectory(external/rapidjson)
+
+# Add the LibNTC source directory
 add_subdirectory(src)
+
+target_link_libraries(libntc PRIVATE libdeflate)

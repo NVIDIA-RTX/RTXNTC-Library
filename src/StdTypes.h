@@ -15,6 +15,7 @@
 #include <libntc/ntc.h>
 #include <string>
 #include <vector>
+#include <queue>
 #include <memory>
 
 namespace ntc
@@ -89,6 +90,16 @@ public:
 };
 
 template<typename T>
+class Queue : public std::queue<T, std::deque<T, Allocator<T>>>
+{
+    using Base = std::queue<T, std::deque<T, Allocator<T>>>;
+public:
+    Queue(IAllocator* allocator)
+        : Base(Allocator<T>(allocator))
+    { }
+};
+
+template<typename T>
 class Deleter
 {
 public:
@@ -111,5 +122,30 @@ public:
         : std::unique_ptr<T, Deleter<T>>(val, Deleter<T>(allocator))
     { }
 };
+
+// Constructs a new object of type T using the allocator.
+// Returns a UniquePtr that will delete the object using the same allocator.
+template<typename T, class... TArgs>
+UniquePtr<T> MakeUnique(IAllocator* allocator, TArgs&&... args)
+{
+    T* object = new(allocator->Allocate(sizeof(T))) T(args...);
+    return UniquePtr<T>(object, allocator);
+}
+
+// Constructs a new object of type T using the allocator, passes the allocator as the first argument to the object ctor.
+// Returns a UniquePtr that will delete the object using the same allocator.
+template<typename T, class... TArgs>
+UniquePtr<T> MakeUniqueWithAllocator(IAllocator* allocator, TArgs&&... args)
+{
+    T* object = new(allocator->Allocate(sizeof(T))) T(allocator, args...);
+    return UniquePtr<T>(object, allocator);
+}
+
+template<typename T, class... TArgs>
+std::shared_ptr<T> MakeShared(IAllocator* allocator, TArgs&&... args)
+{
+    T* object = new(allocator->Allocate(sizeof(T))) T(args...);
+    return std::shared_ptr<T>(object, Deleter<T>(allocator));
+}
 
 }

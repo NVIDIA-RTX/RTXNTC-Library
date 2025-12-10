@@ -32,42 +32,6 @@ namespace ntc
 
 static const uint32_t g_NvidiaVendorID = 0x10DE;
 
-static DataType GetDataTypeForWeights(InferenceWeightType weightType)
-{
-    switch (weightType)
-    {
-    case InferenceWeightType::GenericInt8:
-        return DataType::Int8;
-    case InferenceWeightType::GenericFP8:
-    case InferenceWeightType::CoopVecFP8:
-        return DataType::FP8;
-    default:
-        return DataType::None;
-    }
-}
-
-static size_t GetDataTypeSize(DataType type)
-{
-    switch (type)
-    {
-    case DataType::None:
-        return 0;
-    case DataType::Int8:
-        return sizeof(uint8_t);
-    case DataType::Int32:
-        return sizeof(int32_t);
-    case DataType::FP8:
-        return sizeof(uint8_t);
-    case DataType::FP16:
-        return sizeof(uint16_t);
-    case DataType::FP32:
-        return sizeof(float);
-    default:
-        assert(!"Unsupported data type");
-        return 0;
-    }
-}
-
 #if NTC_WITH_VULKAN
 static VkConvertCooperativeVectorMatrixInfoNV GetVkConvertLayerDesc(DataType type, int inputChannels, int outputChannels,
     size_t* pDstSize, uint64_t srcData = 0, uint64_t dstData = 0)
@@ -180,171 +144,67 @@ bool CoopVecWeightConverter::IsConversionSupported(GraphicsResources const* reso
     }
 }
 
-bool CoopVecWeightConverter::GetWeightLayout(GraphicsResources const* resources, MlpDesc const& mlpDesc,
-    InferenceWeightType weightType, WeightLayout& outLayout)
+bool CoopVecWeightConverter::GetConvertedWeightMatrixSize(GraphicsResources const* resources,
+    int inputChannels, int outputChannels,
+    DataType weightType, size_t& outSize)
 {
-    outLayout.weights[0].type = outLayout.weights[1].type = outLayout.weights[2].type = GetDataTypeForWeights(weightType);
-    outLayout.weights[3].type = (outLayout.weights[0].type == DataType::FP8) ? DataType::Int8 : outLayout.weights[0].type;
+    if (!resources)
+        return false;
 
-    if (!IsCoopVecWeightType(weightType))
+    if (resources->GetGraphicsApi() == GraphicsAPI::Vulkan)
     {
-        for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
-        {
-            outLayout.weights[layer].size =
-                mlpDesc.GetLayerInputChannels(layer) *
-                mlpDesc.GetLayerOutputChannels(layer) *
-                GetDataTypeSize(outLayout.weights[layer].type);
-        }
-    }
-    else
-    {
-        // Handle all coopvec layouts below
-
-        if (!IsConversionSupported(resources, weightType))
-            return false;
-
-        if (resources->GetGraphicsApi() == GraphicsAPI::Vulkan)
-        {
 #if NTC_WITH_VULKAN
-            VkDevice const vkDevice = resources->GetVulkanDevice();
+        VkDevice const vkDevice = resources->GetVulkanDevice();
 
-            assert(vkDevice);
-            assert(resources->pfn_vkConvertCooperativeVectorMatrixNV);
+        assert(vkDevice);
+        assert(resources->pfn_vkConvertCooperativeVectorMatrixNV);
 
-            // Compute converted weight sizes for all layers
-            for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
-            {
-                VkConvertCooperativeVectorMatrixInfoNV convertInfo = GetVkConvertLayerDesc(
-                    outLayout.weights[layer].type, mlpDesc.GetLayerInputChannels(layer),
-                    mlpDesc.GetLayerOutputChannels(layer), &outLayout.weights[layer].size);
+        VkConvertCooperativeVectorMatrixInfoNV convertInfo = GetVkConvertLayerDesc(
+            weightType, inputChannels, outputChannels, &outSize);
 
-                VkResult res = resources->pfn_vkConvertCooperativeVectorMatrixNV(vkDevice, &convertInfo);
+        VkResult res = resources->pfn_vkConvertCooperativeVectorMatrixNV(vkDevice, &convertInfo);
 
-                if (res != VK_SUCCESS)
-                    return false;
-            }
+        return (res == VK_SUCCESS);
 
 #else // !NTC_WITH_VULKAN
-            return false;
+        return false;
 #endif
-        }
-        if (resources->GetGraphicsApi() == GraphicsAPI::D3D12)
-        {
+    }
+    if (resources->GetGraphicsApi() == GraphicsAPI::D3D12)
+    {
 #if NTC_WITH_DX12
-            ID3D12Device* d3dDevice = resources->GetD3D12Device();
+        ID3D12Device* d3dDevice = resources->GetD3D12Device();
 
-            Microsoft::WRL::ComPtr<ID3D12DevicePreview> devicePreview;
-            if (d3dDevice->QueryInterface(IID_PPV_ARGS(&devicePreview)) != S_OK)
-                return false;
+        Microsoft::WRL::ComPtr<ID3D12DevicePreview> devicePreview;
+        if (d3dDevice->QueryInterface(IID_PPV_ARGS(&devicePreview)) != S_OK)
+            return false;
 
-            // Compute converted weight sizes for all layers
-            for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
-            {
-                // Compute converted size for input layer
-                D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_DEST_INFO convertInfo = GetDX12ConvertLayerDestInfo(
-                    outLayout.weights[layer].type, mlpDesc.GetLayerInputChannels(layer),
-                    mlpDesc.GetLayerOutputChannels(layer));
+        // Compute converted size for input layer
+        D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_DEST_INFO convertInfo = GetDX12ConvertLayerDestInfo(
+            weightType, inputChannels, outputChannels);
 
-                devicePreview->GetLinearAlgebraMatrixConversionDestinationInfo(&convertInfo);
+        devicePreview->GetLinearAlgebraMatrixConversionDestinationInfo(&convertInfo);
 
-                // The GetLinearAlgebraMatrixConversionDestinationInfo function doesn't have a way to signal failure,
-                // so check the returned size for sanity instead.
-                // Note: if the function fails, it might mean that the D3D12CooperativeVectorExperiment experimental
-                // feature is not enabled on the device.
-                if (convertInfo.DestSize == 0)
-                    return false;
+        // The GetLinearAlgebraMatrixConversionDestinationInfo function doesn't have a way to signal failure,
+        // so check the returned size for sanity instead.
+        // Note: if the function fails, it might mean that the D3D12CooperativeVectorExperiment experimental
+        // feature is not enabled on the device.
+        if (convertInfo.DestSize == 0)
+            return false;
 
-                outLayout.weights[layer].size = convertInfo.DestSize;
-            }
+        outSize = convertInfo.DestSize;
+
+        return true;
 
 #else // !NTC_WITH_DX12
-            return false;
+        return false;
 #endif
-        }
     }
 
-    // Calculate the offsets for all layers' weights and total weight size
-    for (int layer = 1; layer < NTC_MLP_LAYERS; ++layer)
-    {
-        outLayout.weights[layer].offset = outLayout.weights[layer - 1].offset + outLayout.weights[layer - 1].size;
-    }
-    outLayout.combinedWeights.offset = 0;
-    outLayout.combinedWeights.size = outLayout.weights[NTC_MLP_LAYERS - 1].offset + outLayout.weights[NTC_MLP_LAYERS - 1].size;
-
-    // Calculate the sizes for the scale and bias vectors
-    size_t totalScaleSize = 0;
-    size_t totalBiasSize = 0;
-    for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
-    {
-        DataType scaleType = DataType::None;
-        DataType biasType = DataType::None;
-
-        switch (weightType)
-        {
-        case InferenceWeightType::GenericInt8:
-            scaleType = DataType::FP32;
-            biasType = DataType::Int32;
-            break;
-
-        case InferenceWeightType::GenericFP8:
-        case InferenceWeightType::CoopVecFP8:
-            if (layer == NTC_MLP_LAYERS - 1)
-            {
-                scaleType = DataType::FP32;
-                biasType = DataType::Int32;
-            }
-            else
-            {
-                // FP8 mode uses FP16 bias vectors, no scale
-                biasType = DataType::FP16;
-            }
-            break;
-        }
-
-        outLayout.scales[layer].type = scaleType;
-        outLayout.biases[layer].type = biasType;
-        outLayout.scales[layer].size = GetDataTypeSize(scaleType) * mlpDesc.GetLayerOutputChannels(layer);
-        outLayout.biases[layer].size = GetDataTypeSize(biasType) * mlpDesc.GetLayerOutputChannels(layer);
-        totalScaleSize += outLayout.scales[layer].size;
-        totalBiasSize += outLayout.biases[layer].size;
-    }
-
-    // Allocate the scale and bias vector block
-    outLayout.combinedScaleBias.offset = outLayout.combinedWeights.offset + outLayout.combinedWeights.size;
-    outLayout.combinedScaleBias.size = totalScaleSize + totalBiasSize;
-
-    // Calculate the offsets for the scale and bias vectors following the rules for each format.
-    // See the comment in the beginning of TextureSet.cpp
-    switch (weightType)
-    {
-    case InferenceWeightType::GenericInt8:
-        // All scale vectors one after another, then all bias vectors
-        outLayout.scales[0].offset = outLayout.combinedScaleBias.offset;
-        outLayout.biases[0].offset = outLayout.combinedScaleBias.offset + totalScaleSize;
-        for (int layer = 1; layer < NTC_MLP_LAYERS; ++layer)
-        {
-            outLayout.scales[layer].offset = outLayout.scales[layer - 1].offset + outLayout.scales[layer - 1].size;
-            outLayout.biases[layer].offset = outLayout.biases[layer - 1].offset + outLayout.biases[layer - 1].size;
-        }
-        break;
-
-    case InferenceWeightType::GenericFP8:
-    case InferenceWeightType::CoopVecFP8:
-        // Bias vectors for layers 0-2, then scale for layer 3, bias for layer 3
-        outLayout.biases[0].offset = outLayout.combinedScaleBias.offset;
-        outLayout.biases[1].offset = outLayout.biases[0].offset + outLayout.biases[0].size;
-        outLayout.biases[2].offset = outLayout.biases[1].offset + outLayout.biases[1].size;
-        outLayout.scales[3].offset = outLayout.biases[2].offset + outLayout.biases[2].size;
-        outLayout.biases[3].offset = outLayout.scales[3].offset + outLayout.scales[3].size;
-        break;
-    }
-
-    outLayout.bufferSize = outLayout.combinedWeights.size + outLayout.combinedScaleBias.size;
-
-    return true;
+    return false;
 }
 
-void CoopVecWeightConverter::ConvertWeights(GraphicsResources const* resources, MlpDesc const& mlpDesc,
+void CoopVecWeightConverter::ConvertWeights(GraphicsResources const* resources,
     WeightLayout const& srcLayout, void* srcBuffer, uint64_t srcOffset,
     WeightLayout const& dstLayout, void* dstBuffer, uint64_t dstOffset,
     void* commandListOrBuffer)
@@ -378,8 +238,8 @@ void CoopVecWeightConverter::ConvertWeights(GraphicsResources const* resources, 
 
         for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
         {
-            int const inputChannels = mlpDesc.GetLayerInputChannels(layer);
-            int const outputChannels = mlpDesc.GetLayerOutputChannels(layer);
+            int const inputChannels = MlpDesc::GetLayerInputChannels(layer);
+            int const outputChannels = MlpDesc::GetLayerOutputChannels(layer);
 
             size_t dstLayerSize = dstLayout.weights[layer].size;
             convertInfos[layer] = GetVkConvertLayerDesc(dstLayout.weights[layer].type,
@@ -419,8 +279,8 @@ void CoopVecWeightConverter::ConvertWeights(GraphicsResources const* resources, 
 
         for (int layer = 0; layer < NTC_MLP_LAYERS; ++layer)
         {
-            int const inputChannels = mlpDesc.GetLayerInputChannels(layer);
-            int const outputChannels = mlpDesc.GetLayerOutputChannels(layer);
+            int const inputChannels = MlpDesc::GetLayerInputChannels(layer);
+            int const outputChannels = MlpDesc::GetLayerOutputChannels(layer);
 
             convertInfos[layer] = GetDX12ConvertLayerDesc(
                 dstLayout.weights[layer].type, inputChannels, outputChannels,
@@ -432,7 +292,7 @@ void CoopVecWeightConverter::ConvertWeights(GraphicsResources const* resources, 
         // Copy the scale and bias data.
         // D3D's CopyBufferRegion requires resource states incompatible with the conversion ops.
         // Use a degenerate form of a matrix conversion to copy the extra data and avoid placing a barrier.
-        convertInfos[4] = GetDX12CopyScaleBiasDesc(dstLayout.combinedScaleBias.size,
+        convertInfos[NTC_MLP_LAYERS] = GetDX12CopyScaleBiasDesc(dstLayout.combinedScaleBias.size,
             srcBufferVA + srcOffset + srcLayout.combinedScaleBias.offset,
             dstBufferVA + dstOffset + dstLayout.combinedScaleBias.offset);
         

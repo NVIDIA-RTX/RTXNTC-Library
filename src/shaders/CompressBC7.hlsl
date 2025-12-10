@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -12,6 +12,8 @@
 
 #define OUTPUT_FORMAT uint4
 #include "BlockCompressCommon.hlsli"
+
+#define BC7_SINGLE_MODE (USE_MODE_BUFFER)
 
 static const uint NO_PARTITIONS = 0xffff;
 static const int ENDPOINT_ITERATIONS = 2;
@@ -119,18 +121,6 @@ static const uint c_Partitions3_Anchor2[64] = {
     15,15,15,15, 3,15,15, 8
 };
 
-
-uint2 GetAllowedPartitions(int mode)
-{
-    uint4 quad = g_Const.allowedModes[mode / 2];
-    return (mode & 1) ? quad.zw : quad.xy;
-}
-
-bool IsModeAllowed(int mode)
-{
-    uint2 partitions = GetAllowedPartitions(mode);
-    return (partitions.x | partitions.y) != 0;
-}
 
 bool GetBit64(uint2 words, int index)
 {
@@ -386,6 +376,9 @@ template<int C>
 float BC7_ComputeError(const vector<float,C> pixels[PIXELS_PER_BLOCK], const int indices[PIXELS_PER_BLOCK],
     uint partitionMask, vector<int,C> ep0, vector<int,C> ep1, int indexBits, int endpointBits)
 {
+#if BC7_SINGLE_MODE
+    return 0;
+#else
     ep0 = BC7_ExpandEndpointTo8Bits<C>(ep0, endpointBits);
     ep1 = BC7_ExpandEndpointTo8Bits<C>(ep1, endpointBits);
 
@@ -408,6 +401,7 @@ float BC7_ComputeError(const vector<float,C> pixels[PIXELS_PER_BLOCK], const int
     }
 
     return error;
+#endif
 }
 
 int3 BC7_RGB_QuantizeEndpoint(float3 ep, int bits, bool sharedLsb)
@@ -731,22 +725,23 @@ void BC7_Mode2_Finalize(const float3 pixels[PIXELS_PER_BLOCK], int bestPartId, S
     currentBlock = block;
 }
 
-void BC7_Mode0_2_Compress(const float3 pixels[PIXELS_PER_BLOCK], inout float currentError, inout uint4 currentBlock)
+void BC7_Mode0_2_Compress(const float3 pixels[PIXELS_PER_BLOCK], uint mode, uint partition, inout float currentError, inout uint4 currentBlock)
 {
     const int NUM_ENDPOINTS = 6;
     const int SEARCH_INDEX_BITS = 3; // Mode 0 has 3, Mode 1 has 2
 
+    StoredEndpoint3 bestEndpoints[NUM_ENDPOINTS];
+    
+#if BC7_SINGLE_MODE
+    int partId = int(partition);
+    int bestPartId = partId;
+#else
     int bestPartId = 0;
     float bestError = FLT_MAX;
-    StoredEndpoint3 bestEndpoints[NUM_ENDPOINTS];
-    uint2 allowedPartitions = GetAllowedPartitions(0) | GetAllowedPartitions(2);
-
     [loop]
     for (int partId = 0; partId < 64; ++partId)
+#endif
     {
-        if (!GetBit64(allowedPartitions, partId))
-            continue;
-
         float3 ep[NUM_ENDPOINTS];
         BC7_MinMax(pixels, c_Partitions3_Subset0[partId], ep[0], ep[1]);
         BC7_MinMax(pixels, c_Partitions3_Subset1[partId], ep[2], ep[3]);
@@ -756,6 +751,11 @@ void BC7_Mode0_2_Compress(const float3 pixels[PIXELS_PER_BLOCK], inout float cur
         BC7_SwapEndpointComponents_RGB(pixels, c_Partitions3_Subset1[partId], ep[2], ep[3]);
         BC7_SwapEndpointComponents_RGB(pixels, c_Partitions3_Subset2[partId], ep[4], ep[5]);
 
+#if BC7_SINGLE_MODE
+        [unroll]
+        for (int i = 0; i < NUM_ENDPOINTS; ++i)
+            bestEndpoints[i] = StoredEndpoint3(ep[i]);
+#else
         float error;
         error  = BC7_EstimateError(pixels, c_Partitions3_Subset0[partId], ep[0], ep[1], SEARCH_INDEX_BITS);
         error += BC7_EstimateError(pixels, c_Partitions3_Subset1[partId], ep[2], ep[3], SEARCH_INDEX_BITS);
@@ -769,12 +769,19 @@ void BC7_Mode0_2_Compress(const float3 pixels[PIXELS_PER_BLOCK], inout float cur
             for (int i = 0; i < NUM_ENDPOINTS; ++i)
                 bestEndpoints[i] = StoredEndpoint3(ep[i]);
         }
+#endif
     }
 
-    if (bestPartId < 16 && IsModeAllowed(0))
+#if BC7_SINGLE_MODE
+    if (mode == 0)
         BC7_Mode0_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
-    if (IsModeAllowed(2))
+    else
         BC7_Mode2_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
+#else
+    if (bestPartId < 16)
+        BC7_Mode0_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
+    BC7_Mode2_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
+#endif
 }
 
 void BC7_Mode1_Finalize(const float3 pixels[PIXELS_PER_BLOCK], int bestPartId, StoredEndpoint3 bestEndpoints[4], inout float currentError, inout uint4 currentBlock)
@@ -920,22 +927,22 @@ void BC7_Mode3_Finalize(const float3 pixels[PIXELS_PER_BLOCK], int bestPartId, S
     currentBlock = block;
 }
 
-void BC7_Mode1_3_Compress(const float3 pixels[PIXELS_PER_BLOCK], inout float currentError, inout uint4 currentBlock)
+void BC7_Mode1_3_Compress(const float3 pixels[PIXELS_PER_BLOCK], uint mode, uint partition, inout float currentError, inout uint4 currentBlock)
 {
     const int NUM_ENDPOINTS = 4;
     const int SEARCH_INDEX_BITS = 3; // Mode 1 has 3, Mode 3 has 2
 
+    StoredEndpoint3 bestEndpoints[NUM_ENDPOINTS];
+#if BC7_SINGLE_MODE
+    int partId = int(partition);
+    int bestPartId = partId;
+#else
     int bestPartId = 0;
     float bestError = FLT_MAX;
-    StoredEndpoint3 bestEndpoints[NUM_ENDPOINTS];
-    uint2 allowedPartitions = GetAllowedPartitions(1) | GetAllowedPartitions(3);
-
     [loop]
     for (int partId = 0; partId < 64; ++partId)
+#endif
     {
-        if (!GetBit64(allowedPartitions, partId))
-            continue;
-
         float3 ep[NUM_ENDPOINTS];
         BC7_MinMax(pixels, c_Partitions2_Subset0[partId], ep[0], ep[1]);
         BC7_MinMax(pixels, c_Partitions2_Subset1[partId], ep[2], ep[3]);
@@ -943,6 +950,11 @@ void BC7_Mode1_3_Compress(const float3 pixels[PIXELS_PER_BLOCK], inout float cur
         BC7_SwapEndpointComponents_RGB(pixels, c_Partitions2_Subset0[partId], ep[0], ep[1]);
         BC7_SwapEndpointComponents_RGB(pixels, c_Partitions2_Subset1[partId], ep[2], ep[3]);
 
+#if BC7_SINGLE_MODE
+        [unroll]
+        for (int i = 0; i < NUM_ENDPOINTS; ++i)
+            bestEndpoints[i] = StoredEndpoint3(ep[i]);
+#else
         float error;
         error  = BC7_EstimateError(pixels, c_Partitions2_Subset0[partId], ep[0], ep[1], SEARCH_INDEX_BITS);
         error += BC7_EstimateError(pixels, c_Partitions2_Subset1[partId], ep[2], ep[3], SEARCH_INDEX_BITS);
@@ -955,12 +967,18 @@ void BC7_Mode1_3_Compress(const float3 pixels[PIXELS_PER_BLOCK], inout float cur
             for (int i = 0; i < NUM_ENDPOINTS; ++i)
                 bestEndpoints[i] = StoredEndpoint3(ep[i]);
         }
+#endif
     }
 
-    if (IsModeAllowed(1))
+#if BC7_SINGLE_MODE
+    if (mode == 1)
         BC7_Mode1_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
-    if (IsModeAllowed(3))
+    else
         BC7_Mode3_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
+#else
+    BC7_Mode1_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
+    BC7_Mode3_Finalize(pixels, bestPartId, bestEndpoints, currentError, currentBlock);
+#endif
 }
 
 template<bool HR_COLOR>
@@ -1134,15 +1152,11 @@ void BC7_Mode45_Compress(inout float4 pixels[PIXELS_PER_BLOCK], inout float curr
     [loop]
     for (uint rotation = 0; rotation < 4; ++rotation)
     {
-        if (GetBit64(GetAllowedPartitions(4), 0 + rotation))
-            BC7_Mode4_Compress_Internal<false>(pixels, rotation, currentError, currentBlock);
+        BC7_Mode4_Compress_Internal<false>(pixels, rotation, currentError, currentBlock);
 
-        // Note: partition offset 4 means idxMode = 1.
-        if (GetBit64(GetAllowedPartitions(4), 4 + rotation))
-            BC7_Mode4_Compress_Internal<true>(pixels, rotation, currentError, currentBlock);
+        BC7_Mode4_Compress_Internal<true>(pixels, rotation, currentError, currentBlock);
 
-        if (GetBit64(GetAllowedPartitions(5), 0 + rotation))
-            BC7_Mode5_Compress_Internal(pixels, rotation, currentError, currentBlock);
+        BC7_Mode5_Compress_Internal(pixels, rotation, currentError, currentBlock);
         
         // Rotate the channels for the next rotation scheme, or back to the original.
         // 00 – Block format is Vector(RGB) Scalar(A) - no swapping
@@ -1185,6 +1199,49 @@ void BC7_Mode45_Compress(inout float4 pixels[PIXELS_PER_BLOCK], inout float curr
                 break;
         }
     }
+}
+
+void BC7_Mode45_Compress_SingleMode(float4 pixels[PIXELS_PER_BLOCK], uint mode, uint partition, inout float currentError, inout uint4 currentBlock)
+{
+    bool hr_color = (partition & 4) != 0;
+    uint rotation = partition & 3;
+
+    // Rotate the channels
+    // 00 – Vector(RGB) Scalar(A) - no swapping
+    // 01 – Vector(AGB) Scalar(R)
+    // 10 – Vector(RAB) Scalar(G)
+    // 11 - Vector(RGA) Scalar(B)
+    switch(rotation)
+    {
+        case 1:
+            [unroll]
+            for (int idx = 0; idx < PIXELS_PER_BLOCK; ++idx)
+            {
+                pixels[idx] = pixels[idx].agbr;
+            }
+            break;
+        case 2:
+            [unroll]
+            for (int idx = 0; idx < PIXELS_PER_BLOCK; ++idx)
+            {
+                pixels[idx] = pixels[idx].rabg;
+            }
+            break;
+        case 3:
+            [unroll]
+            for (int idx = 0; idx < PIXELS_PER_BLOCK; ++idx)
+            {
+                pixels[idx] = pixels[idx].rgab;
+            }
+            break;
+    }
+
+    if (mode == 4 && !hr_color)
+        BC7_Mode4_Compress_Internal<false>(pixels, rotation, currentError, currentBlock);
+    else if (mode == 4 && hr_color)
+        BC7_Mode4_Compress_Internal<true>(pixels, rotation, currentError, currentBlock);
+    else // mode == 5
+        BC7_Mode5_Compress_Internal(pixels, rotation, currentError, currentBlock);
 }
 
 void BC7_Mode6_Compress(const float4 pixels[PIXELS_PER_BLOCK], inout float currentError, inout uint4 currentBlock)
@@ -1236,12 +1293,17 @@ void BC7_Mode6_Compress(const float4 pixels[PIXELS_PER_BLOCK], inout float curre
     currentBlock = block;
 }
 
-void BC7_Mode7_Compress(const float4 pixels[PIXELS_PER_BLOCK], inout float currentError, inout uint4 currentBlock)
+void BC7_Mode7_Compress(const float4 pixels[PIXELS_PER_BLOCK], uint partition, inout float currentError, inout uint4 currentBlock)
 {
     const int NUM_ENDPOINTS = 4;
     const int INDEX_BITS = 2;
     const int COLOR_BITS = 6;
 
+
+#if BC7_SINGLE_MODE
+    int partId = int(partition);
+    int bestPartId = partId;
+#else
     int bestPartId = 0;
     float bestError = FLT_MAX;
     StoredEndpoint4 bestEndpoints[NUM_ENDPOINTS];
@@ -1249,9 +1311,7 @@ void BC7_Mode7_Compress(const float4 pixels[PIXELS_PER_BLOCK], inout float curre
     [loop]
     for (int partId = 0; partId < 64; ++partId)
     {
-        if (!GetBit64(GetAllowedPartitions(7), partId))
-            continue;
-
+#endif
         float4 ep[NUM_ENDPOINTS];
         BC7_MinMax(pixels, c_Partitions2_Subset0[partId], ep[0], ep[1]);
         BC7_MinMax(pixels, c_Partitions2_Subset1[partId], ep[2], ep[3]);
@@ -1262,6 +1322,7 @@ void BC7_Mode7_Compress(const float4 pixels[PIXELS_PER_BLOCK], inout float curre
             BC7_SwapEndpointComponents_RGBA(pixels, c_Partitions2_Subset1[partId], ep[2], ep[3]);
         }
 
+#if !BC7_SINGLE_MODE
         float error;
         error = BC7_EstimateError(pixels, c_Partitions2_Subset0[partId], ep[0], ep[1], INDEX_BITS);
         error += BC7_EstimateError(pixels, c_Partitions2_Subset1[partId], ep[2], ep[3], INDEX_BITS);
@@ -1280,6 +1341,7 @@ void BC7_Mode7_Compress(const float4 pixels[PIXELS_PER_BLOCK], inout float curre
     [unroll]
     for (int i = 0; i < NUM_ENDPOINTS; ++i)
         ep[i] = bestEndpoints[i];
+#endif
 
     BC7_OptimizeEndpoints(pixels, c_Partitions2_Subset0[bestPartId], ep[0], ep[1], INDEX_BITS);
     BC7_OptimizeEndpoints(pixels, c_Partitions2_Subset1[bestPartId], ep[2], ep[3], INDEX_BITS);
@@ -1343,43 +1405,187 @@ void BC7_Mode7_Compress(const float4 pixels[PIXELS_PER_BLOCK], inout float curre
     currentBlock = block;
 }
 
-[numthreads(BLOCK_COMPRESS_CS_ST_GROUP_WIDTH, BLOCK_COMPRESS_CS_ST_GROUP_HEIGHT, 1)]
-void main(uint2 globalIdx : SV_DispatchThreadID)
+#if BC7_SINGLE_MODE
+bool LoadModeAndPartition(uint2 blockPos, out uint mode, out uint partition)
 {
+    blockPos.x += g_Const.modeMapOffsetX;
+    blockPos.y += g_Const.modeMapOffsetY;
+
+    mode = 0;
+    partition = 0;
+
+    if (blockPos.x >= g_Const.modeMapWidthInBlocks || blockPos.y >= g_Const.modeMapHeightInBlocks)
+        return false;
+
+    const uint firstBitIndex = (blockPos.y * g_Const.modeMapWidthInBlocks + blockPos.x) * BLOCK_COMPRESS_BC7_MP_BITS;
+    const uint lowWordOffset = g_Const.modeBufferByteOffset + (firstBitIndex >> 3) & ~3;
+    const uint bitOffset = firstBitIndex & 31;
+
+    const uint lowWord = t_Modes.Load(lowWordOffset);
+    uint highWord = 0;
+    if (bitOffset + BLOCK_COMPRESS_BC7_MP_BITS > 32) 
+        highWord = t_Modes.Load(lowWordOffset + 4);
+
+    uint modeAndPartition = (lowWord >> bitOffset) | (highWord << (32 - bitOffset));
+    modeAndPartition &= (1 << BLOCK_COMPRESS_BC7_MP_BITS) - 1;
+    
+    // Zero value is reserved to indicate integration errors
+    if (modeAndPartition == 0)
+        return false;
+
+    if (modeAndPartition == BLOCK_COMPRESS_BC7_MODE0_PART0_VALUE)
+        modeAndPartition = 0;
+
+    mode = (modeAndPartition >> 6) & 7;
+    partition = modeAndPartition & 0x3F;
+
+    return true;
+}
+
+#define BC7_MODES 8
+groupshared uint s_ActiveThreadCount;
+groupshared uint s_ModeCounts[BC7_MODES];
+groupshared uint s_TasksPerMode[BC7_MODES][BLOCK_COMPRESS_BC7_CS_GROUP_WIDTH * BLOCK_COMPRESS_BC7_CS_GROUP_HEIGHT];
+
+void ReorderThreadsByMode(uint2 threadIdx, inout uint2 blockPos, inout uint mode, inout uint partition)
+{
+    // Pack the block position and partition into a single 32-bit uint.
+    // 12 bits should be enough for x and y because max size of a graphics texture is 16k, or 4k blocks.
+    // Partition index is 6 bits.
+    const uint positionMask = 0xFFF;
+    const uint partitionMask = 0x3F;
+    uint task = (partition << 24) | ((blockPos.y & positionMask) << 12) | (blockPos.x & positionMask);
+
+    uint taskIndex;
+    InterlockedAdd(s_ModeCounts[mode], 1, taskIndex);
+    s_TasksPerMode[mode][taskIndex] = task;
+
+    // Enumerate all active threads in the group.
+    // Note that some threads may be inactive because the entire group is not needed for this image tile,
+    // or some threads may have been killed due to invalid mode/partition data.
+    const uint activeThreadsInWave = WaveActiveCountBits(true);
+    uint firstLinearIndexInWave = 0;
+    if (WaveIsFirstLane())
+    {
+        InterlockedAdd(s_ActiveThreadCount, activeThreadsInWave, firstLinearIndexInWave);
+    }
+    firstLinearIndexInWave = WaveReadLaneFirst(firstLinearIndexInWave);
+    const uint activeThreadIdxInWave = WavePrefixCountBits(true);
+    uint linearThreadIdx = firstLinearIndexInWave + activeThreadIdxInWave;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint m = 0; m < BC7_MODES; ++m)
+    {
+        uint modeCount = s_ModeCounts[m];
+        if (linearThreadIdx < modeCount)
+        {
+            uint pos = s_TasksPerMode[m][linearThreadIdx];
+            blockPos.x = pos & positionMask;
+            blockPos.y = (pos >> 12) & positionMask;
+            partition = (pos >> 24) & partitionMask;
+            mode = m;
+            break;
+        }
+        linearThreadIdx -= modeCount;
+    }
+}
+#endif
+
+void LoadColorsForBlock(uint2 blockPos, out float4 colors4[PIXELS_PER_BLOCK], out float3 colors3[PIXELS_PER_BLOCK],
+    out bool opaqueBlock)
+{
+    opaqueBlock = true;
+    [unroll]
+    for (int idx = 0; idx < PIXELS_PER_BLOCK; ++idx)
+    {
+        const float4 color = t_Input[BCn_GetPixelPos(blockPos, idx) + uint2(g_Const.srcLeft, g_Const.srcTop)];
+        colors4[idx] = color.rgba;
+        colors3[idx] = color.rgb;
+        if (color.a < 1.0)
+            opaqueBlock = false;
+    }
+}
+
+[numthreads(BLOCK_COMPRESS_BC7_CS_GROUP_WIDTH, BLOCK_COMPRESS_BC7_CS_GROUP_HEIGHT, 1)]
+void main(uint2 threadIdx : SV_GroupThreadID, uint2 globalIdx : SV_DispatchThreadID)
+{
+#if BC7_SINGLE_MODE
+    // Clear mode counts while all threads are still active
+    if (threadIdx.y == 0)
+    {
+        if (threadIdx.x < BC7_MODES)
+        {
+            s_ModeCounts[threadIdx.x] = 0;
+        }
+        if (threadIdx.x == 0)
+        {
+            s_ActiveThreadCount = 0;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+#endif
+
     if (globalIdx.x >= g_Const.widthInBlocks || globalIdx.y >= g_Const.heightInBlocks)
         return;
 
     float3 colors3[PIXELS_PER_BLOCK];
     float4 colors4[PIXELS_PER_BLOCK];
     bool opaqueBlock = true;
-    for (int idx = 0; idx < PIXELS_PER_BLOCK; ++idx)
-    {
-        const float4 color = t_Input[BCn_GetPixelPos(globalIdx, idx) + uint2(g_Const.srcLeft, g_Const.srcTop)];
-        colors4[idx] = color;
-        colors3[idx] = color.rgb;
-        if (color.a < 1.0)
-            opaqueBlock = false;
-    }
 
+    uint2 blockPos = globalIdx;
     float error = FLT_MAX;
     uint4 block = 0;
+
+#if BC7_SINGLE_MODE
+    uint mode, partition;
+    if (!LoadModeAndPartition(blockPos, mode, partition))
+    {
+        // Integration error - write a default block containing 4 colored 2x2 squares (black, red, green, blue)
+        block.x = 0x00f80004;
+        block.y = 0x0001f000;
+        block.z = 0x3ff0001f;
+        block.w = 0x1f9e0000;
+        u_Output[blockPos] = block;
+        return;
+    }
+
+    ReorderThreadsByMode(threadIdx, blockPos, mode, partition);
+
+    LoadColorsForBlock(blockPos, colors4, colors3, opaqueBlock);
+    
+    switch(mode)
+    {
+        case 0:
+        case 2:
+            BC7_Mode0_2_Compress(colors3, mode, partition, error, block);
+            break;
+        case 1:
+        case 3:
+            BC7_Mode1_3_Compress(colors3, mode, partition, error, block);
+            break;
+        case 4:
+        case 5:
+            BC7_Mode45_Compress_SingleMode(colors4, mode, partition, error, block);
+            break;
+        case 6:
+            BC7_Mode6_Compress(colors4, error, block);
+            break;
+        case 7:
+            BC7_Mode7_Compress(colors4, partition, error, block);
+            break;
+    }
+#else
+    LoadColorsForBlock(blockPos, colors4, colors3, opaqueBlock);
     if (opaqueBlock)
     {
-        if (IsModeAllowed(0) || IsModeAllowed(2)) BC7_Mode0_2_Compress(colors3, error, block);
-        if (IsModeAllowed(1) || IsModeAllowed(3)) BC7_Mode1_3_Compress(colors3, error, block);
+        BC7_Mode0_2_Compress(colors3, 0, 0, error, block);
+        BC7_Mode1_3_Compress(colors3, 0, 0, error, block);
     }
-    if (IsModeAllowed(4) || IsModeAllowed(5)) BC7_Mode45_Compress(colors4, error, block);
-    if (IsModeAllowed(6)) BC7_Mode6_Compress(colors4, error, block);
-    if (IsModeAllowed(7)) BC7_Mode7_Compress(colors4, error, block);
-    
-    u_Output[globalIdx + uint2(g_Const.dstOffsetX, g_Const.dstOffsetY)] = block;
-    
-#if WRITE_ACCELERATION
-    uint mode = min(7, firstbitlow(block.x));
-    uint partition = block.x >> (mode + 1);
-    static const uint partitionMask[8] = { 15, 63, 63, 63, 7, 3, 0, 63 };
-    partition &= partitionMask[mode];
-
-    u_AccelerationOutput.InterlockedAdd((mode * 64 + partition) * 4, 1);
+    BC7_Mode45_Compress(colors4, error, block);
+    BC7_Mode6_Compress(colors4, error, block);
+    BC7_Mode7_Compress(colors4, 0, error, block);
 #endif
+
+    u_Output[blockPos] = block;
 }

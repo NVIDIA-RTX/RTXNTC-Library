@@ -13,6 +13,7 @@
 #pragma once
 
 #include "FeatureGridMath.h"
+#include "tin/tin_matrix.h"
 #include <cuda_fp16.hpp>
 
 namespace ntc::cuda

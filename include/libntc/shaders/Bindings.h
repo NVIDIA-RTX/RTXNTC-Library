@@ -25,8 +25,8 @@
 // Bindings for the block compression shader, see MakeBlockCompressionComputePass in ntc.h
 #define NTC_BINDING_BC_CONSTANT_BUFFER              0 // b0 or descriptorSet 0, binding 0
 #define NTC_BINDING_BC_INPUT_TEXTURE                1 // t1 or descriptorSet 0, binding 1
-#define NTC_BINDING_BC_OUTPUT_TEXTURE               2 // u2 or descriptorSet 0, binding 2
-#define NTC_BINDING_BC_ACCELERATION_BUFFER          3 // u3 or descriptorSet 0, binding 3
+#define NTC_BINDING_BC_MODE_BUFFER                  2 // t2 or descriptorSet 0, binding 2
+#define NTC_BINDING_BC_OUTPUT_TEXTURE               3 // u3 or descriptorSet 0, binding 3
 
 // Bindings for the image difference shader, see MakeImageDifferenceComputePass in ntc.h
 #define NTC_BINDING_IMAGE_DIFF_CONSTANT_BUFFER      0 // b0 or descriptorSet 0, binding 0

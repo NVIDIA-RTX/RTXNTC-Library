@@ -732,7 +732,7 @@ void EncodeP2Pattern(inout uint4 block, inout float blockMSLE, int pattern, floa
     }
 }
 
-[numthreads(BLOCK_COMPRESS_CS_ST_GROUP_WIDTH, BLOCK_COMPRESS_CS_ST_GROUP_HEIGHT, 1)]
+[numthreads(BLOCK_COMPRESS_CS_GROUP_WIDTH, BLOCK_COMPRESS_CS_GROUP_HEIGHT, 1)]
 void main(uint2 globalIdx : SV_DispatchThreadID)
 {
     if (globalIdx.x >= g_Const.widthInBlocks || globalIdx.y >= g_Const.heightInBlocks)

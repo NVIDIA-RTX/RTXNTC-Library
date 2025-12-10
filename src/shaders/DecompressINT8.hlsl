@@ -167,36 +167,47 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
     // Evaluate the MLP layers:
     
     // Input layer
-    uint hiddenOutput1[NTC_MLP_HIDDEN_CHANNELS / 4];
-    EvaluateLayerINT8_SharedMem<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+    uint hiddenOutput0[NTC_MLP_HIDDEN0_CHANNELS / 4];
+    EvaluateLayerINT8_SharedMem<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN0_CHANNELS, false>(
         g_Const.networkWeightOffsets.x,
         g_Const.networkBiasOffsets.x,
         g_Const.networkScaleOffsets.x,
-        true, networkInputs, hiddenOutput1, threadIndex);
+        true, networkInputs, hiddenOutput0, threadIndex);
 
     // Hidden layer 1
-    uint hiddenOutput2[NTC_MLP_HIDDEN_CHANNELS / 4];
-    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+    uint hiddenOutput1[NTC_MLP_HIDDEN1_CHANNELS / 4];
+    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN0_CHANNELS, NTC_MLP_HIDDEN1_CHANNELS, false>(
         g_Const.networkWeightOffsets.y,
         g_Const.networkBiasOffsets.y,
         g_Const.networkScaleOffsets.y,
-        true, hiddenOutput1, hiddenOutput2, threadIndex);
+        true, hiddenOutput0, hiddenOutput1, threadIndex);
 
+#if NTC_MLP_LAYERS == 4
     // Hidden layer 2
-    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+    uint hiddenOutput2[NTC_MLP_HIDDEN2_CHANNELS / 4];
+    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_HIDDEN2_CHANNELS, false>(
         g_Const.networkWeightOffsets.z,
         g_Const.networkBiasOffsets.z,
         g_Const.networkScaleOffsets.z,
-        true, hiddenOutput2, hiddenOutput1, threadIndex);
+        true, hiddenOutput1, hiddenOutput2, threadIndex);
 
     // Output layer
     uint networkOutputs[OUTPUT_UINTS];
-    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
+    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
         g_Const.networkWeightOffsets.w,
         g_Const.networkBiasOffsets.w,
         g_Const.networkScaleOffsets.w,
+        false, hiddenOutput2, networkOutputs, threadIndex);
+#else
+    // Output layer
+    uint networkOutputs[OUTPUT_UINTS];
+    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
+        g_Const.networkWeightOffsets.z,
+        g_Const.networkBiasOffsets.z,
+        g_Const.networkScaleOffsets.z,
         false, hiddenOutput1, networkOutputs, threadIndex);
-    
+#endif
+
     HashBasedRNG rng = HashBasedRNG::Create(pixelPosition.x + pixelPosition.y * g_Const.imageWidth, 0);
 
     // Store the outputs into shared memory for efficient indexed access later.

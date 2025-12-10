@@ -41,17 +41,11 @@
 
 namespace ntc
 {
-void GetDecompressShaderBytecode(const uint8_t* blobData, size_t blobSize,
-    InferenceMath mathVersion, const void** pOutData, size_t* pOutSize)
-{
-    ShaderMake::FindPermutationInBlob(blobData, blobSize, nullptr, 0, pOutData, pOutSize);
-}
-
-void GetBC7ShaderBytecode(const uint8_t* blobData, size_t blobSize, bool writeAccelerationData,
+void GetBC7ShaderBytecode(const uint8_t* blobData, size_t blobSize, bool useModeBuffer,
     const void** pOutData, size_t* pOutSize)
 {
     ShaderMake::ShaderConstant constants[] = {
-        { "WRITE_ACCELERATION", writeAccelerationData ? "1" : "0" }
+        { "USE_MODE_BUFFER", useModeBuffer ? "1" : "0" }
     };
 
     ShaderMake::FindPermutationInBlob(blobData, blobSize,
@@ -66,12 +60,16 @@ void GetBC7ShaderBytecode(const uint8_t* blobData, size_t blobSize, bool writeAc
 void GetDecompressDxilShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize)
 {
     if (mathVersion == InferenceMath::CoopVecFP8)
-        GetDecompressShaderBytecode(g_DecompressCoopVecFP8_dxil, sizeof(g_DecompressCoopVecFP8_dxil), mathVersion, pOutData, pOutSize);
+    {
+        SET_SHADER_BYTECODE(g_DecompressCoopVecFP8_dxil);
+    }
     else
-        GetDecompressShaderBytecode(g_DecompressINT8_dxil, sizeof(g_DecompressINT8_dxil), mathVersion, pOutData, pOutSize);
+    {
+        SET_SHADER_BYTECODE(g_DecompressINT8_dxil);
+    }
 }
 
-void GetBlockCompressDxilShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize)
+void GetBlockCompressDxilShaderBytecode(BlockCompressedFormat format, bool useModeBuffer, const void** pOutData, size_t* pOutSize)
 {
     switch(format)
     {
@@ -94,7 +92,7 @@ void GetBlockCompressDxilShaderBytecode(BlockCompressedFormat format, bool write
             SET_SHADER_BYTECODE(g_CompressBC6_dxil);
             break;
         case BlockCompressedFormat::BC7:
-            GetBC7ShaderBytecode(g_CompressBC7_dxil, sizeof(g_CompressBC7_dxil), writeAccelerationData, pOutData, pOutSize);
+            GetBC7ShaderBytecode(g_CompressBC7_dxil, sizeof(g_CompressBC7_dxil), useModeBuffer, pOutData, pOutSize);
             break;
     }
 }
@@ -108,12 +106,16 @@ void GetImageDifferenceDxilShaderBytecode(const void** pOutData, size_t* pOutSiz
 void GetDecompressSpirvShaderBytecode(InferenceMath mathVersion, const void** pOutData, size_t* pOutSize)
 {
     if (mathVersion == InferenceMath::CoopVecFP8)
-        GetDecompressShaderBytecode(g_DecompressCoopVecFP8_spirv, sizeof(g_DecompressCoopVecFP8_spirv), mathVersion, pOutData, pOutSize);
+    {
+        SET_SHADER_BYTECODE(g_DecompressCoopVecFP8_spirv);
+    }
     else
-        GetDecompressShaderBytecode(g_DecompressINT8_spirv, sizeof(g_DecompressINT8_spirv), mathVersion, pOutData, pOutSize);
+    {
+        SET_SHADER_BYTECODE(g_DecompressINT8_spirv);
+    }
 }
 
-void GetBlockCompressSpirvShaderBytecode(BlockCompressedFormat format, bool writeAccelerationData, const void** pOutData, size_t* pOutSize)
+void GetBlockCompressSpirvShaderBytecode(BlockCompressedFormat format, bool useModeBuffer, const void** pOutData, size_t* pOutSize)
 {
     switch (format)
     {
@@ -136,7 +138,7 @@ void GetBlockCompressSpirvShaderBytecode(BlockCompressedFormat format, bool writ
             SET_SHADER_BYTECODE(g_CompressBC6_spirv);
             break;
         case BlockCompressedFormat::BC7:
-            GetBC7ShaderBytecode(g_CompressBC7_spirv, sizeof(g_CompressBC7_spirv), writeAccelerationData, pOutData, pOutSize);
+            GetBC7ShaderBytecode(g_CompressBC7_spirv, sizeof(g_CompressBC7_spirv), useModeBuffer, pOutData, pOutSize);
             break;
     }
 }

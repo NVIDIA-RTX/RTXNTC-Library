@@ -35,9 +35,13 @@ namespace json
 
 struct LatentImageDesc
 {
-    StreamRange range;
+    Vector<BufferFootprint> footprintsPerLayer;
     int width = 0;
     int height = 0;
+
+    LatentImageDesc(IAllocator* allocator)
+        : footprintsPerLayer(allocator)
+    { }
 };
 
 struct ColorMipDesc
@@ -65,7 +69,7 @@ public:
     ITextureMetadata const* GetTexture(int textureIndex) const override;
     ColorSpace GetChannelStorageColorSpace(int channel) const override;
     LatentTextureDesc GetLatentTextureDesc() const override;
-    Status GetLatentTextureFootprint(int latentMipLevel, LatentTextureFootprint& outFootprint) const override;
+    Status GetLatentTextureFootprint(int latentMipLevel, int arrayLayer, LatentTextureFootprint& outFootprint) const override;
     Status GetFusedMipLevels(int mipLevel, int* pOutFirstFusedMip, int* pOutLastFusedMip) const override;
     int GetNumLatentImages() const override;
     Status GetMipLevelsForLatentImage(int latentImageIndex, int* pOutFirstColorMip, int* pOutLastColorMip) const override;

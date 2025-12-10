@@ -137,6 +137,7 @@ if (NTC_WITH_CUDA)
         CudaArray.h
         CudaDeviceGuard.cpp
         CudaDeviceGuard.h
+        CudaMLP.h
         CudaRandomGen.cu
         CudaRandomGen.h
         CudaUtils.h
@@ -179,6 +180,8 @@ target_sources(libntc PRIVATE
     ${public_headers}
     AdaptiveCompressionSession.h
     AdaptiveCompressionSession.cpp
+    BinaryChunkBuilder.h
+    BinaryChunkBuilder.cpp
     ChannelInfo.h
     Context.h
     Context.cpp
@@ -188,6 +191,8 @@ target_sources(libntc PRIVATE
     Errors.h
     FeatureGridMath.cpp
     FeatureGridMath.h
+    GDeflate.cpp
+    GDeflate.h
     GraphicsResources.h
     GraphicsResources.cpp
     JsonFileFormat.cpp
@@ -196,7 +201,6 @@ target_sources(libntc PRIVATE
     JsonSerialization.cpp
     KnownLatentShapes.h
     MathUtils.h
-    MlpDesc.cpp
     MlpDesc.h
     PublicFunctions.cpp
     RegressionCommon.h
@@ -208,6 +212,10 @@ target_sources(libntc PRIVATE
     TextureMetadata.cpp
     TextureSetMetadata.h
     TextureSetMetadata.cpp
+    ThreadPool.h
+    ThreadPool.cpp
+    WeightLayout.h
+    WeightLayout.cpp
 )
 
 source_group("Public Headers" FILES ${public_headers})
@@ -308,6 +316,12 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
         ${shader_output_dir}/DecompressCoopVecFP8.dxil.h
     )
 
+    if (NTC_DEBUG_SHADERS)
+        set(debug_option "--embedPDB")
+    else()
+        set(debug_option "")
+    endif()
+
     if (NTC_WITH_DX12)
         add_custom_command(TARGET libntc-shaders PRE_BUILD BYPRODUCTS ${shader_byproducts_dxil} COMMAND ShaderMake
             --config ${shader_config_file}
@@ -318,6 +332,7 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
             --compiler ${SHADERMAKE_DXC_PATH}
             --shaderModel 6_5
             --hlsl2021
+            ${debug_option}
             -I ${include_directory})
 
         add_custom_command(TARGET libntc-shaders PRE_BUILD BYPRODUCTS ${shader_byproducts_coopvec_dxil} COMMAND ShaderMake
@@ -328,6 +343,7 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
             --headerBlob
             --compiler ${SHADERMAKE_DXC_PATH}
             --shaderModel 6_9
+            ${debug_option}
             -I ${include_directory})
     endif()
 
@@ -342,6 +358,7 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
             --noRegShifts
             --vulkanVersion 1.2
             --hlsl2021
+            ${debug_option}
             -I ${include_directory}
             -D SPIRV)
 
@@ -356,6 +373,7 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
             --noRegShifts
             -X -Wno-41017
             -X "-capability spvCooperativeVectorNV"
+            ${debug_option}
             -I ${include_directory}
             -D SPIRV)
     endif()

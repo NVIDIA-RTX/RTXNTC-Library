@@ -54,9 +54,10 @@ TextureSetMetadata::TextureSetMetadata(IAllocator* allocator, Context const* con
 
 ITextureMetadata* TextureSetMetadata::AddTexture()
 {
-    TextureMetadata* texture = new(m_allocator->Allocate(sizeof(TextureMetadata))) TextureMetadata(m_allocator, this);
-    m_textureInfos.push_back(UniquePtr<TextureMetadata>(texture, m_allocator));
-    return texture;
+    UniquePtr<TextureMetadata> texture = MakeUniqueWithAllocator<TextureMetadata>(m_allocator, m_context, this);
+    ITextureMetadata* result = texture.get();
+    m_textureInfos.push_back(std::move(texture));
+    return result;
 }
 
 Status TextureSetMetadata::RemoveTexture(ITextureMetadata* texture)
@@ -115,7 +116,8 @@ LatentTextureDesc TextureSetMetadata::GetLatentTextureDesc() const
     return desc;
 }
 
-Status TextureSetMetadata::GetLatentTextureFootprint(int latentMipLevel, LatentTextureFootprint& outFootprint) const
+Status TextureSetMetadata::GetLatentTextureFootprint(int latentMipLevel, int arrayLayer,
+    LatentTextureFootprint& outFootprint) const
 {
     if (latentMipLevel < 0 || latentMipLevel >= m_latentImages.size())
     {
@@ -125,11 +127,18 @@ Status TextureSetMetadata::GetLatentTextureFootprint(int latentMipLevel, LatentT
 
     ntc::LatentImageDesc const& latentImage = m_latentImages[latentMipLevel];
 
-    outFootprint.range = latentImage.range;
+    int const arraySize = int(latentImage.footprintsPerLayer.size());
+    if (arrayLayer < 0 || arrayLayer >= arraySize)
+    {
+        SetErrorMessage("arrayLayer (%d) must be between 0 and %d", arrayLayer, arraySize);
+        return Status::OutOfRange;
+    }
+
+    
+    outFootprint.buffer = latentImage.footprintsPerLayer[arrayLayer];
     outFootprint.width = latentImage.width;
     outFootprint.height = latentImage.height;
     outFootprint.rowPitch = outFootprint.width * FeatureGridMath::BytesPerLatentPixel;
-    outFootprint.slicePitch = outFootprint.rowPitch * outFootprint.height;
     
     return Status::Ok;
 }
@@ -278,20 +287,15 @@ Status TextureSetMetadata::GetInferenceWeights(InferenceWeightType weightType,
 
 bool TextureSetMetadata::IsInferenceWeightTypeSupported(InferenceWeightType weightType) const
 {
-    if (CoopVecWeightConverter::IsCoopVecWeightType(weightType))
-    {
-        // For CoopVec types, check if the source generic data is available and if the conversion is supported
-        InferenceWeightType const genericType = CoopVecWeightConverter::GetGenericWeightType(weightType);
-
-        return IsInferenceWeightTypeSupported(genericType)
-            && CoopVecWeightConverter::IsConversionSupported(m_context->GetGraphicsResources(), weightType);
-    }
+    if (!m_context->GetWeightLayout(weightType))
+        return false;
 
     switch(weightType)
     {
     case InferenceWeightType::GenericInt8:
         return !m_rowMajorWeightDataInt8.empty();
     case InferenceWeightType::GenericFP8:
+    case InferenceWeightType::CoopVecFP8:
         return !m_rowMajorWeightDataFP8.empty();
     default:
         return false;
@@ -341,12 +345,18 @@ Status TextureSetMetadata::ShuffleInferenceOutputs(ShuffleSource mapping[NTC_MAX
         Span const& outputLayerScales = layout->scales[NTC_MLP_LAYERS - 1];
         Span const& outputLayerBiases = layout->biases[NTC_MLP_LAYERS - 1];
 
-        MlpDesc const& mlpDesc = MlpDesc::Get();
-        int const inputChannels = mlpDesc.GetLayerInputChannels(NTC_MLP_LAYERS - 1);
-        int const outputChannels = mlpDesc.GetLayerOutputChannels(NTC_MLP_LAYERS - 1);
+        int const inputChannels = MlpDesc::GetLayerInputChannels(NTC_MLP_LAYERS - 1);
+        int const outputChannels = MlpDesc::GetLayerOutputChannels(NTC_MLP_LAYERS - 1);
 
+#if NTC_MLP_LAYERS == 4
+        constexpr int OutputLayerInputChannels = NTC_MLP_HIDDEN2_CHANNELS;
+#elif NTC_MLP_LAYERS == 3
+        constexpr int OutputLayerInputChannels = NTC_MLP_HIDDEN1_CHANNELS;
+#else
+        #error "Unsupported NTC_MLP_LAYERS value"
+#endif
         // Sanity check
-        assert(inputChannels == NTC_MLP_HIDDEN_CHANNELS);
+        assert(inputChannels == OutputLayerInputChannels);
         assert(outputChannels == NTC_MLP_OUTPUT_CHANNELS);
         static_assert(NTC_MAX_CHANNELS == NTC_MLP_OUTPUT_CHANNELS,
             "This function assumes that NTC_MAX_CHANNELS == NTC_MLP_OUTPUT_CHANNELS");
@@ -359,7 +369,7 @@ Status TextureSetMetadata::ShuffleInferenceOutputs(ShuffleSource mapping[NTC_MAX
         uint8_t* weights = data.data() + outputLayerWeights.offset;
         float* scale = (float*)(data.data() + outputLayerScales.offset);
         int32_t* bias = (int32_t*)(data.data() + outputLayerBiases.offset);
-        std::array<uint8_t, NTC_MLP_HIDDEN_CHANNELS * NTC_MLP_OUTPUT_CHANNELS> tmpWeights;
+        std::array<uint8_t, OutputLayerInputChannels * NTC_MLP_OUTPUT_CHANNELS> tmpWeights;
         std::array<float, NTC_MLP_OUTPUT_CHANNELS> tmpScale;
         std::array<int32_t, NTC_MLP_OUTPUT_CHANNELS> tmpBias;
 
@@ -449,31 +459,20 @@ Status TextureSetMetadata::LoadMetadataFromStream(json::Document const& document
 
     for (auto const& jsonTexture : document.textures)
     {    
-        ITextureMetadata* texture = AddTexture();
+        TextureMetadata* texture = static_cast<TextureMetadata*>(AddTexture());
         texture->SetName(jsonTexture.name.c_str());
         texture->SetChannels(jsonTexture.firstChannel, jsonTexture.numChannels);
         texture->SetChannelFormat(jsonTexture.channelFormat.value_or(ChannelFormat::UNORM8));
         texture->SetBlockCompressedFormat(jsonTexture.bcFormat.value_or(BlockCompressedFormat::None));
         texture->SetRgbColorSpace(jsonTexture.rgbColorSpace.value_or(ColorSpace::Linear));
         texture->SetAlphaColorSpace(jsonTexture.alphaColorSpace.value_or(ColorSpace::Linear));
-        texture->SetBlockCompressionQuality(jsonTexture.bcQuality.value_or(BlockCompressionMaxQuality));
-        if (jsonTexture.bcAccelerationDataView.has_value())
+        
+        for (auto const& mipData : jsonTexture.bcModeBuffers)
         {
-            if (!ValidateBufferView(*jsonTexture.bcAccelerationDataView, 0, document))
+            if (!ValidateBufferView(mipData.view, 0, document))
                 return Status::FileUnrecognized;
 
-            json::BufferView const& accelDataView = document.views[*jsonTexture.bcAccelerationDataView];
-
-            if (!inputStream->Seek(binaryChunkOffset + accelDataView.offset))
-                return Status::IOError;
-
-            Vector<uint8_t> bcData(m_allocator);
-            bcData.resize(accelDataView.storedSize);
-
-            if (!inputStream->Read(bcData.data(), accelDataView.storedSize))
-                return Status::IOError;
-
-            static_cast<TextureMetadata*>(texture)->SetBlockCompressionModeHistogram(bcData.data(), bcData.size());
+            texture->SetBC7ModeBufferFootprint(mipData.mipLevel, document.views[mipData.view], m_binaryChunkOffset);
         }
     }
 
@@ -501,19 +500,36 @@ Status TextureSetMetadata::LoadMetadataFromStream(json::Document const& document
     m_latentImages.clear();
     for (const auto& mipHeader : document.latents)
     {
-        // Views
+        int const numLayers = FeatureGridMath::GetNumLayers(m_latentShape.numFeatures);
 
-        int const widthBlocks = (mipHeader.width + 3) / 4;
-        int const heightBlocks = (mipHeader.height + 3) / 4;
+        size_t const layerSize = size_t(mipHeader.width) * size_t(mipHeader.height)
+            * FeatureGridMath::BytesPerLatentPixel;
 
-        uint64_t const expectedSize = uint64_t(widthBlocks) * uint64_t(heightBlocks) * FeatureGridMath::BytesPerLatentPixel;
+        LatentImageDesc& imageDesc = m_latentImages.emplace_back(m_allocator);
 
-        if (!ValidateBufferView(mipHeader.view, expectedSize, document))
+        if (mipHeader.layerViews.size() != numLayers)
+        {
+            SetErrorMessage("Expected %d layers, got %d for the latent image in MIP %d", numLayers,
+                int(mipHeader.layerViews.size()), neuralLod);
             return Status::FileUnrecognized;
+        }
+
+        for (int layerIndex = 0; layerIndex < numLayers; ++layerIndex)
+        {
+            uint32_t viewIndex = mipHeader.layerViews[layerIndex];
+            if (!ValidateBufferView(viewIndex, layerSize, document))
+                return Status::FileUnrecognized;
+
+            json::BufferView const& view = document.views[viewIndex];
         
-        LatentImageDesc& imageDesc = m_latentImages.emplace_back();
-        imageDesc.range.offset = document.views[mipHeader.view].offset + m_binaryChunkOffset;
-        imageDesc.range.size = document.views[mipHeader.view].storedSize;
+            BufferFootprint& layerFootprint = imageDesc.footprintsPerLayer.emplace_back();
+            layerFootprint.rangeInStream.offset = view.offset + m_binaryChunkOffset;
+            layerFootprint.rangeInStream.size = view.storedSize;
+            layerFootprint.compressionType = view.compression.value_or(CompressionType::None);
+            layerFootprint.uncompressedSize = view.uncompressedSize.value_or(layerFootprint.rangeInStream.size);
+            layerFootprint.uncompressedCrc32 = view.crc32.value_or(0);
+        }
+        
         imageDesc.width = mipHeader.width;
         imageDesc.height = mipHeader.height;
 
@@ -636,11 +652,25 @@ Status TextureSetMetadata::ConvertInferenceWeights(InferenceWeightType weightTyp
         return Status::Unsupported;
     }
 
-    CoopVecWeightConverter::ConvertWeights(m_context->GetGraphicsResources(), MlpDesc::Get(),
+    CoopVecWeightConverter::ConvertWeights(m_context->GetGraphicsResources(),
         *srcLayout, srcBuffer, srcOffset,
         *dstLayout, dstBuffer, dstOffset, commandList);
 
     return Status::Ok;
+}
+
+static void ExpandWeightMatrix(uint8_t* dstWeights, int dstInputChannels, int dstOutputChannels,
+    uint8_t const* srcWeights, int srcInputChannels, int srcOutputChannels)
+{
+    // Copy the provided weights into the top-left corner of the destination matrix.
+    // Assume that the destination buffer is already zero-initialized.
+
+    for (int outCh = 0; outCh < srcOutputChannels; ++outCh)
+    {
+        uint8_t* pDstRow = dstWeights + outCh * dstInputChannels;
+        uint8_t const* pSrcRow = srcWeights + outCh * srcInputChannels;
+        memcpy(pDstRow, pSrcRow, srcInputChannels);
+    }
 }
 
 Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document, IStream* inputStream)
@@ -650,6 +680,8 @@ Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document,
     {
         WeightLayout const* weightLayout = m_context->GetWeightLayout(weightType);
         dst.resize(weightLayout->bufferSize);
+
+        Vector<uint8_t> tmpWeights(m_allocator);
         
         for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
         {
@@ -659,31 +691,66 @@ Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document,
             Span const& layerScale = weightLayout->scales[layerIndex];
             Span const& layerBias = weightLayout->biases[layerIndex];
 
-            if (!ReadViewFromStream(inputStream, document, layer.weightView,
-                dst.data() + layerWeights.offset, layerWeights.size))
-                return Status::IOError;
+            int const expectedInputChannels = MlpDesc::GetLayerInputChannels(layerIndex);
+            int const expectedOutputChannels = MlpDesc::GetLayerOutputChannels(layerIndex);
+
+            if (layer.inputChannels < expectedInputChannels || layer.outputChannels < expectedOutputChannels)
+            {
+                // If the layer provided by the file is smaller than one that we expect, expand its weights.
+                // Read the weights from the file into a temporary buffer first.
+
+                size_t const providedWeightSize = size_t(layer.inputChannels) * size_t(layer.outputChannels) *
+                    GetDataTypeSize(layerWeights.type);
+                assert(providedWeightSize <= layerWeights.size); // ValidateMLP makes sure of this
+
+                tmpWeights.resize(providedWeightSize);
+                if (!ReadViewFromStream(inputStream, document, layer.weightView,
+                    tmpWeights.data(), providedWeightSize))
+                    return Status::IOError;
+
+                ExpandWeightMatrix(dst.data() + layerWeights.offset, expectedInputChannels, expectedOutputChannels,
+                    tmpWeights.data(), layer.inputChannels, layer.outputChannels);
+            }
+            else
+            {
+                // Provided layer matches expected size - read weights directly into destination buffer.
+
+                if (!ReadViewFromStream(inputStream, document, layer.weightView,
+                    dst.data() + layerWeights.offset, layerWeights.size))
+                    return Status::IOError;
+            }
 
             if (layerScale.size != 0)
             {
+                uint32_t const providedScaleCount = layer.scaleView.has_value() ? layer.outputChannels : 0;
+                size_t const providedScaleSize = providedScaleCount * GetDataTypeSize(layerScale.type);
+                assert(providedScaleSize <= layerScale.size); // ValidateMLP makes sure of this
+                
                 if (layer.scaleView.has_value())
                 {
                     if (!ReadViewFromStream(inputStream, document, *layer.scaleView,
-                        dst.data() + layerScale.offset, layerScale.size))
+                        dst.data() + layerScale.offset, providedScaleSize))
                         return Status::IOError;
                 }
-                else
+                
+                if (providedScaleSize < layerScale.size)
                 {
-                    // No scale vectors provided - fill the memory with 1.0
+                    // None or not enough scale vectors provided - fill the remaining memory with 1.0
                     assert(layerScale.type == DataType::FP32);
 
                     float* scales = (float*)(dst.data() + layerScale.offset);
-                    for (uint32_t i = 0; i < layer.outputChannels; ++i)
+                    for (uint32_t i = providedScaleCount; i < uint32_t(expectedOutputChannels); ++i)
                         scales[i] = 1.0f;
                 }
             }
 
+            size_t const providedBiasSize = size_t(layer.outputChannels) * GetDataTypeSize(layerBias.type);
+            assert(providedBiasSize <= layerBias.size); // ValidateMLP makes sure of this
+
+            // Read the bias vector directly into the destination buffer.
+            // If the provided bias is smaller than expected, the remaining values will stay zero-initialized.
             if (!ReadViewFromStream(inputStream, document, layer.biasView,
-                dst.data() + layerBias.offset, layerBias.size))
+                dst.data() + layerBias.offset, providedBiasSize))
                 return Status::IOError;
         }
 
@@ -891,7 +958,11 @@ bool TextureSetMetadata::ValidateBufferView(uint32_t view, uint64_t minSize,
         return false;
     }
 
-    if (viewDesc.storedSize < minSize)
+    uint64_t uncompressedSize = viewDesc.compression.value_or(CompressionType::None) != CompressionType::None
+        ? viewDesc.uncompressedSize.value_or(0)
+        : viewDesc.storedSize;
+        
+    if (uncompressedSize < minSize)
     {
         SetErrorMessage("View %u size %" PRIu64 " is less than minimum expected size %" PRIu64 ".",
             view, viewDesc.storedSize, minSize);
@@ -941,9 +1012,11 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
 
     // We support two MLP configurations:
     // 1. All layers have Int8 weights, Float32 scale, Int32 bias
-    // 2. Layers 0-2 have FP8 weights and Float16 bias;
-    //    Layer 3 has Int8 weights, Float32 scale, Int32 bias
+    // 2. All layers except the last one have FP8 weights and Float16 bias;
+    //    Last layer has Int8 weights, Float32 scale, Int32 bias
     // Validate that the provided config matches one of these.
+
+#if NTC_MLP_LAYERS == 4
     static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_Int8WeightTypes = {
         json::MlpDataType::Int8, json::MlpDataType::Int8, json::MlpDataType::Int8, json::MlpDataType::Int8 };
     static std::array<std::optional<json::MlpDataType>, NTC_MLP_LAYERS> const c_Int8ScaleTypes = {
@@ -956,6 +1029,22 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
         std::nullopt, std::nullopt, std::nullopt, json::MlpDataType::Float32 };
     static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_FP8BiasTypes = {
         json::MlpDataType::Float16, json::MlpDataType::Float16, json::MlpDataType::Float16, json::MlpDataType::Int32 };
+#elif NTC_MLP_LAYERS == 3
+    static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_Int8WeightTypes = {
+        json::MlpDataType::Int8, json::MlpDataType::Int8, json::MlpDataType::Int8 };
+    static std::array<std::optional<json::MlpDataType>, NTC_MLP_LAYERS> const c_Int8ScaleTypes = {
+        json::MlpDataType::Float32, json::MlpDataType::Float32, json::MlpDataType::Float32 };
+    static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_Int8BiasTypes = {
+        json::MlpDataType::Int32, json::MlpDataType::Int32, json::MlpDataType::Int32 };
+    static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_FP8WeightTypes = {
+        json::MlpDataType::FloatE4M3, json::MlpDataType::FloatE4M3, json::MlpDataType::Int8 };
+    static std::array<std::optional<json::MlpDataType>, NTC_MLP_LAYERS> const c_FP8ScaleTypes = {
+        std::nullopt, std::nullopt, json::MlpDataType::Float32 };
+    static std::array<json::MlpDataType, NTC_MLP_LAYERS> const c_FP8BiasTypes = {
+        json::MlpDataType::Float16, json::MlpDataType::Float16, json::MlpDataType::Int32 };
+#else
+    #error "Unsupported NTC_MLP_LAYERS value"
+#endif
 
     std::array<json::MlpDataType, NTC_MLP_LAYERS> weightTypes;
     std::array<std::optional<json::MlpDataType>, NTC_MLP_LAYERS> scaleTypes;
@@ -985,21 +1074,33 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
         return false;
     }
 
-    MlpDesc const& mlpDesc = MlpDesc::Get();
     for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
     {
         json::MLPLayer const& layer = mlp.layers[layerIndex];
+        
+        // We allow smaller hidden layers, but not input or output layers.
+        bool const allowSmallerInputs = layerIndex > 0;
+        bool const allowSmallerOutputs = layerIndex < NTC_MLP_LAYERS - 1;
+        
+        int const expectedInputChannels = MlpDesc::GetLayerInputChannels(layerIndex);
+        int const expectedOutputChannels = MlpDesc::GetLayerOutputChannels(layerIndex);
+        
+        bool const supportedInputCount = allowSmallerInputs
+            ? layer.inputChannels <= expectedInputChannels
+            : layer.inputChannels == expectedInputChannels;
+        bool const supportedOutputCount = allowSmallerOutputs
+            ? layer.outputChannels <= expectedOutputChannels
+            : layer.outputChannels == expectedOutputChannels;
 
-        if (layer.inputChannels != mlpDesc.GetLayerInputChannels(layerIndex) ||
-            layer.outputChannels != mlpDesc.GetLayerOutputChannels(layerIndex))
-        {   
+        if (!supportedInputCount || !supportedOutputCount)
+        {
             SetErrorMessage("File describes MLP layer %d with %d inputs and %d outputs, "
-                "but that layer should have %d inputs and %d outputs.",
+                "but that layer should have %s%d inputs and %s%d outputs.",
                 layerIndex,
                 layer.inputChannels,
                 layer.outputChannels,
-                mlpDesc.GetLayerInputChannels(layerIndex),
-                mlpDesc.GetLayerOutputChannels(layerIndex));
+                allowSmallerInputs ? "at most " : "", expectedInputChannels,
+                allowSmallerOutputs ? "at most " : "", expectedOutputChannels);
             return false;
         }
 

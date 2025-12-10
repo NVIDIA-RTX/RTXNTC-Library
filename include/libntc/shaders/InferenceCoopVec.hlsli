@@ -201,7 +201,7 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
 
 #else
 
-    // See https://microsoft.github.io/hlsl-specs/proposals/0031-hlsl-vector-matrix-operations.html
+    // See https://microsoft.github.io/hlsl-specs/proposals/0031-hlsl-vector-matrix-operations
     // for the enum value definitions
     
     const uint inputType = 20; // SINT8
@@ -301,8 +301,6 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
     in CoopVec<float16_t, IN> inputArray,
     out CoopVec<float16_t, OUT> outputArray)
 {
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-
     NtcEvaluateLayerMatMulAdd_CoopVec_FP8<IN, OUT>
         (weightBuffer, weightOffset, biasOffset, inputArray, outputArray);
    
@@ -326,8 +324,6 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
     in CoopVec<float16_t, IN> inputArray,
     out CoopVec<float, OUT> outputArray)
 {
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-
     // Convert the inputs from float16_t to float, necessary for correct output at this time
 #if __SLANG__
     CoopVec<float, IN> inputArrayFloat = CoopVec<float, IN>(inputArray);
@@ -351,6 +347,58 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
     outputArray = outputArray * scale;
 }
 
+void NtcEvaluateMLP_CoopVec_FP8(
+    ByteAddressBuffer weightsBuffer,
+    uint weightsOffset,
+    int4 networkWeightOffsets,
+    int4 networkBiasOffsets,
+    int4 networkScaleOffsets,
+    CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> networkInputs,
+    out CoopVec<float, NTC_MLP_OUTPUT_CHANNELS> networkOutputs)
+{
+    // Input layer
+    CoopVec<float16_t, NTC_MLP_HIDDEN0_CHANNELS> hiddenOutput0;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN0_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + networkWeightOffsets.x,
+        weightsOffset + networkBiasOffsets.x,
+        false, networkInputs, hiddenOutput0);
+    
+    // Hidden layer 1
+    CoopVec<float16_t, NTC_MLP_HIDDEN1_CHANNELS> hiddenOutput1;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN0_CHANNELS, NTC_MLP_HIDDEN1_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + networkWeightOffsets.y,
+        weightsOffset + networkBiasOffsets.y,
+        /* scaleActivation = */ (NTC_MLP_LAYERS == 3), hiddenOutput0, hiddenOutput1);
+    
+#if NTC_MLP_LAYERS == 4
+    // Hidden layer 2
+    CoopVec<float16_t, NTC_MLP_HIDDEN2_CHANNELS> hiddenOutput2;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_HIDDEN2_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + networkWeightOffsets.z,
+        weightsOffset + networkBiasOffsets.z,
+        true, hiddenOutput1, hiddenOutput2);
+
+    // Output layer
+    NtcEvaluateOutputLayer_CoopVec_FP8<NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS>(
+        weightsBuffer,
+        weightsOffset + networkWeightOffsets.w,
+        weightsOffset + networkBiasOffsets.w,
+        weightsOffset + networkScaleOffsets.w,
+        hiddenOutput2, networkOutputs);
+#else
+    // Output layer
+    NtcEvaluateOutputLayer_CoopVec_FP8<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_OUTPUT_CHANNELS>(
+        weightsBuffer,
+        weightsOffset + networkWeightOffsets.z,
+        weightsOffset + networkBiasOffsets.z,
+        weightsOffset + networkScaleOffsets.z,
+        hiddenOutput1, networkOutputs);
+#endif
+}
+
 // NtcSampleTextureSet_CoopVec_FP8 - version of NtcSampleTextureSet that uses Cooperative Vectors with FP8 (E4M3) math.
 // Use like SampleTextureSet_CoopVec_FP8(Constants, LatentsBuffer, ...)
 // Returns true if the mip level is valid; out-of-bounds texel positions are clamped.
@@ -369,40 +417,16 @@ bool NtcSampleTextureSet_CoopVec_FP8(
     if (!NtcPrepareNetworkInputs_FP16(desc, latentTexture, latentSampler, texel, mipLevel, networkInputs))
         return false;
 
-    // Evaluate the MLP layers:
-    const int totalChannels = NTC_MLP_HIDDEN_CHANNELS * 3 + NTC_MLP_OUTPUT_CHANNELS;
-    
-    // Input layer
-    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput1;
-    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
-        weightsBuffer,
-        weightsOffset + desc.networkWeightOffsets.x,
-        weightsOffset + desc.networkBiasOffsets.x,
-        false, networkInputs, hiddenOutput1);
-    
-    // Hidden layer 1
-    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput2;
-    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
-        weightsBuffer,
-        weightsOffset + desc.networkWeightOffsets.y,
-        weightsOffset + desc.networkBiasOffsets.y,
-        false, hiddenOutput1, hiddenOutput2);
-    
-    // Hidden layer 2
-    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
-        weightsBuffer,
-        weightsOffset + desc.networkWeightOffsets.z,
-        weightsOffset + desc.networkBiasOffsets.z,
-        true, hiddenOutput2, hiddenOutput1);
-
-    // Output layer
     CoopVec<float, NTC_MLP_OUTPUT_CHANNELS> networkOutputs;
-    NtcEvaluateOutputLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS>(
+    NtcEvaluateMLP_CoopVec_FP8(
         weightsBuffer,
-        weightsOffset + desc.networkWeightOffsets.w,
-        weightsOffset + desc.networkBiasOffsets.w,
-        weightsOffset + desc.networkScaleOffsets.w,
-        hiddenOutput1, networkOutputs);
+        weightsOffset,
+        desc.networkWeightOffsets,
+        desc.networkBiasOffsets,
+        desc.networkScaleOffsets,
+        networkInputs,
+        networkOutputs
+    );
 
     [unroll]
     for (int ch = 0; ch < NTC_MLP_OUTPUT_CHANNELS; ++ch)

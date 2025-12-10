@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -13,10 +13,18 @@
 #ifndef BLOCK_COMPRESS_CONSTANTS_H
 #define BLOCK_COMPRESS_CONSTANTS_H
 
-#define BLOCK_COMPRESS_CS_ST_GROUP_WIDTH 16
-#define BLOCK_COMPRESS_CS_ST_GROUP_HEIGHT 8
+#define BLOCK_COMPRESS_CS_GROUP_WIDTH 16
+#define BLOCK_COMPRESS_CS_GROUP_HEIGHT 8
 
-#define BLOCK_COMPRESS_MODE_MASK_UINTS 16
+// BC7 in single-mode accelerated path uses a larger thread group size to make thread reordering more effective.
+// BC7 in non-accelerated path is not optimized for runtime use and doesn't care as much about group size.
+#define BLOCK_COMPRESS_BC7_CS_GROUP_WIDTH 32
+#define BLOCK_COMPRESS_BC7_CS_GROUP_HEIGHT 16
+
+#define BLOCK_COMPRESS_BC7_MP_BITS 9 // 3 bits for mode, 6 bits for partition
+
+// We use 0 as the "no data" value, and remap mode 0 partition 0 to mode 6 partition 63 (which is otherwise invalid)
+#define BLOCK_COMPRESS_BC7_MODE0_PART0_VALUE 0x1BF
 
 struct NtcBlockCompressConstants
 {
@@ -28,13 +36,12 @@ struct NtcBlockCompressConstants
     int widthInBlocks;
     int heightInBlocks;
     float alphaThreshold;
-    int padding;
+    unsigned int modeBufferByteOffset;
 
-#ifdef __cplusplus
-    uint32_t allowedModes[BLOCK_COMPRESS_MODE_MASK_UINTS];
-#else
-    uint4 allowedModes[BLOCK_COMPRESS_MODE_MASK_UINTS / 4];
-#endif
+    unsigned int modeMapWidthInBlocks;
+    unsigned int modeMapHeightInBlocks;
+    int modeMapOffsetX;
+    int modeMapOffsetY;
 };
 
 #endif

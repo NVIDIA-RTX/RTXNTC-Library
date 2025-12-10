@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -12,10 +12,10 @@
 
 #include "AdaptiveCompressionSession.h"
 #include "Context.h"
-#include "CoopVecWeightConverter.h"
 #include "CudaDeviceGuard.h"
 #include "Errors.h"
 #include "GraphicsResources.h"
+#include "GDeflate.h"
 #include "JsonFileFormat.h"
 #include "MathUtils.h"
 #include "MlpDesc.h"
@@ -57,19 +57,14 @@ Context::Context(ContextParameters const& params)
         InferenceWeightType::GenericFP8,
         InferenceWeightType::CoopVecFP8 })
     {
-        if (CoopVecWeightConverter::IsCoopVecWeightType(weightType))
-        {
-            if (!CoopVecWeightConverter::IsConversionSupported(m_graphicsResources, weightType))
-                continue;
-        }
-
         WeightLayout layout;
-        if (CoopVecWeightConverter::GetWeightLayout(m_graphicsResources,
-            MlpDesc::Get(), weightType, layout))
+        if (MakeQuantizedWeightLayout(m_graphicsResources, weightType, layout))
         {
             m_weightLayouts[GetWeightLayoutArrayIndex(weightType)] = layout;
         }
     }
+
+    MakeFP16WeightLayout(m_fp16WeightLayout);
 }
 
 Context::~Context()
@@ -626,6 +621,12 @@ Status Context::MakeDecompressionComputePass(MakeDecompressionComputePassParamet
     return Status::Ok;
 }
 
+static int GetBlockTextureSize(int originalSizeInPixels, int mipLevel)
+{
+    int const mipSize = std::max(originalSizeInPixels >> mipLevel, 1);
+    return (mipSize + 3) / 4; // Convert to blocks
+}
+
 Status Context::MakeBlockCompressionComputePass(MakeBlockCompressionComputePassParameters const& params,
     ComputePassDesc* pOutComputePass) const
 {
@@ -662,21 +663,75 @@ Status Context::MakeBlockCompressionComputePass(MakeBlockCompressionComputePassP
         return Status::OutOfRange;
     }
 
+    bool const useModeBuffer = params.modeBufferSource != BlockCompressionModeBufferSource::None;
+    if (useModeBuffer && params.dstFormat != BlockCompressedFormat::BC7)
+    {
+        SetErrorMessage("Mode buffer can only be used with BC7 compression");
+        return Status::InvalidArgument;
+    }
+
+    int modeMapWidthInBlocks = 0;
+    int modeMapHeightInBlocks = 0;
+    if (params.modeBufferSource == BlockCompressionModeBufferSource::TextureSet)
+    {
+        if (params.modeBufferInfo.textureSet.texture == nullptr)
+        {
+            SetErrorMessage("modeBufferInfo.textureSet.texture is NULL when modeBufferSource is TextureSet");
+            return Status::InvalidArgument;
+        }
+
+        TextureMetadata const* textureMetadata =
+            static_cast<TextureMetadata const*>(params.modeBufferInfo.textureSet.texture);
+
+        TextureSetMetadata const* textureSetMetadata = textureMetadata->GetParent();
+        assert(textureSetMetadata);
+
+        TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
+        if (params.modeBufferInfo.textureSet.mipLevel < 0 ||
+            params.modeBufferInfo.textureSet.mipLevel >= textureSetDesc.mips)
+        {
+            SetErrorMessage("modeBufferInfo.textureSet.mipLevel (%d) must be between 0 and %d for the provided texture",
+                params.modeBufferInfo.textureSet.mipLevel, textureSetDesc.mips - 1);
+            return Status::OutOfRange;
+        }
+
+        if (textureMetadata->GetBlockCompressedFormat() != params.dstFormat)
+        {
+            SetErrorMessage("modeBufferInfo.textureSet.texture must be targeting the same BCn format specified in dstFormat (%s)",
+                BlockCompressedFormatToString(params.dstFormat));
+            return Status::InvalidArgument;
+        }
+
+        modeMapWidthInBlocks = GetBlockTextureSize(textureSetDesc.width, params.modeBufferInfo.textureSet.mipLevel);
+        modeMapHeightInBlocks = GetBlockTextureSize(textureSetDesc.height, params.modeBufferInfo.textureSet.mipLevel);
+    }
+    else if (params.modeBufferSource == BlockCompressionModeBufferSource::Custom)
+    {
+        if (params.modeBufferInfo.custom.widthInBlocks == 0 || params.modeBufferInfo.custom.heightInBlocks == 0)
+        {
+            SetErrorMessage("modeBufferInfo.custom.widthInBlocks and heightInBlocks "
+                "must be non-zero when modeBufferSource is Custom");
+            return Status::InvalidArgument;
+        }
+        modeMapWidthInBlocks = params.modeBufferInfo.custom.widthInBlocks;
+        modeMapHeightInBlocks = params.modeBufferInfo.custom.heightInBlocks;
+    }
+
     pOutComputePass->computeShader = nullptr;
     pOutComputePass->computeShaderSize = 0;
-    
+
 #if NTC_WITH_PREBUILT_SHADERS
     switch (m_graphicsResources->GetGraphicsApi())
     {
         case GraphicsAPI::D3D12:
 #if NTC_WITH_DX12
-            GetBlockCompressDxilShaderBytecode(params.dstFormat, params.writeAccelerationData,
+            GetBlockCompressDxilShaderBytecode(params.dstFormat, useModeBuffer,
                 &pOutComputePass->computeShader, &pOutComputePass->computeShaderSize);
 #endif
             break;
         case GraphicsAPI::Vulkan:
 #if NTC_WITH_VULKAN
-            GetBlockCompressSpirvShaderBytecode(params.dstFormat, params.writeAccelerationData,
+            GetBlockCompressSpirvShaderBytecode(params.dstFormat, useModeBuffer,
                 &pOutComputePass->computeShader, &pOutComputePass->computeShaderSize);
 #endif
             break;
@@ -698,18 +753,21 @@ Status Context::MakeBlockCompressionComputePass(MakeBlockCompressionComputePassP
     constants.widthInBlocks = (params.srcRect.width + 3) / 4;
     constants.heightInBlocks = (params.srcRect.height + 3) / 4;
     constants.alphaThreshold = params.alphaThreshold;
+    constants.modeMapWidthInBlocks = modeMapWidthInBlocks;
+    constants.modeMapHeightInBlocks = modeMapHeightInBlocks;
+    constants.modeBufferByteOffset = params.modeBufferByteOffset;
+    constants.modeMapOffsetX = params.modeMapOffsetInBlocks.x;
+    constants.modeMapOffsetY = params.modeMapOffsetInBlocks.y;
 
-    memset(constants.allowedModes, 0xff, sizeof(constants.allowedModes));
-    if (params.texture && params.dstFormat == BlockCompressedFormat::BC7 && !params.writeAccelerationData)
-    {
-        static_cast<TextureMetadata const*>(params.texture)->GetAllowedBCModes(constants.allowedModes,
-            sizeof(constants.allowedModes), params.quality);
-    }
-    
-    pOutComputePass->dispatchWidth = (constants.widthInBlocks + BLOCK_COMPRESS_CS_ST_GROUP_WIDTH - 1)
-        / BLOCK_COMPRESS_CS_ST_GROUP_WIDTH;
-    pOutComputePass->dispatchHeight = (constants.heightInBlocks + BLOCK_COMPRESS_CS_ST_GROUP_HEIGHT - 1)
-        / BLOCK_COMPRESS_CS_ST_GROUP_HEIGHT;
+    int const groupWidth = params.dstFormat == BlockCompressedFormat::BC7
+        ? BLOCK_COMPRESS_BC7_CS_GROUP_WIDTH
+        : BLOCK_COMPRESS_CS_GROUP_WIDTH;
+    int const groupHeight = params.dstFormat == BlockCompressedFormat::BC7
+        ? BLOCK_COMPRESS_BC7_CS_GROUP_HEIGHT
+        : BLOCK_COMPRESS_CS_GROUP_HEIGHT;
+
+    pOutComputePass->dispatchWidth = (constants.widthInBlocks + groupWidth - 1) / groupWidth;
+    pOutComputePass->dispatchHeight = (constants.heightInBlocks + groupHeight - 1) / groupHeight;
 
     if (!pOutComputePass->computeShader)
     {
@@ -891,4 +949,53 @@ int Context::GetWeightLayoutArrayIndex(InferenceWeightType weightType)
     return int(weightType) - int(InferenceWeightType::GenericInt8);
 }
 
+Status Context::DecompressBuffer(CompressionType compressionType, void const* pCompressedData, size_t compressedSize,
+    void* pOutDecompressedData, size_t outputBufferSize, uint32_t expectedCrc32) const
+{
+    switch(compressionType)
+    {
+    case CompressionType::None:
+        if (pCompressedData == nullptr)
+        {
+            SetErrorMessage("pCompressedData is NULL.");
+            return Status::InvalidArgument;
+        }
+
+        if (pOutDecompressedData == nullptr)
+        {
+            SetErrorMessage("pOutDecompressedData is NULL.");
+            return Status::InvalidArgument;
+        }
+
+        if (outputBufferSize < compressedSize)
+        {
+            SetErrorMessage("When compressionType == None, outputBufferSize (%zu) must be no less than compressedSize (%zu).",
+                outputBufferSize, compressedSize);
+            return Status::InvalidArgument;
+        }
+
+        // When there is no compression, this is just a memcpy.
+        memcpy(pOutDecompressedData, pCompressedData, compressedSize);
+
+        ClearErrorMessage();
+        return Status::Ok;
+
+    case CompressionType::GDeflate:
+        return ntc::DecompressGDeflate(pCompressedData, compressedSize,
+            pOutDecompressedData, outputBufferSize, m_allocator, expectedCrc32);
+
+    default:
+        SetErrorMessage("Unknown compressionType (%d).", int(compressionType));
+        return Status::InvalidArgument;
+    }
 }
+
+Status Context::DecompressGDeflateOnVulkanGPU(void* commandBuffer,
+    void const* pCompressedHeader, size_t compressedHeaderSize,
+    uint64_t compressedGpuVA, uint64_t decompressedGpuVA) const
+{
+    return ntc::DecompressGDeflateOnVulkanGPU(m_graphicsResources, commandBuffer, pCompressedHeader, compressedHeaderSize,
+        compressedGpuVA, decompressedGpuVA);
+}
+
+} // namespace ntc

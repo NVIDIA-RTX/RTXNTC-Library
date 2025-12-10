@@ -15,7 +15,7 @@
 #include "DecompressCommon.hlsli"
 #include "libntc/shaders/InferenceCoopVec.hlsli"
 
-groupshared float s_Outputs[DECOMPRESS_CS_BLOCK_HEIGHT * DECOMPRESS_CS_BLOCK_WIDTH * NTC_MLP_OUTPUT_CHANNELS];
+groupshared float s_Outputs[NTC_MLP_OUTPUT_CHANNELS][DECOMPRESS_CS_BLOCK_HEIGHT * DECOMPRESS_CS_BLOCK_WIDTH];
 
 void DecompressPixel_CoopVec(uint2 globalIndex, uint2 threadIndex)
 {
@@ -30,50 +30,23 @@ void DecompressPixel_CoopVec(uint2 globalIndex, uint2 threadIndex)
     NtcPrepareNetworkInputsInternal_FP16(t_Latents, s_LatentSampler,
         pixelPosition, uv, colorMip, networkInputs);
 
-    // Evaluate the MLP layers:
-    // Input layer
-    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput1;
-    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
-        t_WeightBuffer,
-        g_Const.networkWeightOffsets.x,
-        g_Const.networkBiasOffsets.x,
-        false, networkInputs, hiddenOutput1);
-
-    // Hidden layer 1
-    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput2;
-    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
-        t_WeightBuffer,
-        g_Const.networkWeightOffsets.y,
-        g_Const.networkBiasOffsets.y,
-        false, hiddenOutput1, hiddenOutput2);
-
-    // Hidden layer 2
-    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput3;
-    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
-        t_WeightBuffer,
-        g_Const.networkWeightOffsets.z,
-        g_Const.networkBiasOffsets.z,
-        true, hiddenOutput2, hiddenOutput3);
-
-    // Output layer
     CoopVec<float, NTC_MLP_OUTPUT_CHANNELS> networkOutputs;
-    NtcEvaluateOutputLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS>(
+    NtcEvaluateMLP_CoopVec_FP8(
         t_WeightBuffer,
-        g_Const.networkWeightOffsets.w,
-        g_Const.networkBiasOffsets.w,
-        g_Const.networkScaleOffsets.w,
-        hiddenOutput3, networkOutputs);
+        /* weightsOffset = */ 0,
+        g_Const.networkWeightOffsets,
+        g_Const.networkBiasOffsets,
+        g_Const.networkScaleOffsets,
+        networkInputs,
+        networkOutputs
+    );
 
     // Store the outputs into shared memory for efficient indexed access later.
     // Note: there is no need for a barrier before or after this store because we're using a dedicated
     // shared memory array, and each thread only reads the data it's written - nothing from other threads.
-    int threadOffset = (threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIndex.x) * NTC_MLP_OUTPUT_CHANNELS;
-#if __SLANG__
-    networkOutputs.store(s_Outputs, threadOffset * sizeof(float));
-#else
-    for (int i = 0; i < NTC_MLP_OUTPUT_CHANNELS; ++i)
-        s_Outputs[threadOffset + i] = networkOutputs[i];
-#endif
+    int linearThreadIndex = (threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIndex.x);
+    for (int channelIndex = 0; channelIndex < NTC_MLP_OUTPUT_CHANNELS; ++channelIndex)
+        s_Outputs[channelIndex][linearThreadIndex] = networkOutputs[channelIndex];
     
     HashBasedRNG rng = HashBasedRNG::Create(pixelPosition.x + pixelPosition.y * g_Const.imageWidth, 0);
 
@@ -89,15 +62,13 @@ void DecompressPixel_CoopVec(uint2 globalIndex, uint2 threadIndex)
         
         // Read 4 channels from the network output
         float4 texelValue;
-        int firstOffset = threadOffset + outputDesc.firstChannel;
-
-        texelValue.r = s_Outputs[firstOffset];
+        texelValue.r = s_Outputs[outputDesc.firstChannel][linearThreadIndex];
         if (outputDesc.numChannels >= 2)
-            texelValue.g = s_Outputs[++firstOffset];
+            texelValue.g = s_Outputs[outputDesc.firstChannel + 1][linearThreadIndex];
         if (outputDesc.numChannels >= 3)
-            texelValue.b = s_Outputs[++firstOffset];
+            texelValue.b = s_Outputs[outputDesc.firstChannel + 2][linearThreadIndex];
         if (outputDesc.numChannels == 4)
-            texelValue.a = s_Outputs[++firstOffset];
+            texelValue.a = s_Outputs[outputDesc.firstChannel + 3][linearThreadIndex];
 
         // Perform color space conversion, if needed
         texelValue.rgb = NtcConvertColorSpace(texelValue.rgb, outputDesc.srcRgbColorSpace, outputDesc.dstRgbColorSpace);

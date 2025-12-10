@@ -23,8 +23,8 @@ static const NtcBlockCompressConstants g_Const;
 NTC_DECLARE_CBUFFER(ConstantBuffer<NtcBlockCompressConstants> g_Const, NTC_BINDING_BC_CONSTANT_BUFFER, 0);
 #endif
 NTC_DECLARE_SRV(Texture2D<float4> t_Input,                NTC_BINDING_BC_INPUT_TEXTURE, 0);
+NTC_DECLARE_SRV(ByteAddressBuffer t_Modes,                NTC_BINDING_BC_MODE_BUFFER, 0); // Optional - BC7 only
 NTC_DECLARE_UAV(RWTexture2D<OUTPUT_FORMAT> u_Output,      NTC_BINDING_BC_OUTPUT_TEXTURE, 0);
-NTC_DECLARE_UAV(RWByteAddressBuffer u_AccelerationOutput, NTC_BINDING_BC_ACCELERATION_BUFFER, 0); // Optional - BC7 only
 
 #define PIXELS_PER_BLOCK 16
 

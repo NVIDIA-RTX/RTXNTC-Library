@@ -145,18 +145,19 @@ uint16_t* FeatureGrid::GetEncodedPixelsDevicePtr(int neuralLod)
     return (uint16_t*)m_encodedPixelsMemory.DevicePtrOffset(offset);
 }
 
-uint16_t* FeatureGrid::GetEncodedPixelsHostPtr(int neuralLod)
+uint16_t* FeatureGrid::GetEncodedPixelsHostPtr(int neuralLod, int layerIndex)
 {
     assert(neuralLod < m_numNeuralMipLevels);
-    size_t offset = m_mipOffsetsInPixels[neuralLod] * size_t(m_numLayers) * BytesPerLatentPixel;
+    size_t const offset = (m_mipOffsetsInPixels[neuralLod] * size_t(m_numLayers)
+                         + m_mipSizesInPixels[neuralLod] * size_t(layerIndex)) * BytesPerLatentPixel;
     assert((offset % 2) == 0);
     return (uint16_t*)m_encodedPixelsMemory.HostPtrOffset(offset);
 }
 
-size_t FeatureGrid::GetEncodedPixelsSize(int neuralLod)
+size_t FeatureGrid::GetEncodedPixelsSizePerLayer(int neuralLod)
 {
     assert(neuralLod < m_numNeuralMipLevels);
-    return m_mipSizesInPixels[neuralLod] * size_t(m_numLayers) * BytesPerLatentPixel;
+    return m_mipSizesInPixels[neuralLod] * BytesPerLatentPixel;
 }
 
 uint32_t* FeatureGrid::GetGradientMaskDevicePtr()

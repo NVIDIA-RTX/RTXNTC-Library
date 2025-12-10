@@ -12,7 +12,10 @@
 
 #include "TextureMetadata.h"
 #include "TextureSetMetadata.h"
+#include "Context.h"
+#include "GDeflate.h"
 #include "Errors.h"
+#include "JsonFileFormat.h"
 #include <libntc/shaders/BlockCompressConstants.h>
 #include <algorithm>
 #include <cassert>
@@ -22,12 +25,14 @@
 namespace ntc
 {
 
-TextureMetadata::TextureMetadata(IAllocator* allocator, TextureSetMetadata* parent)
+TextureMetadata::TextureMetadata(IAllocator* allocator, Context const* context, TextureSetMetadata* parent)
     : m_allocator(allocator)
+    , m_context(context)
     , m_parent(parent)
     , m_name(allocator)
-    , m_bcHistogram(allocator)
+    , m_modeBuffers(allocator)
 {
+    m_modeBuffers.resize(parent->GetDesc().mips, ModeBufferInfo(allocator));
 }
 
 void TextureMetadata::SetName(const char* name)
@@ -88,108 +93,141 @@ ColorSpace TextureMetadata::GetAlphaColorSpace() const
     return m_alphaColorSpace;
 }
 
-Status TextureMetadata::SetBlockCompressionAccelerationData(void const* pData, size_t size)
+Status TextureMetadata::MakeAndStoreBC7ModeBuffer(int mipLevel, int widthInBlocks, int heightInBlocks,
+        void const* blockData, size_t blockDataSize, size_t rowPitch)
 {
-    if (!pData)
+    TextureSetDesc const& desc = m_parent->GetDesc();
+    if (mipLevel < 0 || mipLevel >= desc.mips)
     {
-        SetErrorMessage("pData is NULL");
+        SetErrorMessage("mipLevel (%d) must be between 0 and %d.", mipLevel, desc.mips - 1);
+        return Status::OutOfRange;
+    }
+
+    size_t const bytesPerBlock = 16;
+
+    int const mipWidth = std::max(1, desc.width >> mipLevel);
+    int const mipHeight = std::max(1, desc.height >> mipLevel);
+    int const mipWidthInBlocks = (mipWidth + 3) / 4;
+    int const mipHeightInBlocks = (mipHeight + 3) / 4;
+
+    if (widthInBlocks != mipWidthInBlocks || heightInBlocks != mipHeightInBlocks)
+    {
+        SetErrorMessage("Provided widthInBlocks (%d) and heightInBlocks (%d) do not match the expected "
+            "dimensions (%d x %d) for mip level %d.", widthInBlocks, heightInBlocks,
+            mipWidthInBlocks, mipHeightInBlocks, mipLevel);
         return Status::InvalidArgument;
     }
 
-    if (size != BlockCompressionAccelerationBufferSize)
-    {
-        SetErrorMessage("Invalid size of acceleration data (%zu), must be %zu", size, BlockCompressionAccelerationBufferSize);
-        return Status::InvalidArgument;
-    }
-
-    uint32_t const* pUintData = static_cast<uint32_t const*>(pData);
-    uint32_t nonzeroCount = 0;
-    uint32_t sumOfStats = 0;
-    for (uint32_t index = 0; index < BlockCompressionAccelerationBufferSize / sizeof(uint32_t); ++index)
-    {
-        if (!pUintData[index])
-            continue;
-
-        ++nonzeroCount;
-        sumOfStats += pUintData[index];
-    }
-
-    if (nonzeroCount == 0)
-    {
-        SetErrorMessage("Acceleration data buffer is empty (all zeros)");
-        return Status::InvalidArgument;
-    }
-
-    m_bcHistogram.resize(nonzeroCount);
-    uint32_t histogramIndex = 0;
-    for (uint32_t index = 0; index < BlockCompressionAccelerationBufferSize / sizeof(uint32_t); ++index)
-    {
-        if (!pUintData[index])
-            continue;
-
-        BCHistogramEntry& entry = m_bcHistogram[histogramIndex];
-        entry.mode = uint8_t(index >> 6);
-        entry.partition = uint8_t(index & 63);
-        entry.frequency = uint16_t(std::clamp(int(65535.f * float(pUintData[index]) / float(sumOfStats)), 1, 0xffff));
-        ++histogramIndex;
-    }
-
-    std::sort(m_bcHistogram.begin(), m_bcHistogram.end(), [](BCHistogramEntry const& a, BCHistogramEntry const& b) { return a.frequency > b.frequency; });
+    ModeBufferInfo& bufferInfo = m_modeBuffers[mipLevel];
+    // Discard any previous data
+    bufferInfo.Clear();
     
+    size_t const modeBufferSize = GetBC7ModeBufferSize(mipWidthInBlocks, mipHeightInBlocks);
+    bufferInfo.data.resize(modeBufferSize);
+
+    Status status = MakeBC7ModeBuffer(widthInBlocks, heightInBlocks, blockData, blockDataSize, rowPitch,
+        bufferInfo.data.data(), modeBufferSize);
+    if (status != Status::Ok)
+        return status;
+
+    ClearErrorMessage();
     return Status::Ok;
 }
 
-bool TextureMetadata::HasBlockCompressionAccelerationData() const
+void TextureMetadata::GetBC7ModeBuffer(int mipLevel, void const** outData, size_t* outSize) const
 {
-    return !m_bcHistogram.empty();
-}
+    if (outData) *outData = nullptr;
+    if (outSize) *outSize = 0;
 
-void TextureMetadata::SetBlockCompressionQuality(uint8_t quality)
-{
-    m_bcQuality = quality;
-}
-
-uint8_t TextureMetadata::GetBlockCompressionQuality() const
-{
-    return m_bcQuality;
-}
-
-void TextureMetadata::GetBlockCompressionModeHistogram(void const** ppData, size_t* pSize) const
-{
-    if (ppData) *ppData = m_bcHistogram.data();
-    if (pSize) *pSize = m_bcHistogram.size() * sizeof(BCHistogramEntry);
-}
-
-void TextureMetadata::SetBlockCompressionModeHistogram(void const* pData, size_t size)
-{
-    if ((size % sizeof(BCHistogramEntry)) != 0)
+    TextureSetDesc const& desc = m_parent->GetDesc();
+    if (mipLevel < 0 || mipLevel >= int(m_modeBuffers.size()))
         return;
 
-    m_bcHistogram.resize(size / sizeof(BCHistogramEntry));
+    ModeBufferInfo const& bufferInfo = m_modeBuffers[mipLevel];
+    if (bufferInfo.data.empty())
+        return;
 
-    if (size != 0)
-        memcpy(m_bcHistogram.data(), pData, size);
+    if (outData) *outData = bufferInfo.data.data();
+    if (outSize) *outSize = bufferInfo.data.size();
 }
 
-bool TextureMetadata::GetAllowedBCModes(uint32_t* pData, size_t size, uint8_t quality) const
+void TextureMetadata::SetBC7ModeBufferFootprint(int mipLevel, json::BufferView const& view, uint64_t binaryChunkOffset)
 {
-    if (m_bcHistogram.empty())
-        return false;
+    if (mipLevel < 0 || mipLevel >= int(m_modeBuffers.size()))
+        return;
 
-    if (size != BLOCK_COMPRESS_MODE_MASK_UINTS * sizeof(uint32_t))
-        return false;
-    
-    uint32_t count = std::max(1u, uint32_t(roundf(float(m_bcHistogram.size()) * float(quality) / 255.f)));
-    assert(count <= m_bcHistogram.size());
+    ModeBufferInfo& bufferInfo = m_modeBuffers[mipLevel];
+    bufferInfo.footprint.rangeInStream.offset = view.offset + binaryChunkOffset;
+    bufferInfo.footprint.rangeInStream.size = view.storedSize;
+    bufferInfo.footprint.compressionType = view.compression.value_or(CompressionType::None);
+    bufferInfo.footprint.uncompressedSize = view.uncompressedSize.value_or(view.storedSize);
+    bufferInfo.footprint.uncompressedCrc32 = view.crc32.value_or(0);
+}
 
-    memset(pData, 0, size);
-    for (uint32_t index = 0; index < count; ++index)
+Status TextureMetadata::LoadBC7ModeBuffers(IStream* inputStream)
+{
+    for (size_t index = 0; index < m_modeBuffers.size(); ++index)
     {
-        BCHistogramEntry const& entry = m_bcHistogram[index];
-        uint32_t modePartition = (uint32_t(entry.mode) << 6) | uint32_t(entry.partition);
-        pData[modePartition >> 5] |= (1 << (modePartition & 31));
+        ModeBufferInfo& bufferInfo = m_modeBuffers[index];
+        BufferFootprint const& footprint = bufferInfo.footprint;
+
+        if (footprint.rangeInStream.size == 0)
+        {
+            bufferInfo.data.clear();
+            continue;
+        }
+        
+        Vector<uint8_t> dataFromStream(m_allocator);
+        dataFromStream.resize(footprint.rangeInStream.size);
+
+        if (!inputStream->Seek(footprint.rangeInStream.offset) ||
+            !inputStream->Read(dataFromStream.data(), dataFromStream.size()))
+        {
+            SetErrorMessage("Failed to read BC7 mode buffer data of size %llu for mip level %zu.",
+                footprint.rangeInStream.size, index);
+            return Status::IOError;
+        }
+
+        if (footprint.compressionType == CompressionType::GDeflate)
+        {
+            Vector<uint8_t> uncompressedData(m_allocator);
+            uncompressedData.resize(footprint.uncompressedSize);
+
+            Status status = DecompressGDeflate(
+                dataFromStream.data(), dataFromStream.size(),
+                uncompressedData.data(), uncompressedData.size(),
+                m_allocator, footprint.uncompressedCrc32);
+
+            if (status != Status::Ok)
+                return status;
+            
+            bufferInfo.data = std::move(uncompressedData);
+        }
+        else
+        {
+            bufferInfo.data = std::move(dataFromStream);
+        }
     }
-    return true;
+
+    return Status::Ok;
+}
+
+BufferFootprint TextureMetadata::GetBC7ModeBufferFootprint(int mipLevel) const
+{
+    BufferFootprint result;
+    if (mipLevel < 0 || mipLevel >= int(m_modeBuffers.size()))
+        return result;
+
+    ModeBufferInfo const& bufferInfo = m_modeBuffers[mipLevel];
+    return bufferInfo.footprint;
+}
+
+ModeBufferInfo const* TextureMetadata::GetModeBufferInfo(int mipLevel) const
+{
+    if (mipLevel < 0 || mipLevel >= int(m_modeBuffers.size()))
+        return nullptr;
+
+    return &m_modeBuffers[mipLevel];
 }
 
 }

@@ -59,17 +59,19 @@ public:
 
     uint64_t GetOutputStreamSize() override;
 
-    Status SaveToStream(IStream* stream) override;
+    Status SaveToStream(IStream* stream, LosslessCompressionStats* pOutCompressionStats) override;
     
     Status LoadFromStream(IStream* stream) override;
 
-    Status SaveToMemory(void* pData, size_t* pSize) override;
+    Status SaveToMemory(void* pData, size_t* pSize, LosslessCompressionStats* pOutCompressionStats) override;
 
     Status LoadFromMemory(void const* pData, size_t size) override;
 
-    Status SaveToFile(char const* fileName) override;
+    Status SaveToFile(char const* fileName, LosslessCompressionStats* pOutCompressionStats) override;
 
     Status LoadFromFile(char const* fileName) override;
+
+    Status ConfigureLosslessCompression(LosslessCompressionSettings const& params) override;
 
     Status WriteChannels(WriteChannelsParameters const& params) override;
 
@@ -103,6 +105,7 @@ private:
     DeviceArray<half> m_textureData;
     DeviceArray<half> m_textureDataOut;
     DeviceArray<uint8_t> m_textureStaging;
+    LosslessCompressionSettings m_losslessCompression;
 
     FeatureGrid m_featureGrid;
     

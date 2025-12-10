@@ -15,6 +15,7 @@
 #include "CudaUtils.h"
 #include "FeatureGridMath.h"
 #include "MlpDesc.h"
+#include "WeightLayout.h"
 #include "RegressionCommon.h"
 #include "tin/tin_matrix_host.h"
 #include "tin/tin_activation.h"
@@ -28,74 +29,78 @@ namespace ntc::cuda
 
 namespace th = tin::host;
 
+template<typename T>
+__device__ T* GetPtrAtByteOffset(void* basePtr, size_t offset)
+{
+    return basePtr ? reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(basePtr) + offset) : nullptr;
+}
+
+template<typename T>
+__device__ T const* GetPtrAtByteOffset(void const* basePtr, size_t offset)
+{
+    return basePtr ? reinterpret_cast<T const*>(reinterpret_cast<uint8_t const*>(basePtr) + offset) : nullptr;
+}
+
+
 struct AddressParams
 {
-    th::HMatrixB wtMat;
+    th::HMatrixB weightMatrix;
     int rows;
     int col = 0;
-    int weightOffsetForLayer = 0;
-    int channelOffsetForLayer = 0;
-    int totalChannels = 0;
-    int globalColumnIndex = 0;
+    int layerIndex = 0;
     bool inputLayer = false;
     bool outputLayer = false;
 
     __device__ AddressParams(int rows, int cols)
-        : wtMat(rows, cols)
+        : weightMatrix(rows, cols)
         , rows(rows)
     { }
 };
 
-static __device__ AddressParams GetColumnAddressParams(
-    int hiddenLayers,
-    int inputChannels,
-    int hiddenChannels,
-    int outputChannels,
-    int threadIdx)
+static __device__ AddressParams GetColumnAddressParams(int threadIdx)
 {
-    int lastLayerOffset = hiddenChannels * (hiddenLayers + 1);
+    // All quantizer kernels are used with a single thread block where each thread processes one column (output channel),
+    // with the columns from all layers concatenated together.
+    // Determine which layer and column in the layer this thread is responsible for.
 
-    int colLast = threadIdx - (lastLayerOffset);
-    int colFirst = threadIdx % hiddenChannels;
+    int columnOffset = 0;
+    int layerIndex;
+    int layerInputs;
+    int layerOutputs;
+    for (layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
+    {
+        layerInputs = MlpDesc::GetLayerInputChannels(layerIndex);
+        layerOutputs = MlpDesc::GetLayerOutputChannels(layerIndex);
+        if (threadIdx < columnOffset + layerOutputs)
+            break;  
+        columnOffset += layerOutputs;
+    }
 
-    bool outputLayer = colLast >= 0;
-
-    bool inputLayer = (threadIdx - hiddenChannels) < 0;
-    int rows = inputLayer ? inputChannels : hiddenChannels;
-    int cols = outputLayer ? outputChannels : hiddenChannels;
-
-    AddressParams params(rows, cols);
-    params.col = (outputLayer ? colLast : colFirst);
-
-    int hiddenLayer = (threadIdx - hiddenChannels) / hiddenChannels;
-    params.weightOffsetForLayer = inputLayer ? 0 : inputChannels * hiddenChannels + hiddenChannels * hiddenChannels * hiddenLayer;
-    params.channelOffsetForLayer = inputLayer ? 0 : hiddenChannels * (hiddenLayer + 1);
-    params.totalChannels = lastLayerOffset + outputChannels;
-    params.globalColumnIndex = threadIdx;
-    params.inputLayer = inputLayer;
-    params.outputLayer = outputLayer;
+    AddressParams params(layerInputs, layerOutputs);
+    params.col = threadIdx - columnOffset;
+    params.layerIndex = layerIndex;
+    params.inputLayer = layerIndex == 0;
+    params.outputLayer = layerIndex == (NTC_MLP_LAYERS - 1);
     return params;
 }
 extern __constant__ ChannelInfo g_ChannelInfo[NTC_MAX_CHANNELS];
 
 __device__ void QuantizeColumnInt8(
-    int weightCount,
     AddressParams params,
-    half* __restrict__ halfWeights,
+    half2* __restrict__ fp16WeightsForLayer,
+    half* __restrict__ fp16BiasForLayer,
     int8_t* __restrict__ int8WeightsForLayer,
     float* __restrict__ scaleForLayer,
     int32_t* __restrict__ biasForLayer)
 {
-    half2* half2Weights = (half2*)(halfWeights + params.weightOffsetForLayer);
-
     float elemMin = std::numeric_limits<float>::max();
     float elemMax = std::numeric_limits<float>::min();
 
     for (int r = 0; r < params.rows; r += 2)
     {
-        int elemOffset = params.wtMat.get_packed_offset(r, params.col);
+        int elemOffset = params.weightMatrix.get_packed_offset(r, params.col);
 
-        float2 elem = __half22float2(half2Weights[elemOffset]);
+        float2 elem = __half22float2(fp16WeightsForLayer[elemOffset]);
 
         elemMin = std::min(elemMin, elem.x);
         elemMax = std::max(elemMax, elem.x);
@@ -116,9 +121,9 @@ __device__ void QuantizeColumnInt8(
 
     for (int r = 0; r < params.rows; r += 2)
     {
-        int elemOffset = params.wtMat.get_packed_offset(r, params.col);
+        int elemOffset = params.weightMatrix.get_packed_offset(r, params.col);
 
-        half2 helem = half2Weights[elemOffset];
+        half2 helem = fp16WeightsForLayer[elemOffset];
 
         float2 elem = __half22float2(helem);
         elem.x = round(elem.x * scale * ilimit);
@@ -132,7 +137,7 @@ __device__ void QuantizeColumnInt8(
         elem.y = elem.y * limit * iscale;
         half2 res = __float22half2_rn(elem);
 
-        half2Weights[elemOffset] = res;
+        fp16WeightsForLayer[elemOffset] = res;
 
         if (int8WeightsForLayer)
         {
@@ -147,7 +152,7 @@ __device__ void QuantizeColumnInt8(
     if (scaleForLayer || biasForLayer)
     {
         float layerScale = limit * iscale;
-        float layerBias = halfWeights[weightCount + params.globalColumnIndex];
+        float layerBias = fp16BiasForLayer[params.col];
 
         const float activationScale = tin::ActHGELUClamp::step;
         const int activationBias = tin::ActHGELUClamp::bias;
@@ -203,20 +208,17 @@ __device__ void QuantizeColumnInt8(
 }
 
 __device__ void QuantizeColumnFP8(
-    int weightCount,
     AddressParams params,
-    half* __restrict__ halfWeights,
+    half2* __restrict__ fp16WeightsForLayer,
+    half* __restrict__ fp16BiasForLayer,
     int8_t* __restrict__ fp8WeightsForLayer,
-    half* __restrict__ scaleForLayer,
     half* __restrict__ biasForLayer)
 {
-    half2* half2Weights = (half2*)(halfWeights + params.weightOffsetForLayer);
-
     for (int r = 0; r < params.rows; r += 2)
     {
-        int elemOffset = params.wtMat.get_packed_offset(r, params.col);
+        int elemOffset = params.weightMatrix.get_packed_offset(r, params.col);
 
-        half2 helem = half2Weights[elemOffset];
+        half2 helem = fp16WeightsForLayer[elemOffset];
         half2 res;
 
         if (fp8WeightsForLayer)
@@ -238,31 +240,20 @@ __device__ void QuantizeColumnFP8(
             res.y = tin::RoundHalfToFloatE4M3(helem.y);
         }
         
-        half2Weights[elemOffset] = res;
+        fp16WeightsForLayer[elemOffset] = res;
     }
 
-    if (scaleForLayer || biasForLayer)
+    // FP8 weights are not used for the last layer, and therefore don't have scales.
+    // Bias is not quantized, just copied over.
+    if (biasForLayer)
     {
-        float layerScale = 1.f;
-        float layerBias = halfWeights[weightCount + params.globalColumnIndex];
-
-        if (params.outputLayer)
-        {
-            layerScale *= g_ChannelInfo[params.col].optimalToLinearScale;
-            layerBias  = layerBias * g_ChannelInfo[params.col].optimalToLinearScale + g_ChannelInfo[params.col].optimalToLinearBias;
-        }
-
-        if (scaleForLayer) scaleForLayer[params.col] = layerScale;
-        if (biasForLayer) biasForLayer[params.col] = layerBias;
+        biasForLayer[params.col] = fp16BiasForLayer[params.col];
     }
 }
 
 __global__ void QuantizeNetworkInt8Kernel(
-    int weightCount,
-    int hiddenLayers,
-    int inputChannels,
-    int hiddenChannels,
-    int outputChannels,
+    WeightLayout const fp16WeightLayout,
+    WeightLayout const quantizedWeightLayout,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ int8Data)
 {
@@ -270,22 +261,19 @@ __global__ void QuantizeNetworkInt8Kernel(
     auto block = cooperative_groups::this_thread_block();
 
     int i = block.thread_rank();
-    AddressParams params = GetColumnAddressParams(hiddenLayers, inputChannels, hiddenChannels, outputChannels, i);
+    AddressParams params = GetColumnAddressParams(i);
 
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-    
-    QuantizeColumnInt8(weightCount, params, halfWeights,
-        int8Data ? int8Data + params.weightOffsetForLayer : nullptr,
-        int8Data ? (float*)(int8Data + weightCount + params.channelOffsetForLayer * sizeof(float)) : nullptr,
-        int8Data ? (int32_t*)(int8Data + weightCount + (params.totalChannels + params.channelOffsetForLayer) * sizeof(float)) : nullptr);
+    QuantizeColumnInt8(params, 
+        GetPtrAtByteOffset<half2>(halfWeights, fp16WeightLayout.weights[params.layerIndex].offset),
+        GetPtrAtByteOffset<half>(halfWeights, fp16WeightLayout.biases[params.layerIndex].offset),
+        GetPtrAtByteOffset<int8_t>(int8Data, quantizedWeightLayout.weights[params.layerIndex].offset),
+        GetPtrAtByteOffset<float>(int8Data, quantizedWeightLayout.scales[params.layerIndex].offset),
+        GetPtrAtByteOffset<int32_t>(int8Data, quantizedWeightLayout.biases[params.layerIndex].offset));
 }
 
 __global__ void QuantizeNetworkFP8Kernel(
-    int weightCount,
-    int hiddenLayers,
-    int inputChannels,
-    int hiddenChannels,
-    int outputChannels,
+    WeightLayout const fp16WeightLayout,
+    WeightLayout const quantizedWeightLayout,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ fp8Data)
 {
@@ -293,64 +281,55 @@ __global__ void QuantizeNetworkFP8Kernel(
     auto block = cooperative_groups::this_thread_block();
 
     int i = block.thread_rank();
-    AddressParams params = GetColumnAddressParams(hiddenLayers, inputChannels, hiddenChannels, outputChannels, i);
-
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
+    AddressParams params = GetColumnAddressParams(i);
 
     if (params.outputLayer)
     {
-        // Output layer scale and bias are packed together after the fp8 bias values
-        QuantizeColumnInt8(weightCount, params, halfWeights,
-            fp8Data ? fp8Data + params.weightOffsetForLayer : nullptr,
-            fp8Data ? (float*)(fp8Data + weightCount + params.channelOffsetForLayer * sizeof(half)) : nullptr,
-            fp8Data ? (int32_t*)(fp8Data + weightCount + params.channelOffsetForLayer * sizeof(half) + outputChannels * sizeof(float)) : nullptr);
+        QuantizeColumnInt8(params,
+            GetPtrAtByteOffset<half2>(halfWeights, fp16WeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<half>(halfWeights, fp16WeightLayout.biases[params.layerIndex].offset),
+            GetPtrAtByteOffset<int8_t>(fp8Data, quantizedWeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<float>(fp8Data, quantizedWeightLayout.scales[params.layerIndex].offset),
+            GetPtrAtByteOffset<int32_t>(fp8Data, quantizedWeightLayout.biases[params.layerIndex].offset));
     }
     else
     {
-        // No scale values, just bias packed together for all layers
-        QuantizeColumnFP8(weightCount, params, halfWeights,
-            fp8Data ? fp8Data + params.weightOffsetForLayer : nullptr,
-            nullptr,
-            fp8Data ? (half*)(fp8Data + weightCount + params.channelOffsetForLayer * sizeof(half)) : nullptr);
+        QuantizeColumnFP8(params,
+            GetPtrAtByteOffset<half2>(halfWeights, fp16WeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<half>(halfWeights, fp16WeightLayout.biases[params.layerIndex].offset),
+            GetPtrAtByteOffset<int8_t>(fp8Data, quantizedWeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<half>(fp8Data, quantizedWeightLayout.biases[params.layerIndex].offset));
     }
 }
 
 void QuantizeNetwork(
-    MlpDesc const& mlpDesc,
+    WeightLayout const& fp16WeightLayout,
+    WeightLayout const& quantizedWeightLayout,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ outputData,
     bool useFP8)
 {
-    int const outputCount = mlpDesc.GetLayerOutputCount();
-    int const weightCount = mlpDesc.GetWeightCount();
-
-    int threadBlockSize = outputCount;
+    int threadBlockSize = MlpDesc::GetTotalOutputCount();
     int gridSize = 1;
 
     if (useFP8)
     {
-        QuantizeNetworkFP8Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
-            mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
-            halfWeights, outputData);
+        QuantizeNetworkFP8Kernel <<< gridSize, threadBlockSize >>> (fp16WeightLayout, quantizedWeightLayout, halfWeights, outputData);
     }
     else
     {
-        QuantizeNetworkInt8Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
-            mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
-            halfWeights, outputData);
+        QuantizeNetworkInt8Kernel <<< gridSize, threadBlockSize >>> (fp16WeightLayout, quantizedWeightLayout, halfWeights, outputData);
     }
 }
 
 __device__ void UnquantizeColumnInt8(
-    int weightCount,
     AddressParams params,
-    half* __restrict__ halfWeights,
+    half2* __restrict__ fp16WeightsForLayer,
+    half* __restrict__ fp16BiasForLayer,
     int8_t const* __restrict__ int8WeightsForLayer,
     float const* __restrict__ scaleForLayer,
     int const* __restrict__ biasForLayer)
 {
-    half2* half2Weights = (half2*)(halfWeights + params.weightOffsetForLayer);
-
     float layerScale = scaleForLayer[params.col];
     int const integerLayerBias = biasForLayer[params.col];
     float layerBias = float(integerLayerBias) * layerScale;
@@ -382,8 +361,8 @@ __device__ void UnquantizeColumnInt8(
         elem.y = float(qy) * layerScale;
 
         // Write two fp16 weights in MMA layout
-        int elemOffset = params.wtMat.get_packed_offset(r, params.col);
-        half2Weights[elemOffset] = __float22half2_rn(elem);
+        int elemOffset = params.weightMatrix.get_packed_offset(r, params.col);
+        fp16WeightsForLayer[elemOffset] = __float22half2_rn(elem);
     
         integerWeightSum += qx + qy;
     }
@@ -399,19 +378,16 @@ __device__ void UnquantizeColumnInt8(
     }
 
     // Write the fp16 bias
-    halfWeights[weightCount + params.globalColumnIndex] = layerBias;
+    fp16BiasForLayer[params.col] = layerBias;
 }
 
 __device__ void UnquantizeColumnFP8(
-    int weightCount,
     AddressParams params,
-    half* __restrict__ halfWeights,
+    half2* __restrict__ fp16WeightsForLayer,
+    half* __restrict__ fp16BiasForLayer,
     int8_t const* __restrict__ fp8WeightsForLayer,
-    half const* __restrict__ scaleForLayer,
     half const* __restrict__ biasForLayer)
 {
-    half2* half2Weights = (half2*)(halfWeights + params.weightOffsetForLayer);
-
     // This function reverses the effect of QuantizeNetworkFP8Kernel, except the optimalToLinear scale and bias
     
     for (int r = 0; r < params.rows; r += 2)
@@ -423,44 +399,38 @@ __device__ void UnquantizeColumnFP8(
         qelem.__x = *reinterpret_cast<uint16_t const*>(fp8WeightsForLayer + addr);
 
         // Write two fp16 weights in MMA layout
-        int elemOffset = params.wtMat.get_packed_offset(r, params.col);
-        half2Weights[elemOffset] = half2(qelem);
+        int elemOffset = params.weightMatrix.get_packed_offset(r, params.col);
+        fp16WeightsForLayer[elemOffset] = half2(qelem);
     }
 
     // Write the fp16 bias
     float layerBias = biasForLayer ? float(biasForLayer[params.col]) : 0.f;
-    halfWeights[weightCount + params.globalColumnIndex] = layerBias;
+    fp16BiasForLayer[params.col] = layerBias;
 }
 
 __global__ void ConvertNetworkFromInt8ToFP16Kernel(
-    int weightCount,
-    int hiddenLayers,
-    int inputChannels,
-    int hiddenChannels,
-    int outputChannels,
+    WeightLayout const fp16WeightLayout,
+    WeightLayout const quantizedWeightLayout,
     half* __restrict__ halfWeights,
-    int8_t* __restrict__ int8Data)
+    int8_t const* __restrict__ int8Data)
 {
     using namespace cooperative_groups;
     auto block = cooperative_groups::this_thread_block();
     
     int i = block.thread_rank();
-    AddressParams params = GetColumnAddressParams(hiddenLayers, inputChannels, hiddenChannels, outputChannels, i);
+    AddressParams params = GetColumnAddressParams(i);
 
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-
-    UnquantizeColumnInt8(weightCount, params, halfWeights,
-        int8Data + params.weightOffsetForLayer,
-        (float*)(int8Data + weightCount + params.channelOffsetForLayer * sizeof(float)),
-        (int32_t*)(int8Data + weightCount + (params.totalChannels + params.channelOffsetForLayer) * sizeof(float)));
+    UnquantizeColumnInt8(params,
+        GetPtrAtByteOffset<half2>(halfWeights, fp16WeightLayout.weights[params.layerIndex].offset),
+        GetPtrAtByteOffset<half>(halfWeights, fp16WeightLayout.biases[params.layerIndex].offset),
+        GetPtrAtByteOffset<int8_t>(int8Data, quantizedWeightLayout.weights[params.layerIndex].offset),
+        GetPtrAtByteOffset<float>(int8Data, quantizedWeightLayout.scales[params.layerIndex].offset),
+        GetPtrAtByteOffset<int32_t>(int8Data, quantizedWeightLayout.biases[params.layerIndex].offset));
 }
 
 __global__ void ConvertNetworkFromFP8ToFP16Kernel(
-    int weightCount,
-    int hiddenLayers,
-    int inputChannels,
-    int hiddenChannels,
-    int outputChannels,
+    WeightLayout const fp16WeightLayout,
+    WeightLayout const quantizedWeightLayout,
     half* __restrict__ halfWeights,
     int8_t const* __restrict__ fp8Data)
 {
@@ -468,168 +438,45 @@ __global__ void ConvertNetworkFromFP8ToFP16Kernel(
     auto block = cooperative_groups::this_thread_block();
     
     int i = block.thread_rank();
-    AddressParams params = GetColumnAddressParams(hiddenLayers, inputChannels, hiddenChannels, outputChannels, i);
-
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
+    AddressParams params = GetColumnAddressParams(i);
 
     if (params.outputLayer)
     {
-        // Output layer scale and bias are packed together after the fp8 bias values
-        UnquantizeColumnInt8(weightCount, params, halfWeights,
-            fp8Data + params.weightOffsetForLayer,
-            (float*)(fp8Data + weightCount + params.channelOffsetForLayer * sizeof(half)),
-            (int32_t*)(fp8Data + weightCount + params.channelOffsetForLayer * sizeof(half) + outputChannels * sizeof(float)));
+        UnquantizeColumnInt8(params,
+            GetPtrAtByteOffset<half2>(halfWeights, fp16WeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<half>(halfWeights, fp16WeightLayout.biases[params.layerIndex].offset),
+            GetPtrAtByteOffset<int8_t>(fp8Data, quantizedWeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<float>(fp8Data, quantizedWeightLayout.scales[params.layerIndex].offset),
+            GetPtrAtByteOffset<int32_t>(fp8Data, quantizedWeightLayout.biases[params.layerIndex].offset));
     }
     else
     {
-        // No scale values, just bias packed together for all layers
-        UnquantizeColumnFP8(weightCount, params, halfWeights,
-            fp8Data + params.weightOffsetForLayer,
-            nullptr,
-            (half*)(fp8Data + weightCount + params.channelOffsetForLayer * sizeof(half)));
+        UnquantizeColumnFP8(params,
+            GetPtrAtByteOffset<half2>(halfWeights, fp16WeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<half>(halfWeights, fp16WeightLayout.biases[params.layerIndex].offset),
+            GetPtrAtByteOffset<int8_t>(fp8Data, quantizedWeightLayout.weights[params.layerIndex].offset),
+            GetPtrAtByteOffset<half>(fp8Data, quantizedWeightLayout.biases[params.layerIndex].offset));
     }
 }
 
 void ConvertNetworkFromQuantizedToFp16(
-    MlpDesc const& mlpDesc,
+    WeightLayout const& fp16WeightLayout,
+    WeightLayout const& quantizedWeightLayout,
     half* __restrict__ halfWeights,
     int8_t* __restrict__ inputData,
     bool useFP8)
 {
-    int const outputCount = mlpDesc.GetLayerOutputCount();
-    int const weightCount = mlpDesc.GetWeightCount();
-
-    int threadBlockSize = outputCount;
+    int threadBlockSize = MlpDesc::GetTotalOutputCount();
     int gridSize = 1;
 
     if (useFP8)
     {
-        ConvertNetworkFromFP8ToFP16Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
-        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.   GetOutputChannels(), halfWeights, inputData);
+        ConvertNetworkFromFP8ToFP16Kernel <<< gridSize, threadBlockSize >>> (fp16WeightLayout, quantizedWeightLayout, halfWeights, inputData);
     }
     else
     {
-        ConvertNetworkFromInt8ToFP16Kernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
-        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(), halfWeights, inputData);
+        ConvertNetworkFromInt8ToFP16Kernel <<< gridSize, threadBlockSize >>> (fp16WeightLayout, quantizedWeightLayout, halfWeights, inputData);
     }
-}
-
-__global__ void ExportNetworkIntoRowMajorLayoutKernel(
-    int weightCount,
-    int hiddenLayers,
-    int inputChannels,
-    int hiddenChannels,
-    int outputChannels,
-    half* __restrict__ halfWeights,
-    half* __restrict__ fp16Data)
-{
-    using namespace cooperative_groups;
-    auto block = cooperative_groups::this_thread_block();
-
-    int i = block.thread_rank();
-    AddressParams params = GetColumnAddressParams(hiddenLayers, inputChannels, hiddenChannels, outputChannels, i);
-
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-
-    half2* half2Weights = (half2*)(halfWeights + params.weightOffsetForLayer);
-    half* fp16WeightsForLayer = fp16Data + params.weightOffsetForLayer;
-    half* biasForLayer = fp16Data + weightCount + params.channelOffsetForLayer;
-
-    half layerScale = half(1.f);
-    if (params.outputLayer)
-        layerScale = g_ChannelInfo[params.col].optimalToLinearScale;
-
-    for (int r = 0; r < params.rows; r += 2)
-    {
-        int elemOffset = params.wtMat.get_packed_offset(r, params.col);
-
-        half2 helem = half2Weights[elemOffset];
-        
-        int addr = params.col * params.rows + r;
-        fp16WeightsForLayer[addr + 0] = helem.x * layerScale;
-        fp16WeightsForLayer[addr + 1] = helem.y * layerScale;
-    }
-
-    half layerBias = halfWeights[weightCount + params.globalColumnIndex];
-
-    if (params.outputLayer)
-    {
-        layerBias = layerBias * layerScale + half(g_ChannelInfo[params.col].optimalToLinearBias);
-    }
-
-    biasForLayer[params.col] = layerBias;
-}
-
-void ExportNetworkIntoRowMajorLayout(
-    MlpDesc const& mlpDesc,
-    half* __restrict__ halfWeights,
-    half* __restrict__ outputData)
-{
-    int const outputCount = mlpDesc.GetLayerOutputCount();
-    int const weightCount = mlpDesc.GetWeightCount();
-
-    int threadBlockSize = outputCount;
-    int gridSize = 1;
-
-    ExportNetworkIntoRowMajorLayoutKernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
-        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
-        halfWeights, outputData);
-}
-
-__global__ void ImportNetworkFromRowMajorLayoutKernel(
-    int weightCount,
-    int hiddenLayers,
-    int inputChannels,
-    int hiddenChannels,
-    int outputChannels,
-    half* __restrict__ halfWeights,
-    half* __restrict__ inputData)
-{
-    using namespace cooperative_groups;
-    auto block = cooperative_groups::this_thread_block();
-
-    int i = block.thread_rank();
-    AddressParams params = GetColumnAddressParams(hiddenLayers, inputChannels, hiddenChannels, outputChannels, i);
-
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-
-    half2* half2Weights = (half2*)(halfWeights + params.weightOffsetForLayer);
-    half* fp16WeightsForLayer = inputData + params.weightOffsetForLayer;
-    half* biasForLayer = inputData + weightCount + params.channelOffsetForLayer;
-
-    // This function reverses the effect of QuantizeNetworkFP8Kernel, except the optimalToLinear scale and bias
-
-    for (int r = 0; r < params.rows; r += 2)
-    {
-        // Read two fp16 weights in column major layout
-        int addr = params.col * params.rows + r;
-
-        half2 values = *reinterpret_cast<half2 const*>(fp16WeightsForLayer + addr);
-
-        // Write two fp16 weights in MMA layout
-        int elemOffset = params.wtMat.get_packed_offset(r, params.col);
-        half2Weights[elemOffset] = values;
-    }
-
-    // Write the fp16 bias
-    float layerBias = biasForLayer ? float(biasForLayer[params.col]) : 0.f;
-    halfWeights[weightCount + params.globalColumnIndex] = layerBias;
-}
-
-void ImportNetworkFromRowMajorLayout(
-    MlpDesc const& mlpDesc,
-    half* __restrict__ halfWeights,
-    half* __restrict__ inputData)
-{
-    int const outputCount = mlpDesc.GetLayerOutputCount();
-    int const weightCount = mlpDesc.GetWeightCount();
-
-    int threadBlockSize = outputCount;
-    int gridSize = 1;
-
-    ImportNetworkFromRowMajorLayoutKernel <<< gridSize, threadBlockSize >>> (weightCount, mlpDesc.GetHiddenLayers(),
-        mlpDesc.GetInputChannels(), mlpDesc.GetHiddenChannels(), mlpDesc.GetOutputChannels(),
-        halfWeights, inputData);
 }
 
 __device__ uint32_t QuantizeValue(float value, int bits)

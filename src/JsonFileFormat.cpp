@@ -22,15 +22,17 @@
 namespace ntc::json
 {
 
-static auto const CompressionEnum = MakeEnumSchema({
-    EnumValue(Compression::None, "None")
+static auto const CompressionTypeEnum = MakeEnumSchema({
+    EnumValue(CompressionType::None, "None"),
+    EnumValue(CompressionType::GDeflate, "GDeflate")
 });
 
 static auto const BufferViewSchema = MakeObjectSchema("BufferView", {
-    Field::UInt64("offset",                   &BufferView::offset),
-    Field::UInt64("storedSize",               &BufferView::storedSize),
-    Field::OptionalEnum("compression",        &BufferView::compression, CompressionEnum),
-    Field::OptionalUInt64("uncompressedSize", &BufferView::uncompressedSize),
+    Field::UInt64("offset",                         &BufferView::offset),
+    Field::UInt64("storedSize",                     &BufferView::storedSize),
+    Field::OptionalEnum("compression",              &BufferView::compression, CompressionTypeEnum),
+    Field::OptionalUInt64("uncompressedSize",       &BufferView::uncompressedSize),
+    Field::OptionalUInt("crc32",                    &BufferView::crc32),
 });
 
 static ArrayOfObjectHandler<BufferView> const ArrayOfBufferViewHandler(BufferViewSchema);
@@ -106,6 +108,13 @@ static auto const BlockCompressedFormatEnum = MakeEnumSchema({
     EnumValue(BlockCompressedFormat::BC7,   "BC7"),
 });
 
+static auto const BCModeBufferSchema = MakeObjectSchema("BCModeBuffer", {
+    Field::UInt("mipLevel", &BCModeBuffer::mipLevel),
+    Field::UInt("view", &BCModeBuffer::view),
+});
+
+static ArrayOfObjectHandler<BCModeBuffer> const ArrayOfBCModeBufferHandler(BCModeBufferSchema);
+
 static auto const TextureSchema = MakeObjectSchema("Texture", {
     Field::String("name",                             &Texture::name),
     Field::UInt("firstChannel",                       &Texture::firstChannel),
@@ -114,8 +123,7 @@ static auto const TextureSchema = MakeObjectSchema("Texture", {
     Field::OptionalEnum("rgbColorSpace",              &Texture::rgbColorSpace, ColorSpaceEnum),
     Field::OptionalEnum("alphaColorSpace",            &Texture::alphaColorSpace, ColorSpaceEnum),
     Field::OptionalEnum("bcFormat",                   &Texture::bcFormat, BlockCompressedFormatEnum),
-    Field::OptionalUInt("bcQuality",                  &Texture::bcQuality),
-    Field::OptionalUInt("bcAccelerationDataView",     &Texture::bcAccelerationDataView),
+    Field::ArrayOfObject("bcModeBuffers",             &Texture::bcModeBuffers, ArrayOfBCModeBufferHandler),
 });
 
 static ArrayOfObjectHandler<Texture> const ArrayOfTextureHandler(TextureSchema);
@@ -127,10 +135,9 @@ static auto const ChannelSchema = MakeObjectSchema("Channel", {
 static ArrayOfObjectHandler<Channel> const ArrayOfChannelHandler(ChannelSchema);
 
 static auto const LatentImageSchema = MakeObjectSchema("LatentImage", {
-    Field::UInt("width",        &LatentImage::width),
-    Field::UInt("height",       &LatentImage::height),
-    Field::UInt("arraySize",    &LatentImage::arraySize),
-    Field::UInt("view",         &LatentImage::view),
+    Field::UInt("width",                &LatentImage::width),
+    Field::UInt("height",               &LatentImage::height),
+    Field::ArrayOfUInt("layerViews",    &LatentImage::layerViews)
 });
 
 static ArrayOfObjectHandler<LatentImage> const ArrayOfLatentImageHandler(LatentImageSchema);
@@ -233,23 +240,22 @@ static bool Test()
     document.height = 512;
     document.numChannels = 12;
     document.latentShape = LatentShape();
-    document.latentShape->highResFeatures = 16;
-    document.latentShape->lowResFeatures = 12;
-    document.latentShape->highResQuantBits = 4;
-    document.latentShape->lowResQuantBits = 2;
+    document.latentShape->numFeatures = 16;
     
-    BufferView view;
+    BufferView view(&allocator);
     view.offset = 12;
     view.storedSize = 256;
     document.views.push_back(view);
     view.offset = 268;
     view.storedSize = 384;
     document.views.push_back(view);
+    view.compression = CompressionType::GDeflate;
+    view.uncompressedSize = 1024;
+    document.views.push_back(view);
 
     MLP mlp(&allocator);
     mlp.activation = ActivationType::HGELUClamp;
-    mlp.weightType = MlpDataType::Int8;
-    mlp.scaleBiasType = MlpDataType::Float32;
+    mlp.weightLayout = MatrixLayout::RowMajor;
 
     MLPLayer layer(&allocator);
     layer.inputChannels = 64;
@@ -258,23 +264,23 @@ static bool Test()
     layer.scaleView = 1;
     layer.biasView = 2;
     mlp.layers.push_back(layer);
-    document.mlp = mlp;
+    document.mlpVersions.push_back(mlp);
+
+    BCModeBuffer bcModeBuffer;
+    bcModeBuffer.mipLevel = 0;
+    bcModeBuffer.view = 3;
 
     Texture texture(&allocator);
     texture.name = String("Diffuse", &allocator);
     texture.firstChannel = 0;
     texture.numChannels = 3;
+    texture.bcModeBuffers.push_back(bcModeBuffer);
     document.textures.push_back(texture);
 
     LatentImage limg(&allocator);
-    limg.highResWidth = 256;
-    limg.lowResWidth = 128;
-    limg.highResHeight = 128;
-    limg.lowResHeight = 64;
-    limg.highResBitsPerPixel = 64;
-    limg.lowResBitsPerPixel = 24;
-    limg.highResView = 3;
-    limg.lowResView = 4;
+    limg.width = 256;
+    limg.height = 128;
+    limg.layerViews.push_back(4);
     document.latents.push_back(limg);
 
     ColorImageData cimg(&allocator);

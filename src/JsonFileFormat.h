@@ -19,8 +19,8 @@
 namespace ntc::json
 {
 
-// Conservative estimate for the JSON chunk, normally around 2-4 kB
-static constexpr size_t JsonChunkSizeLimit = 8192;
+// Conservative estimate for the JSON chunk, normally around 4-8 kB
+static constexpr size_t JsonChunkSizeLimit = 16384;
 
 // Header for the container, stored in binary form at the beginning of NTC files
 struct FileHeader
@@ -44,17 +44,14 @@ struct FileHeader
 // The main object in the JSON chunk is represented by the Document struct below.
 // Any fields not described in the schema will be silently skipped by the serializer and the parser.
 
-enum class Compression
-{
-    None
-};
 
 struct BufferView
 {
     uint64_t offset = 0;
     uint64_t storedSize = 0;
-    std::optional<Compression> compression;
+    std::optional<CompressionType> compression;
     std::optional<uint64_t> uncompressedSize;
+    std::optional<uint32_t> crc32;
 
     BufferView() = default;
     BufferView(IAllocator* allocator) { }
@@ -115,6 +112,15 @@ struct MLP
     { }
 };
 
+struct BCModeBuffer
+{
+    uint32_t mipLevel = 0;
+    uint32_t view = 0;
+
+    BCModeBuffer() = default;
+    BCModeBuffer(IAllocator* allocator) { }
+};
+
 struct Texture
 {
     String name;
@@ -124,11 +130,11 @@ struct Texture
     std::optional<ColorSpace> rgbColorSpace;
     std::optional<ColorSpace> alphaColorSpace;
     std::optional<BlockCompressedFormat> bcFormat;
-    std::optional<uint32_t> bcQuality;
-    std::optional<uint32_t> bcAccelerationDataView;
+    Vector<BCModeBuffer> bcModeBuffers;
 
     Texture(IAllocator* allocator)
         : name(allocator)
+        , bcModeBuffers(allocator)
     { }
 };
 
@@ -144,10 +150,10 @@ struct LatentImage
 {
     uint32_t width = 0;
     uint32_t height = 0;
-    uint32_t arraySize = 0;
-    uint32_t view = 0;
+    Vector<uint32_t> layerViews;
 
     LatentImage(IAllocator* allocator)
+        : layerViews(allocator)
     { }
 };
 
@@ -181,7 +187,7 @@ struct ColorMip
 
 struct Document
 {
-    static constexpr uint32_t SchemaVersion = 2;
+    static constexpr uint32_t SchemaVersion = 3;
 
     IAllocator* allocator;
 

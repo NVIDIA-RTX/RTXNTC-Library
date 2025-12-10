@@ -45,14 +45,19 @@ namespace tin {
         static constexpr float qmin  = -127;
         Quantization quant;
     };
-    
-    template<uint32_t Z0, uint32_t Z1, ReducerUpdateMode UPDATE_MODE, uint32_t NUM_THREADS, typename GradType = half>
+  
+    template<ReducerUpdateMode UPDATE_MODE, uint32_t NUM_THREADS, typename GradType = half>
     class HLinear
     {
     public:
 
-        TIN_DEVICE HLinear() :
-            m_weights(nullptr), m_bias(nullptr  ), m_weights_grad(nullptr), m_bias_grad(nullptr), m_red_mem(nullptr) {};
+        TIN_DEVICE HLinear()
+            : m_weights(nullptr)
+            , m_bias(nullptr)
+            , m_weights_grad(nullptr)
+            , m_bias_grad(nullptr)
+            , m_red_mem(nullptr)
+        { }
 
         TIN_DEVICE HLinear(
             const half* weights,
@@ -60,11 +65,12 @@ namespace tin {
             half* red_mem = nullptr,
             GradType* weights_grad = nullptr,
             GradType* bias_grad = nullptr) :
-            m_weights(weights), m_bias(bias), m_weights_grad(weights_grad), m_bias_grad(bias_grad), m_red_mem(red_mem) {
+            m_weights(weights), m_bias(bias), m_weights_grad(weights_grad), m_bias_grad(bias_grad), m_red_mem(red_mem)
+        { }
 
-        }
-
-        TIN_DEVICE HVector<Z1> forward(const HVector<Z0>& ip) {
+        template<uint32_t Z0, uint32_t Z1>
+        TIN_DEVICE HVector<Z1> forward(const HVector<Z0>& ip)
+        {
             HMatrixB<Z0, Z1> w;
             w.load_native(m_weights);
 
@@ -82,7 +88,11 @@ namespace tin {
             return out;
         }
 
-        TIN_DEVICE HVector<Z0> backward(const HVector<Z0>& ip, const HVector<Z1>& op_grad, uint32_t wt_grad_offset = 0, uint32_t bias_grad_offset = 0) {
+        template<uint32_t Z0, uint32_t Z1>
+        TIN_DEVICE HVector<Z0> backward(const HVector<Z0>& ip, const HVector<Z1>& op_grad, uint32_t wt_grad_offset = 0, uint32_t bias_grad_offset = 0)
+        {    
+            using RedOuter = OuterProductReducer<NUM_THREADS, Z0, Z1, UPDATE_MODE>;
+            using RedSum   = SumReducer<NUM_THREADS, Z1, UPDATE_MODE>;
             HMatrixB<Z0, Z1> w;
             w.load_native(m_weights);
 
@@ -101,15 +111,13 @@ namespace tin {
         }
 
     protected:
-        using RedOuter = OuterProductReducer<NUM_THREADS, Z0, Z1, UPDATE_MODE>;
-        using RedSum   = SumReducer<NUM_THREADS, Z1, UPDATE_MODE>;
         const half* m_weights;
         const half* m_bias;
         GradType* m_weights_grad;
         GradType* m_bias_grad;
         half* m_red_mem;
     };
-
+    
     template<uint32_t HIDDEN_LAYERS,
              uint32_t Z_IP,
              uint32_t Z_HI,
@@ -148,7 +156,7 @@ namespace tin {
              GradType* bias_grad = nullptr
              ) : m_h_act(quant), m_lh_act(last_hidden_quant), m_o_act(quant), m_ip_quant(quant) {
 
-            m_ip_layer = HLinear<Z_IP, Z_HI, UPDATE_MODE, NUM_THREADS, GradType>(weights, bias, red_mem, weights_grad, bias_grad);
+            m_ip_layer = HLinear<UPDATE_MODE, NUM_THREADS, GradType>(weights, bias, red_mem, weights_grad, bias_grad);
 
             weights      += Z_IP * Z_HI;
             weights_grad += Z_IP * Z_HI;
@@ -157,33 +165,33 @@ namespace tin {
 
 TIN_UNROLL
             for (uint32_t i = 0; i < HIDDEN_LAYERS; i++) {
-                m_hidden_layers[i] = HLinear<Z_HI, Z_HI, UPDATE_MODE, NUM_THREADS, GradType>(weights, bias, red_mem, weights_grad, bias_grad);
+                m_hidden_layers[i] = HLinear<UPDATE_MODE, NUM_THREADS, GradType>(weights, bias, red_mem, weights_grad, bias_grad);
 
                 weights      += Z_HI * Z_HI;
                 weights_grad += Z_HI * Z_HI;
                 if (bias)       bias += Z_HI;
                 if (bias_grad)  bias_grad += Z_HI;
             }
-            m_op_layer = HLinear<Z_HI, Z_OP, UPDATE_MODE, NUM_THREADS, GradType>(weights, bias, red_mem, weights_grad, bias_grad);
+            m_op_layer = HLinear<UPDATE_MODE, NUM_THREADS, GradType>(weights, bias, red_mem, weights_grad, bias_grad);
         }
 
         TIN_DEVICE HVector<Z_OP> forward(const HVector<Z_IP>& ip) {
             auto ipq = act_forward(m_ip_quant, ip);
 
             m_ip_cached = ipq;
-            m_hidden_cached[0] = m_ip_layer.forward(ipq);
+            m_hidden_cached[0] = m_ip_layer.template forward<Z_IP, Z_HI>(ipq);
             auto h = act_forward(m_h_act, m_hidden_cached[0]);
 TIN_UNROLL
             for (uint32_t i = 0; i < HIDDEN_LAYERS; i++) {
 
-                m_hidden_cached[i + 1] = m_hidden_layers[i].forward(h);
+                m_hidden_cached[i + 1] = m_hidden_layers[i].template forward<Z_HI, Z_HI>(h);
                 if (i == HIDDEN_LAYERS - 1)
                     h = act_forward(m_lh_act, m_hidden_cached[i + 1]);
                 else
                     h = act_forward(m_h_act, m_hidden_cached[i + 1]);
             }
 
-            m_op_cached = m_op_layer.forward(h);
+            m_op_cached = m_op_layer.template forward<Z_HI, Z_OP>(h);
             auto op = act_forward(m_o_act, m_op_cached);
             return op;
         }
@@ -235,9 +243,9 @@ TIN_UNROLL
         half* m_weights;
         half* m_bias;
 
-        HLinear<Z_IP, Z_HI, UPDATE_MODE, NUM_THREADS, GradType> m_ip_layer;
-        HLinear<Z_HI, Z_HI, UPDATE_MODE, NUM_THREADS, GradType> m_hidden_layers[HIDDEN_LAYERS];
-        HLinear<Z_HI, Z_OP, UPDATE_MODE, NUM_THREADS, GradType> m_op_layer;
+        HLinear<UPDATE_MODE, NUM_THREADS, GradType> m_ip_layer;
+        HLinear<UPDATE_MODE, NUM_THREADS, GradType> m_hidden_layers[HIDDEN_LAYERS];
+        HLinear<UPDATE_MODE, NUM_THREADS, GradType> m_op_layer;
 
         HVector<Z_IP> m_ip_cached;
         HVector<Z_HI> m_hidden_cached[HIDDEN_LAYERS + 1];

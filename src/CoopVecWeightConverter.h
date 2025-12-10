@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "WeightLayout.h"
 #include <libntc/ntc.h>
 #include <cstdint>
 #include <cstdlib>
@@ -20,25 +21,26 @@
 namespace ntc
 {
 
-class GraphicsResources;
 struct MlpDesc;
-struct WeightLayout;
+
+class GraphicsResources;
 
 class CoopVecWeightConverter
 {
 public:
     static bool IsConversionSupported(GraphicsResources const* resources, InferenceWeightType weightType);
 
-    static bool GetWeightLayout(GraphicsResources const* resources, MlpDesc const& mlpDesc,
-        InferenceWeightType weightType, WeightLayout& outLayout);
-
-    static void ConvertWeights(GraphicsResources const* resources, MlpDesc const& mlpDesc,
+    static void ConvertWeights(GraphicsResources const* resources,
         WeightLayout const& srcLayout, void* srcBuffer, uint64_t srcOffset,
         WeightLayout const& dstLayout, void* dstBuffer, uint64_t dstOffset,
         void* commandListOrBuffer);
 
     static bool IsCoopVecWeightType(InferenceWeightType weightType);
     static InferenceWeightType GetGenericWeightType(InferenceWeightType weightType);
+
+    static bool GetConvertedWeightMatrixSize(GraphicsResources const* resources,
+        int inputChannels, int outputChannels,
+        DataType weightType, size_t& outSize);
 
 #if NTC_WITH_DX12
     static void IsDX12CoopVecSupported(GraphicsResources const* resources, bool& outSupported);

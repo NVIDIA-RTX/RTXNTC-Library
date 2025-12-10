@@ -37,7 +37,7 @@ namespace ntc
 {
 
 // Update the interface version whenever changes to the LibNTC API are made.
-constexpr uint32_t InterfaceVersion = 0x25'10'10'00; // Year, month, day, ordinal
+constexpr uint32_t InterfaceVersion = 0x25'12'05'00; // Year, month, day, ordinal
 
 // Version information for the library, see GetLibraryVersion()
 struct VersionInfo
@@ -63,13 +63,14 @@ enum class Status
     Unsupported       = 8,
     InternalError     = 9,
     InvalidArgument   = 10,
-    InvalidState      = 11,
-    IOError           = 12,
-    NotImplemented    = 13,
-    OutOfMemory       = 14,
-    OutOfRange        = 15,
-    ShaderUnavailable = 16,
-    UnknownError      = 17,
+    InvalidData       = 11,
+    InvalidState      = 12,
+    IOError           = 13,
+    NotImplemented    = 14,
+    OutOfMemory       = 15,
+    OutOfRange        = 16,
+    ShaderUnavailable = 17,
+    UnknownError      = 18,
 };
 
 // This interface declares functions of a custom CPU memory allocator for the NTC library.
@@ -123,8 +124,6 @@ struct StreamRange
 constexpr StreamRange EntireStream = StreamRange{0, ~0ull};
 
 constexpr int DisableCudaDevice = -1; // Use for ContextParameters::cudaDevice
-constexpr size_t BlockCompressionAccelerationBufferSize = 8*64*4; // 8 BC7 modes, 64 uints per mode
-constexpr uint8_t BlockCompressionMaxQuality = 255;
 
 // *** Texture sets ***
 
@@ -365,6 +364,27 @@ struct InferenceData
     NtcTextureSetConstants constants;
 };
 
+enum class CompressionType
+{
+    None = 0,
+    GDeflate = 1
+};
+
+// Describes the location, size and compression method for a buffer stored in a stream, such as NTC file.
+struct BufferFootprint
+{
+    // Location of the compressed or raw data in the stream
+    StreamRange rangeInStream;
+    CompressionType compressionType = CompressionType::None;
+
+    // Size of the uncompressed data in bytes.
+    // When compressionType == None, this must match rangeInStream.size.
+    uint64_t uncompressedSize = 0;
+
+    // CRC32 of the uncompressed data for integrity verification.
+    // Zero means no CRC32 is available.
+    uint32_t uncompressedCrc32 = 0;
+};
 
 // The ITextureMetadata interface is used to provide information about a specific texture in a texture set.
 class ITextureMetadata
@@ -414,20 +434,23 @@ public:
     // Returns the value previously set with 'SetAlphaColorSpace'.
     virtual ColorSpace GetAlphaColorSpace() const = 0;
 
-    // Sets the acceleration data for BC compression obtained by running a compression pass.
-    // The data should be read from the buffer used in the compression pass, see 'MakeBlockCompressionComputePass'.
-    virtual Status SetBlockCompressionAccelerationData(void const* pData, size_t size) = 0;
+    // Extracts the acceleration data from a full compressed BC7 texture for the given mip level
+    // and stores it in the texture set / NTC file. The dimensions of the compressed texture must match
+    // the full dimensions of the given mip level of the texture set.
+    virtual Status MakeAndStoreBC7ModeBuffer(int mipLevel, int widthInBlocks, int heightInBlocks,
+        void const* blockData, size_t blockDataSize, size_t rowPitch) = 0;
 
-    // Returns 'true' if 'SetBlockCompressionAccelerationData' was previously called with valid data.
-    virtual bool HasBlockCompressionAccelerationData() const = 0;
+    // Returns a pointer to the BC7 mode buffer for the given mip level previously created with
+    // 'MakeAndStoreBC7ModeBuffer', along with its size in bytes.
+    // If no such data exists, the results are set to zero.
+    // To use the mode buffer in a BC7 compression pass, transfer this data into a GPU byte address buffer
+    // and provide it to the BC7 compression shader through the NTC_BINDING_BC_MODE_BUFFER binding.
+    // Make sure to set MakeBlockCompressionComputePassParameters::useModeBuffer to true.
+    virtual void GetBC7ModeBuffer(int mipLevel, void const** outData, size_t* outSize) const = 0;
 
-    // Sets the default quality value for block compression of this texture.
-    virtual void SetBlockCompressionQuality(uint8_t quality) = 0;
-
-    // Returns the value previously set with 'SetBlockCompressionQuality'.
-    // This value should be passed to 'MakeBlockCompressionComputePass'.
-    // The default value is 'BlockCompressionMaxQuality'.
-    virtual uint8_t GetBlockCompressionQuality() const = 0;
+    // Returns the stream range of the BC7 mode buffer for the given mip level stored in the compressed file or stream.
+    // If no such data exists, returns an empty range.
+    virtual BufferFootprint GetBC7ModeBufferFootprint(int mipLevel) const = 0;
 
     virtual ~ITextureMetadata() = default;
 };
@@ -504,14 +527,13 @@ struct LatentTextureDesc
     int mipLevels = 0;
 };
 
-// Describes the layout of a latent texture mip level in the compressed file or stream.
+// Describes the layout of a latent texture subresource (one mip level, one array layer) in the compressed file or stream.
 struct LatentTextureFootprint
 {
-    StreamRange range;
+    BufferFootprint buffer;
     int width = 0;
     int height = 0;
     size_t rowPitch = 0; // In bytes
-    size_t slicePitch = 0; // In bytes
 };
 
 // The ITextureSetMetadata interface is used to provide information about texture set contents without allocating memory
@@ -551,8 +573,9 @@ public:
     virtual LatentTextureDesc GetLatentTextureDesc() const = 0;
 
     // Returns the range and layout of data from the compressed stream or file that contains the latent data
-    // for the requested mip level of the latent texture in BGRA4 format.
-    virtual Status GetLatentTextureFootprint(int latentMipLevel, LatentTextureFootprint& outFootprint) const = 0;
+    // for the requested mip level and array layer of the latent texture in BGRA4 format.
+    virtual Status GetLatentTextureFootprint(int latentMipLevel, int arrayLayer,
+        LatentTextureFootprint& outFootprint) const = 0;
 
     // Returns the range of mip levels including 'mipLevel' that are represented by the same latent image.
     // If a slice of any of these mips is requested for partial inference, scaled slices of all of them
@@ -792,6 +815,41 @@ struct DecompressionStats
     float gpuTimeMilliseconds = 0;
 };
 
+// Configuration for lossless compression of certain parts of NTC files.
+struct LosslessCompressionSettings
+{
+    CompressionType algorithm = CompressionType::GDeflate;
+
+    // Compression level, algorithm-specific. For GDeflate, must be 0-12.
+    int compressionLevel = 9;
+
+    // Enables compression of BC7 mode buffers, usually reduces their size by about half
+    bool compressBCModeBuffers = true;
+
+    // Enables compression of latent texture slices, usually not very effective
+    bool compressLatents = true;
+
+    // Threshold for applying lossless compression to individual buffers.
+    // If compressed data is larger than uncompressed data multiplied by this factor, uncompressed data will be stored.
+    float compressionRatioThreshold = 0.95f;
+
+    // Number of threads to use for compression.
+    // Negative values disable the use of a thread pool.
+    // 0 means automatic selection based on the number of CPU cores.
+    int compressionThreads = 0;
+};
+
+// Statistics about lossless compression used when saving texture sets.
+struct LosslessCompressionStats
+{
+    uint32_t compressedBuffers = 0;
+    uint32_t totalBuffers = 0;
+    uint64_t sizeOfCompressedBuffers = 0;
+    uint64_t originalSizeOfCompressedBuffers = 0;
+    uint64_t sizeOfUncompressedBuffers = 0;
+    float compressionTimeMs = 0;
+};
+
 // The ITextureSet interface extends ITextureSetMetadata and provides APIs for compressing and decompressing texture sets
 // using CUDA. Unlike metadata objects, ITextureSet allocates GPU memory to hold all texture data and extra buffers for network training.
 class ITextureSet : virtual public ITextureSetMetadata
@@ -806,7 +864,7 @@ public:
     virtual uint64_t GetOutputStreamSize() = 0;
 
     // Saves the compressed texture set into a stream.
-    virtual Status SaveToStream(IStream* stream) = 0;
+    virtual Status SaveToStream(IStream* stream, LosslessCompressionStats* pOutCompressionStats = nullptr) = 0;
 
     // Loads the compressed texture set from a stream if the stored data has the same dimensions as this texture set.
     // If the stored data has different dimensions, returns FileIncompatible, and the data in memory is unchanged.
@@ -816,7 +874,7 @@ public:
     // The pSize parameter must point to a variable that contains the buffer size on input
     // and will contain the actual written size after the function executes.
     // Shortcut for IContext::OpenMemory and SaveToStream.
-    virtual Status SaveToMemory(void* pData, size_t* pSize) = 0;
+    virtual Status SaveToMemory(void* pData, size_t* pSize, LosslessCompressionStats* pOutCompressionStats = nullptr) = 0;
 
     // Loads the compressed texture set from a buffer in memory.
     // Shortcut for IContext::OpenReadOnly and LoadFromStream.
@@ -824,11 +882,16 @@ public:
 
     // Saves the compressed texture set into a file.
     // Shortcut for IContext::OpenFile and SaveToStream.
-    virtual Status SaveToFile(char const* fileName) = 0;
+    virtual Status SaveToFile(char const* fileName, LosslessCompressionStats* pOutCompressionStats = nullptr) = 0;
 
     // Loads the compressed texture set from a file.
     // Shortcut for IContext::OpenFile and LoadFromStream.
     virtual Status LoadFromFile(char const* fileName) = 0;
+
+    // Sets the parameters for lossless compression (e.g. GDeflate) for some buffers in the output stream.
+    // The default configuration is described by the field initialization values in BufferCompressionParams.
+    // The configuration applied by this call affects all subsequent calls to SaveToStream(...) and similar functions.
+    virtual Status ConfigureLosslessCompression(LosslessCompressionSettings const& params) = 0;
 
     // *** Raw texture data access ***
 
@@ -972,6 +1035,14 @@ struct MakeDecompressionComputePassParameters
     int numOutputTextures = 0;
 };
 
+// Describes the source of the BC7 mode buffer for block compression.
+enum class BlockCompressionModeBufferSource
+{
+    None = 0,
+    TextureSet = 1,
+    Custom = 2
+};
+
 struct MakeBlockCompressionComputePassParameters
 {
     // Extent of the texture data to compress from the source texture.
@@ -986,15 +1057,43 @@ struct MakeBlockCompressionComputePassParameters
     // Alpha threshold for transparent pixels in BC1, has no effect on other formats.
     float alphaThreshold = 1.f / 255.f;
 
-    // Controls whether BC7 acceleration data is written by the compression pass.
-    // When true, the output buffer for this data must be bound to the shader.
-    bool writeAccelerationData = false;
-    
-    // Optional, texture object to get BC7 acceleration data from.
-    ITextureMetadata const* texture = nullptr;
+    // If true, the compression pass will use a BC7 mode bitmap to accelerate encoding.
+    BlockCompressionModeBufferSource modeBufferSource = BlockCompressionModeBufferSource::None;
 
-    // BC7 compression quality, only effective when 'texture' is provided and if it has the acceleration data.
-    uint8_t quality = BlockCompressionMaxQuality;
+    // Offset of this texture's data in the BC7 mode buffer, in bytes.
+    // Set this to nonzero when packing mode buffers for multiple textures or mip levels into one buffer.
+    uint64_t modeBufferByteOffset = 0;
+
+    // Offset of the top left block in the mode buffer.
+    // This offset does not necessarily match the offset described by 'srcRect' or 'dstOffsetInBlocks',
+    // for example when transcoding a tile of an NTC texture set through an intermediate texture at zero offset.
+    Point modeMapOffsetInBlocks;
+
+    // Information about the mode buffer geometry.
+    // Only needed if 'modeBufferSource' is not None.
+    union
+    {
+        // When modeBufferSource == TextureSet
+        struct {
+            ITextureMetadata const* texture;
+            int mipLevel;
+        } textureSet;
+
+        // When modeBufferSource == Custom
+        struct {
+            uint32_t widthInBlocks;
+            uint32_t heightInBlocks;
+        } custom;
+    } modeBufferInfo;
+
+    MakeBlockCompressionComputePassParameters()
+    {
+        // Clear all fields in the union to be sure
+        modeBufferInfo.textureSet.texture = nullptr;
+        modeBufferInfo.textureSet.mipLevel = 0;
+        modeBufferInfo.custom.widthInBlocks = 0;
+        modeBufferInfo.custom.heightInBlocks = 0;
+    }
 };
 
 struct MakeImageDifferenceComputePassParameters
@@ -1113,10 +1212,10 @@ public:
     // - NTC_BINDING_BC_CONSTANT_BUFFER:     ConstantBuffer containing the CB data
     //                                       (provided by ComputePassDecs::constantBufferData)
     // - NTC_BINDING_BC_INPUT_TEXTURE:       Texture2D<float4> containing the input texture.
+    // - NTC_BINDING_BC_MODE_BUFFER:         ByteAddressBuffer containing the BC7 mode and partition data
+    //                                       (only needed when dstFormat is BC7 and modeBufferSource is not None).
     // - NTC_BINDING_BC_OUTPUT_TEXTURE:      RWTexture2D<uint2|uint4> containing the output texture
     //                                       (use uint2 for BC1 and BC4, and uint4 for all other BC modes)
-    // - NTC_BINDING_BC_ACCELERATION_BUFFER: RWByteAddressBuffer containing the buffer for acceleration data
-    //                                       (only if writeAccelerationData is true and only for BC7)
     // If this function returns Status::ShaderUnavailable, the rest of the data in 'pOutComputePass' is still valid.
     virtual Status MakeBlockCompressionComputePass(MakeBlockCompressionComputePassParameters const& params,
         ComputePassDesc* pOutComputePass) const = 0;
@@ -1151,6 +1250,23 @@ public:
     // Returns true if the graphics device supports all the required features and extensions for cooperative vector
     // based decompression of NTC texture sets.
     virtual bool IsCooperativeVectorSupported() const = 0;
+
+    // Decompresses the provided data into the output buffer using the CPU.
+    // The output buffer must be preallocated and large enough to hold the decompressed data.
+    virtual Status DecompressBuffer(CompressionType compressionType, void const* pCompressedData, size_t compressedSize,
+        void* pOutDecompressedData, size_t outputBufferSize,
+        uint32_t expectedCrc32 = 0) const = 0;
+
+    // Decompresses the provided GDeflate-compressed from one GPU buffer into another GPU buffer.
+    // Only supported on Vulkan when the device implements the VK_NV_memory_decompression extension.
+    // The compressed data header must be accessible to the CPU at the provided address. The header is stored at the
+    // beginning of the compressed stream and its size can be determined using the GetGDeflateHeaderSize function.
+    // The compressed data on the GPU doesn't need to include the header, and the 'compressedGpuVA' parameter
+    // points to the start of the data *after* the header.
+    virtual Status DecompressGDeflateOnVulkanGPU(
+        void* commandBuffer,
+        void const* pCompressedHeader, size_t compressedHeaderSize,
+        uint64_t compressedGpuVA, uint64_t decompressedGpuVA) const = 0;
 
     virtual ~IContext() = default;
 };
@@ -1226,6 +1342,9 @@ NTC_API const char* ColorSpaceToString(ColorSpace colorSpace);
 // Provides a textual representation of the weight type.
 NTC_API const char* InferenceWeightTypeToString(InferenceWeightType weightType);
 
+// Provides a textual representation of the weight type.
+NTC_API const char* CompressionTypeToString(CompressionType type);
+
 // Returns the size of one color component in a pixel for the given format.
 NTC_API size_t GetBytesPerPixelComponent(ChannelFormat format);
 
@@ -1254,6 +1373,16 @@ NTC_API float GetLatentShapeBitsPerPixel(LatentShape const& shape);
 // Converts the results placed in the output buffer by the IContext::MakeImageDifferenceComputePass pass
 // into a regular double representing the MSE value.
 NTC_API double DecodeImageDifferenceResult(uint64_t value);
+
+// Returns the size of the buffer needed to hold the BC7 mode bitmap for a texture of the given dimensions in blocks.
+NTC_API size_t GetBC7ModeBufferSize(int widthInBlocks, int heightInBlocks);
+
+// Fills a buffer with the BC7 mode bitmap for the provided block-compressed data.
+NTC_API Status MakeBC7ModeBuffer(int widthInBlocks, int heightInBlocks, void const* blockData, size_t blockDataSize,
+    size_t rowPitch, void* modeBuffer, size_t modeBufferSize);
+
+// Returns the size of the header for a GDeflate compressed stream.
+NTC_API size_t GetGDeflateHeaderSize(size_t uncompressedSize);
 
 } // extern "C"
 

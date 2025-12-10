@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -23,15 +23,21 @@
 #define NTC_MAX_CHANNELS    16
 #define NTC_MAX_NEURAL_MIPS 8
 
-#define NTC_FEATURES_PER_LAYER 4
+#define NTC_FEATURES_PER_LAYER 4 // Number of features stored in each layer of the latent texture array (BGRA4 has 4 channels, thus 4 features)
 
-#define NTC_MLP_LAYERS                4
-#define NTC_MLP_FEATURES              16
-#define NTC_MLP_POS_ENC_WAVES         3
+#define NTC_MLP_LAYERS                4  // Total number of layers (matrix multiplication ops) in the MLP. Supported values: 3 or 4
+#define NTC_MLP_FEATURES              16 // Maximum number of features per texel in the latent representation
+#define NTC_MLP_POS_ENC_WAVES         3  // Number of positional encoding waves (frequencies) used for the input coordinates
 #define NTC_MLP_SUPPLEMENTAL_INPUTS   14 // Positional encoding (12 inputs) and the mip level (twice)
-#define NTC_MLP_INPUT_CHANNELS        48 // roundup(NTC_MLP_SUPPLEMENTAL_INPUTS + NTC_MLP_FEATURES * 2, 16)
-#define NTC_MLP_HIDDEN_CHANNELS       64
-#define NTC_MLP_OUTPUT_CHANNELS       16
+#define NTC_MLP_INPUT_CHANNELS        48 // Size of the MLP input vector = roundup(NTC_MLP_SUPPLEMENTAL_INPUTS + NTC_MLP_FEATURES * 2, 16)
+#define NTC_MLP_HIDDEN0_CHANNELS      64 // Size of the first hidden layer, must be a multiple of 16
+#define NTC_MLP_HIDDEN1_CHANNELS      48 // Size of the second hidden layer, must be a multiple of 16
+#if NTC_MLP_LAYERS >= 4
+#define NTC_MLP_HIDDEN2_CHANNELS      32 // Size of the third hidden layer, must be a multiple of 16
+#else
+#define NTC_MLP_HIDDEN2_CHANNELS      0  // For 3-layer MLPs, there is no third hidden layer
+#endif
+#define NTC_MLP_OUTPUT_CHANNELS       16 // Size of the MLP output vector, must be a multiple of 16
 
 struct NtcColorMipConstants
 {

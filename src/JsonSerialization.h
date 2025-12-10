@@ -195,10 +195,15 @@ struct Field
         Float,
         Double,
         String,
-        ArrayOfString,
         Object,
-        ArrayOfObject,
         Enum,
+        ArrayOfInt,
+        ArrayOfUInt,
+        ArrayOfUInt64,
+        ArrayOfFloat,
+        ArrayOfDouble,
+        ArrayOfString,
+        ArrayOfObject,
         OptionalBool,
         OptionalInt,
         OptionalUInt,
@@ -254,6 +259,18 @@ struct Field
         return res;
     }
 
+    // ntc::Vector<int> v;
+    template<typename ParentType>
+    static constexpr Field ArrayOfInt(char const* name, ntc::Vector<int> ParentType::* ptr)
+    {
+        Field res;
+        res.name = name;
+        res.type = Type::ArrayOfInt;
+        res.offset = GetMemberOffset(ptr);
+        res.required = false;
+        return res;
+    }
+
     // std::optional<int> i;
     template<typename ParentType>
     static constexpr Field OptionalInt(char const* name, std::optional<int> ParentType::* ptr)
@@ -276,6 +293,18 @@ struct Field
         res.offset = GetMemberOffset(ptr);
         res.validateFunc = validateFunc;
         res.required = true;
+        return res;
+    }
+
+    // ntc::Vector<uint32_t> v;
+    template<typename ParentType>
+    static constexpr Field ArrayOfUInt(char const* name, ntc::Vector<uint32_t> ParentType::* ptr)
+    {
+        Field res;
+        res.name = name;
+        res.type = Type::ArrayOfUInt;
+        res.offset = GetMemberOffset(ptr);
+        res.required = false;
         return res;
     }
 
@@ -303,6 +332,18 @@ struct Field
         return res;
     }
 
+    // ntc::Vector<uint64_t> v;
+    template<typename ParentType>
+    static constexpr Field ArrayOfUInt64(char const* name, ntc::Vector<uint64_t> ParentType::* ptr)
+    {
+        Field res;
+        res.name = name;
+        res.type = Type::ArrayOfUInt64;
+        res.offset = GetMemberOffset(ptr);
+        res.required = false;
+        return res;
+    }
+
     // std::optional<uint64_t> u;
     template<typename ParentType>
     static constexpr Field OptionalUInt64(char const* name, std::optional<uint64_t> ParentType::* ptr)
@@ -327,6 +368,18 @@ struct Field
         return res;
     }
 
+    // ntc::Vector<float> v;
+    template<typename ParentType>
+    static constexpr Field ArrayOfFloat(char const* name, ntc::Vector<float> ParentType::* ptr)
+    {
+        Field res;
+        res.name = name;
+        res.type = Type::ArrayOfFloat;
+        res.offset = GetMemberOffset(ptr);
+        res.required = false;
+        return res;
+    }
+
     // std::optional<float> f;
     template<typename ParentType>
     static constexpr Field OptionalFloat(char const* name, std::optional<float> ParentType::* ptr)
@@ -348,6 +401,18 @@ struct Field
         res.type = Type::Double;
         res.offset = GetMemberOffset(ptr);
         res.required = true;
+        return res;
+    }
+
+    // ntc::Vector<double> v;
+    template<typename ParentType>
+    static constexpr Field ArrayOfDouble(char const* name, ntc::Vector<double> ParentType::* ptr)
+    {
+        Field res;
+        res.name = name;
+        res.type = Type::ArrayOfDouble;
+        res.offset = GetMemberOffset(ptr);
+        res.required = false;
         return res;
     }
 

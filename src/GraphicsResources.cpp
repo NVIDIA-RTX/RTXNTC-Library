@@ -59,6 +59,7 @@ GraphicsResources::GraphicsResources(ContextParameters const& params)
 
             LOAD_DEVICE_FN(vkCmdConvertCooperativeVectorMatrixNV);
             LOAD_DEVICE_FN(vkCmdCopyBuffer);
+            LOAD_DEVICE_FN(vkCmdDecompressMemoryNV);
             LOAD_DEVICE_FN(vkConvertCooperativeVectorMatrixNV);
             LOAD_DEVICE_FN(vkGetBufferDeviceAddress);
 

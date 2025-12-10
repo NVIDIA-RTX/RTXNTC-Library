@@ -50,9 +50,9 @@ public:
 
     uint16_t* GetEncodedPixelsDevicePtr(int neuralLod);
 
-    uint16_t* GetEncodedPixelsHostPtr(int neuralLod);
+    uint16_t* GetEncodedPixelsHostPtr(int neuralLod, int layerIndex);
 
-    size_t GetEncodedPixelsSize(int neuralLod);
+    size_t GetEncodedPixelsSizePerLayer(int neuralLod);
 
     uint32_t* GetGradientMaskDevicePtr();
 

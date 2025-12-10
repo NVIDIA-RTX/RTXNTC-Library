@@ -16,7 +16,7 @@
 #include <memory>
 #include <array>
 #include <optional>
-#include "MlpDesc.h"
+#include "WeightLayout.h"
 
 namespace ntc
 {
@@ -84,15 +84,25 @@ public:
     
     bool IsCooperativeVectorSupported() const override;
 
+    Status DecompressBuffer(CompressionType compressionType, void const* pCompressedData, size_t compressedSize,
+        void* pOutDecompressedData, size_t outputBufferSize, uint32_t expectedCrc32) const override;
+    
+    Status DecompressGDeflateOnVulkanGPU(void* commandBuffer,
+        void const* pCompressedHeader, size_t compressedHeaderSize,
+        uint64_t compressedGpuVA, uint64_t decompressedGpuVA) const override;
+
     GraphicsResources const* GetGraphicsResources() const { return m_graphicsResources; }
 
     WeightLayout const* GetWeightLayout(InferenceWeightType weightType) const;
+
+    WeightLayout const& GetFP16WeightLayout() const { return m_fp16WeightLayout; }
 
 private:
     IAllocator* m_allocator;
     int m_cudaDevice = -1;
     GraphicsResources* m_graphicsResources = nullptr;
     std::array<std::optional<WeightLayout>, size_t(InferenceWeightType::Count) - 1> m_weightLayouts{};
+    WeightLayout m_fp16WeightLayout;
 
     static int GetWeightLayoutArrayIndex(InferenceWeightType weightType);
 };

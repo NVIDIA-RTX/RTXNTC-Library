@@ -11,10 +11,12 @@
  */
 
 #include "TextureSet.h"
+#include "BinaryChunkBuilder.h"
 #include "Context.h"
 #include "CudaDeviceGuard.h"
 #include "CudaRandomGen.h"
 #include "Errors.h"
+#include "GDeflate.h"
 #include "JsonFileFormat.h"
 #include "MathUtils.h"
 #include "MlpDesc.h"
@@ -26,88 +28,6 @@
 #include <cassert>
 #include <cinttypes>
 
-/* Note on the data formats and layouts used in various places...
-
-=== Training and CUDA decompression ===
-
-Training and CUDA decompression use FP16 weights and bias vectors. They are stored in the `m_mlpWeightsBase`
-and `m_mlpWeightsQuantized` arrays. The "Base" array contains non-quantized weights that are used by the optimizer:
-it takes the gradients from the regression kernel and applies them to the base weights. The "Quantized" weights are
-used by the regression kernel. They are produced by the optimizer and at that point are not yet quantized. They become
-quantized on the next step using the `QuantizeNetwork` calls in the final part of the training session.
-
-Both of these arrays contain two copies of weights: the first set at offset 0 that get FP8 quantization, and 
-the second set at offset `m_numNetworkParams` that get the Int8 quantization.
-
-There are two parts in each set of weights: the actual layer weights, and the bias vectors. The layer weights are
-stored in the obscure "MMA" layout that is compatible with the tensor core matrix multiplication operations. Their size
-is equal to the number of elements in all layer matrices, i.e. there are no holes in the layout. Weights for layer 0
-are immediately followed by weights for layer 1, and so on until layer 3. After the matrix weights, all bias vectors
-are stored consecutively: dense bias vector for layer 0, followed by bias for layer 1, and so on until layer 3.
-
-The FP16 weights and bias vectors are converted into the Int8 or FP8 format and row-major layout by the
-`QuantizeNetwork` function after training is complete. These Int8 or FP8 weights are stored in the NTC files.
-Before CUDA decompression, these low-precision weights are converted back into FP16 using the
-`ConvertNetworkFromQuantizedToFp16` function.
-
-=== Int8 inference ===
-
-The Int8 inference weights are available in one generic layout that works for DP4a based inference on any GPU.
-
-The weights package contains three components: the matrix weights, the scale vectors, and the bias vectors. The matrix
-weights for all layers are stored in Int8 format and densely packed one after another. Then the scale vectors for all
-layers are stored in Float32 format and are densely packed one after another. Finally, the bias vectors for all layers
-are stored in Int32 format and also densely packed.
-
-=== FP8 inference ===
-
-Technically, it's hybrid FP8 and Int8 inference: layers 0-2 are using FP8 weights, and the output layer uses Int8
-weights. This is done to improve the output precision, which is lacking with FP8 because that format cannot even
-represent all integers in the range 0-255.
-
-FP8 weights come in two flavors, the generic one (with row-major matrices) and the CoopVec specific one. The generic
-weights are only used for storage, and not used by any GPU for inference because there are currently no scalar FP8
-operations in GPUs.  The CoopVec weights are derived from the generic weights when the texture set is loaded from disk.
-See `TextureSetMetadata::LoadWeightsFromStream`, `TextureSetMetadata::ConvertWeightsForCoopVec` and
-`CoopVecWeightConverter.cpp`.
-
-The generic weights contain the weight matrices, bias and scale vectors. They are laid out in the following order:
-- Weight matrices for layers 0-2 using the FP8 type, in row-major layout
-- Weight matrices for layer 3 using the Int8 type, in row-major layout
-- Bias vectors for layers 0-2 using the FP16 type
-- Scale vector for layer 3 using the FP32 type
-- Bias vector for layer 3 using the Int32 type
-
-The CoopVec weights follow the same general layout. The matrix weights are converted to the CoopVec-compatible
-layout on load, which is normally larger than the dense row-major layout.
-
-=== Important code locations using these layouts ===
-
-                                                 | FP16 | GI8* | GFP8 | CVFP8 |
--------------------------------------------------+------+------+------+-------+
-CUDA training and inference                      |      |      |      |       |
-    RegressionKernels.h                          |  X   |      |      |       |
-Weight quantization and conversion               |      |      |      |       |
-    Quantizer.cu                                 |  X   |  X   |  X   |       |
-Serialization                                    |      |      |      |       |
-    TextureSet::SaveToStream                     |      |  X   |  X   |       |
-Deserialization                                  |      |      |      |       |
-    TextureSetMetadata::LoadWeightsFromStream    |      |  X   |  X   |       |
-CoopVec layout conversion                        |      |      |      |       |
-    TextureSetMetadata::ConvertWeightsForCoopVec |      |  X   |  X   |   X   |
-    CoopVecWeightConverter.cpp                   |      |  X   |  X   |   X   |
-GAPI decompression                               |      |      |      |       |
-    * DecompressINT8.hlsl                        |      |  X   |      |       |
-    * DecompressCoopVecFP8.slang                 |      |      |      |   X   |
-GAPI inference                                   |      |      |      |       |
-    * Inference.hlsli                            |      |  X   |      |       |
-    * InferenceCoopVec.hlsli                     |      |      |      |   X   |
-
-[*] GI8 = GenericInt8, GFP8 = GenericFP8, CVFP8 = CoopVecFP8
-
-These layout descriptions and names match the InferenceWeightType enum declared in ntc.h
-
-*/
 namespace ntc
 {
 
@@ -314,11 +234,56 @@ Status TextureSet::LoadFromStreamPostHeader(json::Document const& document, uint
     for (int neuralLod = 0; neuralLod < m_featureGrid.GetNumMipLevels(); ++neuralLod)
     {
         json::LatentImage const& latentImage = document.latents[neuralLod];
-        
-        if (!ReadViewFromStream(inputStream, document, latentImage.view,
-            m_featureGrid.GetEncodedPixelsHostPtr(neuralLod),
-            m_featureGrid.GetEncodedPixelsSize(neuralLod)))
-            return Status::IOError;
+        for (int layerIndex = 0; layerIndex < m_featureGrid.GetNumLayers(); ++layerIndex)
+        {
+            uint32_t viewIndex = latentImage.layerViews[layerIndex];
+            json::BufferView const& view = document.views[viewIndex];
+            CompressionType compression = view.compression.value_or(CompressionType::None);
+
+            if (compression == CompressionType::GDeflate)
+            {
+                Vector<uint8_t> compressedData(m_allocator);
+                compressedData.resize(view.storedSize);
+                if (!ReadViewFromStream(inputStream, document, viewIndex, compressedData.data(), compressedData.size()))
+                    return Status::IOError;
+
+                ntc::Status status = DecompressGDeflate(
+                    compressedData.data(),
+                    compressedData.size(),
+                    m_featureGrid.GetEncodedPixelsHostPtr(neuralLod, layerIndex),
+                    m_featureGrid.GetEncodedPixelsSizePerLayer(neuralLod),
+                    m_allocator,
+                    view.crc32.value_or(0));
+
+                if (status != Status::Ok)
+                {
+                    return status;
+                }
+            }
+            else if (compression == CompressionType::None)
+            {
+                if (!ReadViewFromStream(inputStream, document, viewIndex,
+                    m_featureGrid.GetEncodedPixelsHostPtr(neuralLod, layerIndex),
+                    m_featureGrid.GetEncodedPixelsSizePerLayer(neuralLod)))
+                    return Status::IOError;
+                }
+            else
+            {
+                SetErrorMessage("Latent image view %d has unsupported compression type %d.",
+                    viewIndex, int(compression));
+                return Status::FileUnrecognized;
+            }
+        }
+    }
+
+    // BC7 mode buffers.
+    // They're likely not needed right away, but we need to load them now in case the texture set will be saved later.
+    for (auto& textureInfo : m_textureInfos)
+    {
+        // The stream ranges were already loaded in LoadMetadataFromStream
+       status = textureInfo->LoadBC7ModeBuffers(inputStream);
+       if (status != Status::Ok)
+           return status;
     }
 
     // Deserialized network is equivalent to one that's just completed training, both can be decompressed.
@@ -384,8 +349,7 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape)
     }
     
     // Trainable MLP parameters: weights and bias. No scales at training time, they are added during quantization.
-    MlpDesc const& mlpDesc = MlpDesc::Get();
-    m_numNetworkParams = mlpDesc.GetWeightCount() + mlpDesc.GetLayerOutputCount();
+    m_numNetworkParams = MlpDesc::GetTotalWeightCount() + MlpDesc::GetTotalOutputCount();
 
     if (!m_mlpWeightsQuantized.Allocate(m_numNetworkParams * 2))
     {
@@ -478,7 +442,7 @@ Status TextureSet::SetLatentShape(LatentShape const& newShape)
     m_latentImages.clear();
     for (int neuralLod = 0; neuralLod < m_featureGrid.GetNumMipLevels(); ++neuralLod)
     {
-        LatentImageDesc& imageDesc = m_latentImages.emplace_back();
+        LatentImageDesc& imageDesc = m_latentImages.emplace_back(m_allocator);
         imageDesc.width = FeatureGridMath::GetGridDimension(m_desc.width, neuralLod, m_latentShape.gridSizeScale);
         imageDesc.height = FeatureGridMath::GetGridDimension(m_desc.height, neuralLod, m_latentShape.gridSizeScale);
     }
@@ -510,9 +474,13 @@ uint64_t TextureSet::GetOutputStreamSize()
     // Texture names and BC acceleration data
     for (const auto& info : m_textureInfos)
     {
-        size_t bcDataSize = 0;
-        info->GetBlockCompressionModeHistogram(nullptr, &bcDataSize);
-        size += info->GetNameString().size() + bcDataSize;
+        size += info->GetNameString().size();
+        for (int mipLevel = 0; mipLevel < m_desc.mips; ++mipLevel)
+        {
+            size_t mipLevelModeBufferSize = 0;
+            info->GetBC7ModeBuffer(mipLevel, nullptr, &mipLevelModeBufferSize);
+            size += mipLevelModeBufferSize;
+        }
     }
     
     // MLP
@@ -527,19 +495,7 @@ uint64_t TextureSet::GetOutputStreamSize()
     return size;
 }
 
-// If the current output position in the stream is not a multiple of 4 bytes, write some zeros until it is.
-// Note: alignment of MLP and latent data in the stream is important for GAPI decompression, so that 
-// we can load the entire file into a RawAddressBuffer and safely read uint's from it on the GPU.
-static bool PadStreamTo4Bytes(IStream* outputStream)
-{
-    uint64_t actualOffset = outputStream->Tell();
-    uint32_t padding = 0;
-    if (actualOffset & 3)
-        return outputStream->Write(&padding, 4 - (actualOffset & 3));
-    return true;
-}
-
-Status TextureSet::SaveToStream(IStream* outputStream)
+Status TextureSet::SaveToStream(IStream* outputStream, LosslessCompressionStats* pOutCompressionStats)
 {
     if (!outputStream)
     {
@@ -553,6 +509,8 @@ Status TextureSet::SaveToStream(IStream* outputStream)
             NetworkStateToString(m_networkState));
         return Status::InvalidState;
     }
+    
+    BinaryChunkBuilder builder(m_allocator, m_losslessCompression);
 
     json::Document document(m_allocator);
     document.width = m_desc.width;
@@ -573,36 +531,30 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     mlpFP8.activation = json::ActivationType::HGELUClamp;
     mlpFP8.weightLayout = json::MatrixLayout::RowMajor;
 
-    uint64_t binaryChunkSize = 0;
-    auto appendView = [&document, &binaryChunkSize](uint64_t size) {
-        uint32_t const viewIndex = uint32_t(document.views.size());
-        json::BufferView& view = document.views.emplace_back(document.allocator);
-        view.offset = binaryChunkSize;
-        view.storedSize = size;
-        binaryChunkSize += RoundUp4(size);
-        return viewIndex;
-    };
-
     WeightLayout const* weightLayoutInt8 = m_context->GetWeightLayout(InferenceWeightType::GenericInt8);
     assert(weightLayoutInt8);
 
     WeightLayout const* weightLayoutFP8 = m_context->GetWeightLayout(InferenceWeightType::GenericFP8);
     assert(weightLayoutFP8);
 
-    MlpDesc const& mlpDesc = MlpDesc::Get();
-
     // Fill out the MLP layers - Int8
     for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
     {
         json::MLPLayer& layer = mlpInt8.layers.emplace_back(m_allocator);
-        layer.inputChannels = mlpDesc.GetLayerInputChannels(layerIndex);
-        layer.outputChannels = mlpDesc.GetLayerOutputChannels(layerIndex);
+        layer.inputChannels = MlpDesc::GetLayerInputChannels(layerIndex);
+        layer.outputChannels = MlpDesc::GetLayerOutputChannels(layerIndex);
         layer.weightType = json::MlpDataType::Int8;
         layer.scaleType = json::MlpDataType::Float32;
         layer.biasType = json::MlpDataType::Int32;
-        layer.weightView = appendView(weightLayoutInt8->weights[layerIndex].size);
-        layer.scaleView = appendView(weightLayoutInt8->scales[layerIndex].size);
-        layer.biasView = appendView(weightLayoutInt8->biases[layerIndex].size);
+        layer.weightView = builder.AllocateViewAndRegisterData(m_mlpDataInt8.HostPtrOffset(
+            weightLayoutInt8->weights[layerIndex].offset),
+            weightLayoutInt8->weights[layerIndex].size, false);
+        layer.scaleView = builder.AllocateViewAndRegisterData(m_mlpDataInt8.HostPtrOffset(
+            weightLayoutInt8->scales[layerIndex].offset),
+            weightLayoutInt8->scales[layerIndex].size, false);
+        layer.biasView = builder.AllocateViewAndRegisterData(m_mlpDataInt8.HostPtrOffset(
+            weightLayoutInt8->biases[layerIndex].offset),
+            weightLayoutInt8->biases[layerIndex].size, false);
     }
 
     // Fill out the MLP layers - FP8
@@ -611,16 +563,20 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
     {
         json::MLPLayer& layer = mlpFP8.layers.emplace_back(m_allocator);
-        layer.inputChannels = mlpDesc.GetLayerInputChannels(layerIndex);
-        layer.outputChannels = mlpDesc.GetLayerOutputChannels(layerIndex);
-        layer.weightView = appendView(weightLayoutFP8->weights[layerIndex].size);
+        layer.inputChannels = MlpDesc::GetLayerInputChannels(layerIndex);
+        layer.outputChannels = MlpDesc::GetLayerOutputChannels(layerIndex);
+        layer.weightView = builder.AllocateViewAndRegisterData(m_mlpDataFP8.HostPtrOffset(
+            weightLayoutFP8->weights[layerIndex].offset),
+            weightLayoutFP8->weights[layerIndex].size, false);
 
         if (layerIndex == NTC_MLP_LAYERS - 1)
         {
             layer.weightType = json::MlpDataType::Int8;
             layer.scaleType = json::MlpDataType::Float32;
             layer.biasType = json::MlpDataType::Int32;
-            layer.scaleView = appendView(weightLayoutFP8->scales[layerIndex].size);
+            layer.scaleView = builder.AllocateViewAndRegisterData(m_mlpDataFP8.HostPtrOffset(
+                weightLayoutFP8->scales[layerIndex].offset),
+                weightLayoutFP8->scales[layerIndex].size, false);
         }
         else
         {
@@ -628,7 +584,9 @@ Status TextureSet::SaveToStream(IStream* outputStream)
             layer.biasType = json::MlpDataType::Float16;
         }
 
-        layer.biasView = appendView(weightLayoutFP8->biases[layerIndex].size);
+        layer.biasView = builder.AllocateViewAndRegisterData(m_mlpDataFP8.HostPtrOffset(
+            weightLayoutFP8->biases[layerIndex].offset),
+            weightLayoutFP8->biases[layerIndex].size, false);
     }
 
     // Fill out the textures
@@ -648,16 +606,7 @@ Status TextureSet::SaveToStream(IStream* outputStream)
 
         if (info->GetBlockCompressedFormat() != BlockCompressedFormat::None)
             texture.bcFormat = info->GetBlockCompressedFormat();
-
-        if (info->GetBlockCompressionQuality() != BlockCompressionMaxQuality)
-            texture.bcQuality = info->GetBlockCompressionQuality();
-
-        if (info->HasBlockCompressionAccelerationData())
-        {
-            size_t bcDataSize = 0;
-            info->GetBlockCompressionModeHistogram(nullptr, &bcDataSize);
-            texture.bcAccelerationDataView = appendView(bcDataSize);
-        }
+        
     }
 
     // Fill out the channels
@@ -675,9 +624,17 @@ Status TextureSet::SaveToStream(IStream* outputStream)
         json::LatentImage& image = document.latents.emplace_back(m_allocator);
         image.width = src.width;
         image.height = src.height;
-        image.arraySize = m_featureGrid.GetNumLayers();
-        size_t const pixelsSize = m_featureGrid.GetEncodedPixelsSize(neuralLod);
-        image.view = appendView(pixelsSize);
+
+        size_t const pixelsSize = m_featureGrid.GetEncodedPixelsSizePerLayer(neuralLod);
+        for (int layerIndex = 0; layerIndex < m_featureGrid.GetNumLayers(); ++layerIndex)
+        {
+            uint32_t const viewIndex = builder.AllocateViewAndRegisterData(
+                m_featureGrid.GetEncodedPixelsHostPtr(neuralLod, layerIndex),
+                m_featureGrid.GetEncodedPixelsSizePerLayer(neuralLod),
+                m_losslessCompression.compressLatents);
+
+            image.layerViews.push_back(viewIndex);
+        }
     }
 
     // Fill out the color MIP descriptors
@@ -690,6 +647,29 @@ Status TextureSet::SaveToStream(IStream* outputStream)
         mip.positionLod = m_colorMips[mipLevel].positionLod;
         mip.positionScale = m_colorMips[mipLevel].positionScale;
     }
+
+    // Allocate views for the texture BC7 mode buffers - it's probably better to keep them at the end of the file
+    for (size_t textureIndex = 0; textureIndex < m_textureInfos.size(); ++textureIndex)
+    {
+        json::Texture& texture = document.textures[textureIndex];
+        TextureMetadata& info = *m_textureInfos[textureIndex];
+
+        for (int mipLevel = 0; mipLevel < m_desc.mips; ++mipLevel)
+        {
+            ModeBufferInfo const* versions = info.GetModeBufferInfo(mipLevel);
+            if (!versions || versions->data.empty())
+                continue;
+
+            json::BCModeBuffer& bc7ModeBuffer = texture.bcModeBuffers.emplace_back(m_allocator);
+            bc7ModeBuffer.mipLevel = mipLevel;
+            bc7ModeBuffer.view = builder.AllocateViewAndRegisterData(versions->data.data(),
+                versions->data.size(), m_losslessCompression.compressBCModeBuffers);
+        }
+    }
+
+    // Export the view information from the builder into the JSON document.
+    // This has to be done after all the views have been allocated.
+    builder.WriteViewInfosToDocument(document);
 
     // Serialize the document into a JSON string
     String jsonString(m_allocator);
@@ -706,7 +686,7 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     header.jsonChunkOffset = sizeof(json::FileHeader);
     header.jsonChunkSize = jsonString.size() + 1;
     header.binaryChunkOffset = RoundUp4(header.jsonChunkOffset + header.jsonChunkSize);
-    header.binaryChunkSize = binaryChunkSize;
+    header.binaryChunkSize = builder.GetBinaryChunkSize();
 
     if (!outputStream->Write(&header, sizeof(header)))
         return Status::IOError;
@@ -714,96 +694,8 @@ Status TextureSet::SaveToStream(IStream* outputStream)
     if (!outputStream->Write(jsonString.c_str(), jsonString.size() + 1))
         return Status::IOError;
 
-    if (!PadStreamTo4Bytes(outputStream))
+    if (!builder.WriteAllViewsToStream(outputStream, header.binaryChunkOffset))
         return Status::IOError;
-
-    auto validateOffset = [&document, &header, &outputStream](uint32_t view) {
-        uint64_t expectedOffset = document.views[view].offset + header.binaryChunkOffset;
-        uint64_t actualOffset = outputStream->Tell();
-        assert(actualOffset == expectedOffset);
-    };
-
-    // Write the MLP data
-
-    auto writeMlpData = [this, &outputStream, &validateOffset]
-    (json::MLP const& mlp, DeviceAndHostArray<uint8_t>& buffer, WeightLayout const* weightLayout)
-    {
-        for (int layerIndex = 0; layerIndex < NTC_MLP_LAYERS; ++layerIndex)
-        {
-            json::MLPLayer const& layer = mlp.layers[layerIndex];
-
-            validateOffset(layer.weightView);
-
-            Span const& layerWeights = weightLayout->weights[layerIndex];
-            Span const& layerScale = weightLayout->scales[layerIndex];
-            Span const& layerBias = weightLayout->biases[layerIndex];
-
-            if (!outputStream->Write(buffer.HostPtr() + layerWeights.offset, layerWeights.size))
-                return Status::IOError;
-            if (!PadStreamTo4Bytes(outputStream))
-                return Status::IOError;
-
-            if (layer.scaleView.has_value())
-            {
-                validateOffset(*layer.scaleView);
-                if (!outputStream->Write(buffer.HostPtr() + layerScale.offset, layerScale.size))
-                    return Status::IOError;
-            }
-
-            validateOffset(layer.biasView);
-
-            if (!outputStream->Write(buffer.HostPtr() + layerBias.offset, layerBias.size))
-                return Status::IOError;
-        }
-
-        return Status::Ok;
-    };
-
-    Status status = writeMlpData(mlpInt8, m_mlpDataInt8, weightLayoutInt8);
-    if (status != Status::Ok)
-        return status;
-
-    status = writeMlpData(mlpFP8, m_mlpDataFP8, weightLayoutFP8);
-    if (status != Status::Ok)
-        return status;
-    
-    // Write the texture BC data
-    for (int textureIndex = 0; textureIndex < int(m_textureInfos.size()); ++textureIndex)
-    {
-        auto const& info = m_textureInfos[textureIndex];
-        json::Texture const& texture = document.textures[textureIndex];
-
-        void const* bcData = nullptr;
-        size_t bcDataSize = 0;
-        info->GetBlockCompressionModeHistogram(&bcData, &bcDataSize);
-
-        if (bcDataSize != 0)
-        {
-            assert(texture.bcAccelerationDataView.has_value());
-            validateOffset(*texture.bcAccelerationDataView);
-         
-            if (!outputStream->Write(bcData, bcDataSize))
-                return Status::IOError;
-            if (!PadStreamTo4Bytes(outputStream))
-                return Status::IOError;
-        }
-    }
-
-    // Write the latents data
-    for (int neuralLod = 0; neuralLod < m_featureGrid.GetNumMipLevels(); ++neuralLod)
-    {
-        json::LatentImage const& image = document.latents[neuralLod];
-        
-        validateOffset(image.view);
-
-        if (!outputStream->Write(
-            m_featureGrid.GetEncodedPixelsHostPtr(neuralLod),
-            m_featureGrid.GetEncodedPixelsSize(neuralLod)))
-            return Status::IOError;
-            
-        if (!PadStreamTo4Bytes(outputStream))
-            return Status::IOError;
-    }
 
     // Verify that we've written no more than the number of bytes predicted by GetOutputStreamSize
     uint64_t expectedSize = GetOutputStreamSize();
@@ -815,6 +707,9 @@ Status TextureSet::SaveToStream(IStream* outputStream)
             "predicted no more than %" PRIu64 " bytes.", actualSize, expectedSize);
         return Status::InternalError;
     }
+
+    if (pOutCompressionStats)
+        *pOutCompressionStats = builder.GetStatistics();
 
     ClearErrorMessage();
     return Status::Ok;
@@ -849,7 +744,7 @@ Status TextureSet::LoadFromStream(IStream* stream)
     return LoadFromStreamPostHeader(document, binaryChunkOffset, binaryChunkSize, stream, latentShape);
 }
 
-Status TextureSet::SaveToMemory(void *pData, size_t* pSize)
+Status TextureSet::SaveToMemory(void *pData, size_t* pSize, LosslessCompressionStats* pOutCompressionStats)
 {
     if (!pSize)
     {
@@ -863,7 +758,7 @@ Status TextureSet::SaveToMemory(void *pData, size_t* pSize)
     if (status != Status::Ok)
         return status;
 
-    status = SaveToStream(stream);
+    status = SaveToStream(stream, pOutCompressionStats);
     if (status != Status::Ok)
         return status;
 
@@ -883,7 +778,7 @@ Status TextureSet::LoadFromMemory(void const *pData, size_t size)
     return LoadFromStream(stream);
 }
 
-Status TextureSet::SaveToFile(char const *fileName)
+Status TextureSet::SaveToFile(char const *fileName, LosslessCompressionStats* pOutCompressionStats)
 {
     FileStreamWrapper stream(m_context);
 
@@ -891,7 +786,7 @@ Status TextureSet::SaveToFile(char const *fileName)
     if (status != Status::Ok)
         return status;
         
-    return SaveToStream(stream);
+    return SaveToStream(stream, pOutCompressionStats);
 }
 
 Status TextureSet::LoadFromFile(char const *fileName)
@@ -903,6 +798,38 @@ Status TextureSet::LoadFromFile(char const *fileName)
         return status;
         
     return LoadFromStream(stream);
+}
+
+Status TextureSet::ConfigureLosslessCompression(LosslessCompressionSettings const& params)
+{
+    switch(params.algorithm)
+    {
+    case CompressionType::None:
+        break;
+
+    case CompressionType::GDeflate:
+        if (params.compressionLevel < 0 || params.compressionLevel > 12)
+        {
+            SetErrorMessage("For GDeflate, compressionLevel (%d) must be between 0 and 12.");
+            return Status::InvalidArgument;
+        }
+        break;
+
+    default:
+        SetErrorMessage("Unrecognized algorithm value %d.", int(params.algorithm));
+        return Status::InvalidArgument;
+    }
+
+    if (params.compressionRatioThreshold <= 0.f || params.compressionRatioThreshold > 1.f)
+    {
+        SetErrorMessage("compressionRatioThreshold (%.2f) must be between 0 and 1.");
+        return Status::InvalidArgument;
+    }
+
+    m_losslessCompression = params;
+
+    ClearErrorMessage();
+    return Status::Ok;
 }
 
 Status TextureSet::WriteChannels(WriteChannelsParameters const& params)
@@ -1300,12 +1227,10 @@ Status TextureSet::BeginCompression(const CompressionSettings& settings)
     // Fill the layers' data with normal distributed random numbers
     int weightOffset = 0;
 
-    MlpDesc const& mlpDesc = MlpDesc::Get();
-    
     for (int i = 0; i < NTC_MLP_LAYERS; i++)
     {
-        int const inputs = mlpDesc.GetLayerInputChannels(i);
-        int const outputs = mlpDesc.GetLayerOutputChannels(i);
+        int const inputs = MlpDesc::GetLayerInputChannels(i);
+        int const outputs = MlpDesc::GetLayerOutputChannels(i);
         int const layerWeights = inputs * outputs;
 
         float scale = sqrtf(2.f / float(inputs));
@@ -1427,8 +1352,6 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         size_t(m_compressionSettings.kPixelsPerBatch) * c_PixelsPerKPixel);
     bool const stableTraining = m_compressionSettings.stableTraining;
 
-    MlpDesc const& mlpDesc = MlpDesc::Get();
-
     uint32_t validMask = GetValidChannelMask();
     
     for (; m_currentStep < finalStepCount; ++m_currentStep)
@@ -1483,8 +1406,13 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
 
         if (quantizeWeightsInt8 || quantizeWeightsFP8)
         {
+            WeightLayout const* weightLayout = m_context->GetWeightLayout(
+                quantizeWeightsFP8 ? InferenceWeightType::GenericFP8 : InferenceWeightType::GenericInt8);
+            assert(weightLayout);
+
             cuda::QuantizeNetwork(
-                mlpDesc,
+                m_context->GetFP16WeightLayout(),
+                *weightLayout,
                 m_mlpWeightsQuantized.DevicePtr() + networkWeightOffset,
                 /* outputData = */ nullptr, // We don't need the quantized weights and scales mid-training,
                                             // only for the final output
@@ -1528,7 +1456,7 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         {
             size_t const sliceSize = TILE_SIZE_X * TB_SIZE_Y;
             size_t gradientSlices = (pixelsPerBatch + sliceSize - 1) / sliceSize;
-            int numNetworkParams = mlpDesc.GetWeightCount() + mlpDesc.GetLayerOutputCount();
+            int numNetworkParams = MlpDesc::GetTotalWeightCount() + MlpDesc::GetTotalOutputCount();
 
             cuda::ReduceNetworkGrad(
                 numNetworkParams,
@@ -1682,19 +1610,23 @@ Status TextureSet::FinalizeCompression()
         return Status::CudaError;
     }
 
-    MlpDesc const& mlpDesc = MlpDesc::Get();
-
     // Quantize and compute FP8 weights, scale and bias values
+    WeightLayout const* weightLayoutFP8 = m_context->GetWeightLayout(InferenceWeightType::GenericFP8);
+    assert(weightLayoutFP8);
     cuda::QuantizeNetwork(
-        mlpDesc,
+        m_context->GetFP16WeightLayout(),
+        *weightLayoutFP8,
         m_mlpWeightsQuantized.DevicePtr(),
         (int8_t*)m_mlpDataFP8.DevicePtr(),
         /* useFP8 = */ true
     );
 
     // Quantize and compute Int8 weights, scale and bias values
+    WeightLayout const* weightLayoutInt8 = m_context->GetWeightLayout(InferenceWeightType::GenericInt8);
+    assert(weightLayoutInt8);
     cuda::QuantizeNetwork(
-        mlpDesc,
+        m_context->GetFP16WeightLayout(),
+        *weightLayoutInt8,
         m_mlpWeightsQuantized.DevicePtr() + m_numNetworkParams,
         (int8_t*)m_mlpDataInt8.DevicePtr(),
         /* useFP8 = */ false
@@ -1756,8 +1688,6 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useInt8Weights
     if (!cudaGuard.Success())
         return Status::CudaError;
         
-    MlpDesc const& mlpDesc = MlpDesc::Get();
-
     if (m_networkState != TextureSetNetworkState::TrainingInProgress &&
         m_networkState != TextureSetNetworkState::TrainingFinished)
     {
@@ -1802,8 +1732,11 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useInt8Weights
         cudaMemset(m_mlpWeightsQuantized.DevicePtr(), 0, m_mlpWeightsQuantized.Size());
 
         // Convert the FP8 weights to FP16 in the MMA layout for CUDA decompression to work
+        WeightLayout const* weightLayoutFP8 = m_context->GetWeightLayout(InferenceWeightType::GenericFP8);
+        assert(weightLayoutFP8);
         cuda::ConvertNetworkFromQuantizedToFp16(
-            mlpDesc,
+            m_context->GetFP16WeightLayout(),
+            *weightLayoutFP8,
             m_mlpWeightsQuantized.DevicePtr(),
             (int8_t*)m_mlpDataFP8.DevicePtr(),
             /* useFP8 = */ true
@@ -1811,8 +1744,11 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useInt8Weights
 
         // Convert the Int8 weights to FP16 into the second page of the FP16 MLP data,
         // in case we want to decompress using those for validation
+        WeightLayout const* weightLayoutInt8 = m_context->GetWeightLayout(InferenceWeightType::GenericInt8);
+        assert(weightLayoutInt8);
         cuda::ConvertNetworkFromQuantizedToFp16(
-            mlpDesc,
+            m_context->GetFP16WeightLayout(),
+            *weightLayoutInt8,
             m_mlpWeightsQuantized.DevicePtr() + m_numNetworkParams,
             (int8_t*)m_mlpDataInt8.DevicePtr(),
             /* useFP8 = */ false
