@@ -33,16 +33,10 @@
     template<ArgType1 ArgName1, ArgType2 ArgName2, ArgType3 ArgName3> ReturnType FnName
 #endif
 
-float16_t2 NtcUintToHalf2(uint u)
-{
-    return asfloat16(uint16_t2(uint16_t(u), uint16_t(u >> 16)));
-}
-
-uint NtcHalf2ToUint(float16_t2 h)
-{
-    uint16_t2 u = asuint16(h);
-    return uint(u.x) | (uint(u.y) << 16);
-}
+// Activation function parameters
+#define NTC_HGELU_MAXVALUE 3
+#define NTC_HGELU_INVSTEP 80
+#define NTC_HGELU_BIAS -113
 
 uint NtcPackInt8x4(int4 vec)
 {    
@@ -83,9 +77,9 @@ bool NtcSampleLatentGrid(
         
         float4 sampledValue = latentTexture.SampleLevel(latentSampler, float3(uv, layerIndex), neuralLod);
         sampledValue = sampledValue.bgra; // The texture format is BGRA4, unswizzle that
-        sampledValue = mask ? sampledValue * (2.f * c_InputScale) - c_InputScale : 0.f;
-
-        const uint packedValues = NtcPackInt8x4(int4(sampledValue));
+        sampledValue = mask ? sampledValue * (2.f * c_InputScale) - c_InputScale - 0.5f : 0.f;
+        
+        const uint packedValues = NtcPackInt8x4(int4(floor(sampledValue)));
         outputArray[featureOffset / 4 + layerIndex] = packedValues;
     }
 
@@ -125,55 +119,15 @@ void NtcEncodeSamplePosition(
     outputArray[idx] = packedLod;
 }
 
-struct NtcHGELUParams
-{
-    float maxval;
-    float invStep;
-    float bias;
-};
-
-NtcHGELUParams NtcGetHGELUParams()
-{
-    const float minval = -3.0 / 16.0;
-    const float maxval = 3.0;
-
-    const int bins = 256;
-    const float step = (maxval - minval) / float(bins - 1);
-    const float invStep = 1.0 / step;
-    const int qmax = int(maxval / step);
-    const int qmin = qmax - bins + 1;
-    const int bias = -(bins / 2) - qmin;
-
-    NtcHGELUParams params;
-    params.maxval = maxval;
-    params.invStep = invStep;
-    params.bias = bias;
-    return params;
-}
-
 // HGELU activation function with clamping, forward evaluation
-float16_t4 NtcHGELUClamp_ForwardHalf(float16_t4 x)
-{
-    const NtcHGELUParams params = NtcGetHGELUParams();
-    return min(x, float16_t(params.maxval)) * clamp(float16_t(1/3.f) * x + 0.5h, 0.h, 1.h);
-}
-
 float4 NtcHGELUClamp_ForwardFloat(float4 x)
 {
-    const NtcHGELUParams params = NtcGetHGELUParams();
-    return min(x, params.maxval) * clamp((1/3.f) * x + 0.5f, 0.f, 1.f);
-}
-
-int4 NtcHGELUClamp_QuantizeHalf(float16_t4 x)
-{
-    const NtcHGELUParams params = NtcGetHGELUParams();
-    return int4(round(x * float16_t(params.invStep) + float16_t(params.bias)));
+    return min(x, float(NTC_HGELU_MAXVALUE)) * saturate(mad(x, 0.333333f, 0.5f));
 }
 
 int4 NtcHGELUClamp_QuantizeFloat(float4 x)
 {
-    const NtcHGELUParams params = NtcGetHGELUParams();
-    return int4(round(x * params.invStep + params.bias));
+    return int4(round(x * float(NTC_HGELU_INVSTEP)) + float(NTC_HGELU_BIAS));
 }
 
 NTC_TEMPLATE_FN_3(void, NtcEvaluateLayerINT8, int, IN, int, OUT, bool, OUTPUT_LAYER)
@@ -181,59 +135,48 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayerINT8, int, IN, int, OUT, bool, OUTPUT_LA
     int weightOffset,
     int biasOffset,
     int scaleOffset,
-    bool activation,
     uint inputArray[IN / 4],
-    out uint outputArray[OUTPUT_LAYER ? OUT / 2 : OUT / 4]
+    out uint outputArray[OUTPUT_LAYER ? OUT : OUT / 4]
 )
 {
     // See the comment block in the beginning of WeightLayout.cpp for the weight layouts
 
-    // Note: not unrolling the outer loop.
-    // If we do, DXC/SPIR-V crashes.
-    // DXC/DXIL compiles the unrolled loop successfully, but then creating a pipeline with it takes seconds,
-    // and the resulting code works slower than a regular loop.
-    for (uint c = 0; c < OUT; c += 4)
+    // Note: not unrolling the outer loop for performance and smaller shaders.
+    [loop]
+    for (uint col = 0; col < OUT; col += 4)
     {
-        int4 biases = weightBuffer.Load<int4>(biasOffset + c * 4);
-        int acc0 = biases.x;
-        int acc1 = biases.y;
-        int acc2 = biases.z;
-        int acc3 = biases.w;
+        int4 acc = weightBuffer.Load<int4>(biasOffset + col * 4);
         
         [unroll]
-        for (uint k = 0; k < IN / 4; k++)
+        for (uint row4 = 0; row4 < IN / 4; row4++)
         {
-            const uint weights0 = weightBuffer.Load(weightOffset + (c + 0) * IN + k * 4);
-            const uint weights1 = weightBuffer.Load(weightOffset + (c + 1) * IN + k * 4);
-            const uint weights2 = weightBuffer.Load(weightOffset + (c + 2) * IN + k * 4);
-            const uint weights3 = weightBuffer.Load(weightOffset + (c + 3) * IN + k * 4);
+            const uint weights0 = weightBuffer.Load(weightOffset + (col + 0) * IN + row4 * sizeof(uint));
+            const uint weights1 = weightBuffer.Load(weightOffset + (col + 1) * IN + row4 * sizeof(uint));
+            const uint weights2 = weightBuffer.Load(weightOffset + (col + 2) * IN + row4 * sizeof(uint));
+            const uint weights3 = weightBuffer.Load(weightOffset + (col + 3) * IN + row4 * sizeof(uint));
             
-            acc0 = dot4add_i8packed(inputArray[k], weights0, acc0);
-            acc1 = dot4add_i8packed(inputArray[k], weights1, acc1);
-            acc2 = dot4add_i8packed(inputArray[k], weights2, acc2);
-            acc3 = dot4add_i8packed(inputArray[k], weights3, acc3);
+            acc.x = dot4add_i8packed(inputArray[row4], weights0, acc.x);
+            acc.y = dot4add_i8packed(inputArray[row4], weights1, acc.y);
+            acc.z = dot4add_i8packed(inputArray[row4], weights2, acc.z);
+            acc.w = dot4add_i8packed(inputArray[row4], weights3, acc.w);
         }
         
-        float4 results = float4(acc0, acc1, acc2, acc3);
-        float4 scales = weightBuffer.Load<float4>(scaleOffset + c * 4);
-
-        float16_t4 hresults = float16_t4(results * scales);
+        float4 scales = weightBuffer.Load<float4>(scaleOffset + col * 4);
+        float4 results = float4(acc) * scales;
         
-        if (activation)
-        {
-            hresults = NtcHGELUClamp_ForwardHalf(hresults);
-        }
-
         if (OUTPUT_LAYER)
         {
-            outputArray[c / 2 + 0] = NtcHalf2ToUint(hresults.xy);
-            outputArray[c / 2 + 1] = NtcHalf2ToUint(hresults.zw);
+            outputArray[col + 0] = asuint(results.x);
+            outputArray[col + 1] = asuint(results.y);
+            outputArray[col + 2] = asuint(results.z);
+            outputArray[col + 3] = asuint(results.w);
         }
         else
         {
-            int4 iresults = NtcHGELUClamp_QuantizeHalf(hresults);
+            results = NtcHGELUClamp_ForwardFloat(results);
+            int4 iresults = NtcHGELUClamp_QuantizeFloat(results);
 
-            outputArray[c / 4] = NtcPackInt8x4(iresults);
+            outputArray[col / 4] = NtcPackInt8x4(iresults);
         }
     }
 }
@@ -359,7 +302,7 @@ bool NtcSampleTextureSet(
         weightsOffset + desc.networkWeightOffsets.x,
         weightsOffset + desc.networkBiasOffsets.x,
         weightsOffset + desc.networkScaleOffsets.x,
-        true, networkInputs, hiddenOutput0);
+        networkInputs, hiddenOutput0);
 
     // Hidden layer 1
     uint hiddenOutput1[NTC_MLP_HIDDEN1_CHANNELS / 4];
@@ -368,7 +311,7 @@ bool NtcSampleTextureSet(
         weightsOffset + desc.networkWeightOffsets.y,
         weightsOffset + desc.networkBiasOffsets.y,
         weightsOffset + desc.networkScaleOffsets.y,
-        true, hiddenOutput0, hiddenOutput1);
+        hiddenOutput0, hiddenOutput1);
 
 #if NTC_MLP_LAYERS == 4
     // Hidden layer 2
@@ -378,40 +321,35 @@ bool NtcSampleTextureSet(
         weightsOffset + desc.networkWeightOffsets.z,
         weightsOffset + desc.networkBiasOffsets.z,
         weightsOffset + desc.networkScaleOffsets.z,
-        true, hiddenOutput1, hiddenOutput2);
+        hiddenOutput1, hiddenOutput2);
 
     // Output layer
-    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS / 2];
+    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS];
     NtcEvaluateLayerINT8<NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
         weightsBuffer,
         weightsOffset + desc.networkWeightOffsets.w,
         weightsOffset + desc.networkBiasOffsets.w,
         weightsOffset + desc.networkScaleOffsets.w,
-        false, hiddenOutput2, networkOutputs);
+        hiddenOutput2, networkOutputs);
 #else
     // Output layer
-    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS / 2];
+    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS];
     NtcEvaluateLayerINT8<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
         weightsBuffer,
         weightsOffset + desc.networkWeightOffsets.z,
         weightsOffset + desc.networkBiasOffsets.z,
         weightsOffset + desc.networkScaleOffsets.z,
-        false, hiddenOutput1, networkOutputs);
+        hiddenOutput1, networkOutputs);
 #endif
 
     [unroll]
-    for (int ch = 0; ch < NTC_MLP_OUTPUT_CHANNELS / 2; ++ch)
+    for (int ch = 0; ch < NTC_MLP_OUTPUT_CHANNELS; ++ch)
     {
-        uint twoCh = networkOutputs[ch];
-        int ch0 = ch * 2 + 0;
-        int ch1 = ch * 2 + 1;
-        outputs[ch0] = asfloat16(uint16_t(twoCh));
-        outputs[ch1] = asfloat16(uint16_t(twoCh >> 16));
+        outputs[ch] = asfloat(networkOutputs[ch]);
 
         if (convertToLinearColorSpace)
         {
-            outputs[ch0] = NtcConvertChannelToLinearColorSpace(desc, ch0, outputs[ch0]);
-            outputs[ch1] = NtcConvertChannelToLinearColorSpace(desc, ch1, outputs[ch1]);
+            outputs[ch] = NtcConvertChannelToLinearColorSpace(desc, ch, outputs[ch]);
         }
     }
     

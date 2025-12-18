@@ -11,57 +11,18 @@
  */
 
 #include "DecompressCommon.hlsli"
-   
-// Use manual allocation and addressing for shared memory to share the same memory
-// between matrix/scale/bias preloading and output shuffling because these actions
-// do not overlap.
 
-// First phase - matrix and scale/bias preloading
-static const int MATRIX_B_BASE_ADDR = 0;
-static const int MATRIX_B_MEM_SIZE = MAX_OUTPUT_SIZE * (MAX_INPUT_SIZE / 4);
-static const int SCALE_BIAS_SIZE = MAX_OUTPUT_SIZE;
-static const int BIAS_BASE_ADDR = MATRIX_B_MEM_SIZE;
-static const int SCALE_BASE_ADDR = BIAS_BASE_ADDR + SCALE_BIAS_SIZE;
+groupshared float4 s_Scale[MAX_OUTPUT_SIZE / 4];
+groupshared int4 s_Bias[MAX_OUTPUT_SIZE / 4];
+groupshared uint s_MatrixB[MAX_OUTPUT_SIZE][MAX_INPUT_SIZE / 4];
 
-// Second phase - output shuffling
-static const int OUTPUT_BASE_ADDR = 0;
-static const int OUTPUT_UINTS = NTC_MLP_OUTPUT_CHANNELS/2;
-static const int OUTPUT_SIZE = DECOMPRESS_CS_BLOCK_WIDTH * DECOMPRESS_CS_BLOCK_HEIGHT * (OUTPUT_UINTS+1);
-
-// Calculate the total shared memory size and allocate it
-static const int SHARED_MEMORY_SIZE = max(OUTPUT_SIZE, MATRIX_B_MEM_SIZE + SCALE_BIAS_SIZE * 2);
-groupshared uint s_SharedMem[SHARED_MEMORY_SIZE];
-
-// Shared memory address calculation functions
-
-int GetMatrixBAddress(int col, int row)
-{
-    return MATRIX_B_BASE_ADDR + col * (MAX_INPUT_SIZE / 4) + row;
-}
-
-int GetBiasAddress(int index)
-{
-    return BIAS_BASE_ADDR + index;
-}
-
-int GetScaleAddress(int index)
-{
-    return SCALE_BASE_ADDR + index;
-}
-
-int GetOutputAddress(int ch, int2 threadIdx)
-{
-    return (threadIdx.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIdx.x) * (OUTPUT_UINTS+1) + ch;
-}
-
-template<int IN, int OUT, bool OUT_FLOAT>
+template<int IN, int OUT, bool OUTPUT_LAYER>
 void EvaluateLayerINT8_SharedMem(
     int weightOffset,
     int biasOffset,
     int scaleOffset,
-    bool activation,
     uint inputArray[IN / 4],
-    out uint outputArray[OUT_FLOAT ? OUT / 2 : OUT / 4],
+    out uint outputArray[OUTPUT_LAYER ? OUT : OUT / 4],
     int2 threadIndex)
 {
     GroupMemoryBarrierWithGroupSync();
@@ -70,83 +31,63 @@ void EvaluateLayerINT8_SharedMem(
     // Note: this 'if' assumes that there are enough threads in the group to load all bias values in one pass.
     // If that ever changes, use a loop like one used for the weights below.
     const int linearThreadIndex = threadIndex.x + threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH;
-    if (linearThreadIndex < OUT)
+    if (linearThreadIndex < OUT/4)
     {
-        float scale = t_WeightBuffer.Load<float>(scaleOffset + linearThreadIndex * sizeof(float));
-        int bias = t_WeightBuffer.Load<int>(biasOffset + linearThreadIndex * sizeof(int));
+        float4 scale = t_WeightBuffer.Load<float4>(scaleOffset + linearThreadIndex * sizeof(float4));
+        int4 bias = t_WeightBuffer.Load<int4>(biasOffset + linearThreadIndex * sizeof(int4));
 
-        s_SharedMem[GetScaleAddress(linearThreadIndex)] = asuint(scale);
-        s_SharedMem[GetBiasAddress(linearThreadIndex)] = asuint(bias);
+        s_Scale[linearThreadIndex] = scale;
+        s_Bias[linearThreadIndex] = bias;
     }
 
     // Preload the weights into shared memory.
-    // The weights form a matrix with IN rows and OUT columns, stored in a column-major layout
-    // (i.e. elements of a column are continuous.)
+    // The weights form a matrix with IN rows and OUT columns, stored in a row-major layout
+    // (i.e. elements of a row are continuous).
+    // Each element is an int8, so 4 of these are packed into a uint32.
     int preloadIndex = linearThreadIndex;
     while (preloadIndex < (IN * OUT) / 4)
     {
-        int k = preloadIndex % (IN/4); // row
-        int c = preloadIndex / (IN/4); // column
+        int row = (preloadIndex) % (IN/4);
+        int col = (preloadIndex) / (IN/4);
         
-        s_SharedMem[GetMatrixBAddress(c, k)] = t_WeightBuffer.Load(weightOffset + preloadIndex * 4);
+        s_MatrixB[col][row] = t_WeightBuffer.Load(weightOffset + preloadIndex * 4);
 
         preloadIndex += DECOMPRESS_CS_BLOCK_WIDTH * DECOMPRESS_CS_BLOCK_HEIGHT;
     }
 
     GroupMemoryBarrierWithGroupSync();
 
-    // Note: not unrolling the outer loop.
-    // If we do, DXC/SPIR-V crashes.
-    // DXC/DXIL compiles the unrolled loop successfully, but then creating a pipeline with it takes seconds,
-    // and the resulting code works slower than a regular loop.
-    for (uint c = 0; c < OUT; c += 4)
+    // Note: not unrolling the outer loop for performance and smaller shaders.
+    [loop]
+    for (uint col = 0; col < OUT; col += 4)
     {
-        int acc0 = asint(s_SharedMem[GetBiasAddress(c + 0)]);
-        int acc1 = asint(s_SharedMem[GetBiasAddress(c + 1)]);
-        int acc2 = asint(s_SharedMem[GetBiasAddress(c + 2)]);
-        int acc3 = asint(s_SharedMem[GetBiasAddress(c + 3)]);
+        int4 acc = s_Bias[col / 4];
         
         [unroll]
-        for (uint k = 0; k < IN / 4; k++)
+        for (uint row4 = 0; row4 < IN / 4; row4++)
         {
-            const int matrixAddr0 = GetMatrixBAddress(c + 0, k);
-            const int matrixAddr1 = GetMatrixBAddress(c + 1, k);
-            const int matrixAddr2 = GetMatrixBAddress(c + 2, k);
-            const int matrixAddr3 = GetMatrixBAddress(c + 3, k);
-
-            acc0 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr0], acc0);
-            acc1 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr1], acc1);
-            acc2 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr2], acc2);
-            acc3 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr3], acc3);
+            acc.x = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 0][row4], acc.x);
+            acc.y = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 1][row4], acc.y);
+            acc.z = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 2][row4], acc.z);
+            acc.w = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 3][row4], acc.w);
         }
 
-        float4 results = float4(acc0, acc1, acc2, acc3);
+        float4 scales = s_Scale[col / 4];
+        float4 results = float4(acc) * scales;
 
-        float4 scales;
-        scales.x = asfloat(s_SharedMem[GetScaleAddress(c + 0)]);
-        scales.y = asfloat(s_SharedMem[GetScaleAddress(c + 1)]);
-        scales.z = asfloat(s_SharedMem[GetScaleAddress(c + 2)]);
-        scales.w = asfloat(s_SharedMem[GetScaleAddress(c + 3)]);
-
-        results *= scales;
-
-        float16_t4 hresults = float16_t4(results);
-        
-        if (activation)
+        if (OUTPUT_LAYER)
         {
-            hresults = NtcHGELUClamp_ForwardHalf(hresults);
-        }
-
-        if (OUT_FLOAT)
-        {
-            outputArray[c / 2 + 0] = NtcHalf2ToUint(hresults.xy);
-            outputArray[c / 2 + 1] = NtcHalf2ToUint(hresults.zw);
+            outputArray[col + 0] = asuint(results.x);
+            outputArray[col + 1] = asuint(results.y);
+            outputArray[col + 2] = asuint(results.z);
+            outputArray[col + 3] = asuint(results.w);
         }
         else
         {
-            int4 iresults = NtcHGELUClamp_QuantizeHalf(hresults);
+            results = NtcHGELUClamp_ForwardFloat(results);
+            int4 iresults = NtcHGELUClamp_QuantizeFloat(results);
 
-            outputArray[c / 4] = NtcPackInt8x4(iresults);
+            outputArray[col / 4] = NtcPackInt8x4(iresults);
         }
     }
 }
@@ -172,7 +113,7 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         g_Const.networkWeightOffsets.x,
         g_Const.networkBiasOffsets.x,
         g_Const.networkScaleOffsets.x,
-        true, networkInputs, hiddenOutput0, threadIndex);
+        networkInputs, hiddenOutput0, threadIndex);
 
     // Hidden layer 1
     uint hiddenOutput1[NTC_MLP_HIDDEN1_CHANNELS / 4];
@@ -180,7 +121,7 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         g_Const.networkWeightOffsets.y,
         g_Const.networkBiasOffsets.y,
         g_Const.networkScaleOffsets.y,
-        true, hiddenOutput0, hiddenOutput1, threadIndex);
+        hiddenOutput0, hiddenOutput1, threadIndex);
 
 #if NTC_MLP_LAYERS == 4
     // Hidden layer 2
@@ -189,36 +130,26 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         g_Const.networkWeightOffsets.z,
         g_Const.networkBiasOffsets.z,
         g_Const.networkScaleOffsets.z,
-        true, hiddenOutput1, hiddenOutput2, threadIndex);
+        hiddenOutput1, hiddenOutput2, threadIndex);
 
     // Output layer
-    uint networkOutputs[OUTPUT_UINTS];
+    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS];
     EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
         g_Const.networkWeightOffsets.w,
         g_Const.networkBiasOffsets.w,
         g_Const.networkScaleOffsets.w,
-        false, hiddenOutput2, networkOutputs, threadIndex);
+        hiddenOutput2, networkOutputs, threadIndex);
 #else
     // Output layer
-    uint networkOutputs[OUTPUT_UINTS];
+    uint networkOutputs[NTC_MLP_OUTPUT_CHANNELS];
     EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
         g_Const.networkWeightOffsets.z,
         g_Const.networkBiasOffsets.z,
         g_Const.networkScaleOffsets.z,
-        false, hiddenOutput1, networkOutputs, threadIndex);
+        hiddenOutput1, networkOutputs, threadIndex);
 #endif
 
     HashBasedRNG rng = HashBasedRNG::Create(pixelPosition.x + pixelPosition.y * g_Const.imageWidth, 0);
-
-    // Store the outputs into shared memory for efficient indexed access later.
-    // Note: there is no need for a barrier after this store because each thread only reads the data
-    // it's written - nothing from other threads.
-    GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (int ch = 0; ch < OUTPUT_UINTS; ++ch)
-    {
-        s_SharedMem[GetOutputAddress(ch, threadIndex)] = networkOutputs[ch];
-    }
 
     // Exit if this pixel is outside of the specified rectangle
     if (pixelPosition.x < g_Const.srcLeft || pixelPosition.y < g_Const.srcTop ||
@@ -236,10 +167,7 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         for (int ch = 0; ch < 4; ++ch)
         {
             int srcChannel = min(outputDesc.firstChannel + ch, NTC_MLP_OUTPUT_CHANNELS - 1);
-            uint twoCh = s_SharedMem[GetOutputAddress(srcChannel/2, threadIndex)];
-            if (srcChannel & 1)
-                twoCh >>= 16;
-            texelValue[ch] = asfloat16(uint16_t(twoCh));
+            texelValue[ch] = asfloat(networkOutputs[srcChannel]);
         }
 
         // Perform color space conversion, if needed
@@ -254,6 +182,13 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         if (outputDesc.numChannels <= 1) texelValue.y = 0;
         if (outputDesc.numChannels <= 2) texelValue.z = 0;
         if (outputDesc.numChannels <= 3) texelValue.w = 1;
+
+        // Apply quantization, e.g. manual rounding to UNORM8, because DX doesn't require
+        // correct rounding for UAV writes
+        if (outputDesc.quantizationScale != 0.f)
+        {
+            texelValue = round(texelValue * outputDesc.invQuantizationScale) * outputDesc.quantizationScale;
+        }
 
         // Write out the texel to the UAV
         u_Outputs[outputDesc.textureIndex][dstPosition] = texelValue;

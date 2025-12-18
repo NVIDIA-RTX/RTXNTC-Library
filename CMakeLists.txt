@@ -35,7 +35,7 @@ project(
 
 set(NTC_VERSION_MAJOR 0)
 set(NTC_VERSION_MINOR 9)
-set(NTC_VERSION_POINT 0)
+set(NTC_VERSION_POINT 1)
 
 # Read Git branch name into NTC_VERSION_BRANCH
 execute_process(

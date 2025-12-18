@@ -24,8 +24,8 @@ namespace tin {
 
             if (quant == Quantization::Int8)
             {
-                y = y * half(scale);
-                y = hrint(y);
+                y = y * half(scale) - half(0.5f);
+                y = hfloor(y);
                 y = __hmax(__hmin(y, half(qmax)), half(qmin));
                 y = y * half(1 / scale);
             }

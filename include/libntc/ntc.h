@@ -37,7 +37,7 @@ namespace ntc
 {
 
 // Update the interface version whenever changes to the LibNTC API are made.
-constexpr uint32_t InterfaceVersion = 0x25'12'05'00; // Year, month, day, ordinal
+constexpr uint32_t InterfaceVersion = 0x25'12'15'00; // Year, month, day, ordinal
 
 // Version information for the library, see GetLibraryVersion()
 struct VersionInfo
@@ -995,6 +995,10 @@ struct OutputTextureDesc
     // Multiplier for the dithering noise that is added before storing the output value.
     // For 8-bit textures, this should be 1/255.
     float ditherScale = 0.f;
+
+    // Quantization scale for more numerically stable outputs in DP4a mode. 0 means no explicit quantization.
+    // For 8-bit textures, this should be 1/255.
+    float quantizationScale = 0.f;
 };
 
 struct MakeDecompressionComputePassParameters

@@ -131,10 +131,8 @@ template<typename T, int SIZE>
 void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
 #endif
 {
-    const NtcHGELUParams params = NtcGetHGELUParams();
-
 #if __SLANG__
-    let v3  = CoopVec<T, SIZE>(T(params.maxval));
+    let v3  = CoopVec<T, SIZE>(T(NTC_HGELU_MAXVALUE));
     let v0  = CoopVec<T, SIZE>(T(0.f));
     let v1  = CoopVec<T, SIZE>(T(1.f));
     let vi3 = CoopVec<T, SIZE>(T(1/3.f));
@@ -144,19 +142,19 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
 
     if (scaleAndBias)
     {
-        let istep = CoopVec<T, SIZE>(T(params.invStep));
-        let obias = CoopVec<T, SIZE>(T(params.bias));
+        let istep = CoopVec<T, SIZE>(T(NTC_HGELU_INVSTEP));
+        let obias = CoopVec<T, SIZE>(T(NTC_HGELU_BIAS));
         x = x * istep + obias;
     }
 #else
     CoopVec<T, SIZE> tmp, v3;
     tmp = x * T(1.0 / 3.0) + T(0.5);
     tmp = clamp(tmp, T(0.0), T(1.0));
-    x = tmp * min(x, T(params.maxval));
+    x = tmp * min(x, T(NTC_HGELU_MAXVALUE));
 
     if (scaleAndBias)
     {
-        x = x * T(params.invStep) + T(params.bias);
+        x = x * T(NTC_HGELU_INVSTEP) + T(NTC_HGELU_BIAS);
     }
 #endif
 }

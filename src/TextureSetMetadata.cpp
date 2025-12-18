@@ -927,6 +927,10 @@ void TextureSetMetadata::FillDecompressionConstants(
         dst.dstRgbColorSpace = int(src.rgbColorSpace);
         dst.dstAlphaColorSpace = int(src.alphaColorSpace);
         dst.ditherScale = src.ditherScale;
+        dst.quantizationScale = src.quantizationScale;
+        dst.invQuantizationScale = (src.quantizationScale > 0.f) ? 1.f / src.quantizationScale : 0.f;
+        dst.pad0 = 0;
+        dst.pad1 = 0;
         dst.textureIndex = params.firstOutputDescriptorIndex + src.descriptorIndex;
         
         int alphaChannel = dst.firstChannel + 3;

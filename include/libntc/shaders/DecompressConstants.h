@@ -20,7 +20,7 @@
 #define DECOMPRESS_CS_BLOCK_WIDTH 16
 #define DECOMPRESS_CS_BLOCK_HEIGHT 8
 
-#define DECOMPRESS_CS_MAX_OUTPUTS 16
+#define DECOMPRESS_CS_MAX_OUTPUTS 12
 #define DECOMPRESS_CS_MAX_CHANNELS 16
 
 struct NtcDecompressOutputDesc
@@ -34,6 +34,11 @@ struct NtcDecompressOutputDesc
     int dstRgbColorSpace;
     int srcAlphaColorSpace;
     int dstAlphaColorSpace;
+
+    float quantizationScale;
+    float invQuantizationScale;
+    int pad0;
+    int pad1;
 };
 
 struct NtcDecompressConstants
