@@ -134,6 +134,11 @@ bool BinaryChunkBuilder::WriteAllViewsToStream(IStream* stream, uint64_t binaryC
         if (!WriteViewDataToStream(viewIndex, stream, binaryChunkOffset))
             return false;
     }
+
+    // Make sure that the stream size is a multiple of 4 bytes, to match m_binaryChunkSize computed earlier.
+    if (!PadStreamTo4Bytes(stream))
+        return false;
+    
     return true;
 }
 
