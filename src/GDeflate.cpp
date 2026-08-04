@@ -155,16 +155,16 @@ bool CompressGDeflate(const void* uncompressedData, size_t uncompressedSize,
     
     header->id = TileStream::kGDeflateId;
     header->magic = header->id ^ 0xff;
-    header->numTiles = numPages;
+    header->numTiles = uint16_t(numPages);
     header->tileSizeIdx = 1;
     header->lastTileSize = lastPageSize;
 
-    tileOffsets[0] = lastPageSize;
+    tileOffsets[0] = uint32_t(lastPageSize);
     size_t compressedOffset = 0;
     for (size_t i = 0; i < numPages; ++i)
     {
         if (i > 0)
-            tileOffsets[i] = compressedOffset;
+            tileOffsets[i] = uint32_t(compressedOffset);
         compressedOffset += pages[i].nbytes;
     }
 
@@ -391,7 +391,7 @@ Status DecompressGDeflateOnVulkanGPU(GraphicsResources const* resources, void* c
             region.compressedSize = tileOffsets[i + 1] - compressedTileOffset;
             region.decompressedSize = kDefaultTileSize;
         }
-        decompressedTileOffset += region.decompressedSize;
+        decompressedTileOffset += uint32_t(region.decompressedSize);
     }
 
     VkCommandBuffer vkCmdBuf = static_cast<VkCommandBuffer>(commandBuffer);

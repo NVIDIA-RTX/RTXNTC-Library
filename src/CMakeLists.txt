@@ -24,6 +24,9 @@ if (NTC_WITH_CUDA)
     set(CUDA_LINK_LIBRARIES_KEYWORD PUBLIC)
 
     if (MSVC)
+        if (CUDAToolkit_VERSION_MAJOR GREATER_EQUAL 13)
+            list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=/Zc:preprocessor")
+        endif()
     else()
         list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-Wall")
         list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-fno-strict-aliasing")
@@ -322,6 +325,12 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
         set(debug_option "")
     endif()
 
+    # The DXC HLSL include directory contains dx/linalg.h (LinAlg / Cooperative
+    # Vector). It is needed by both the DX12 and the Vulkan CoopVec shader
+    # compiles, so define it unconditionally rather than only under NTC_WITH_DX12.
+    cmake_path(GET SHADERMAKE_DXC_PATH PARENT_PATH dxc_directory)
+    set(dxc_include_directory "${dxc_directory}/../../inc/hlsl")
+
     if (NTC_WITH_DX12)
         add_custom_command(TARGET libntc-shaders PRE_BUILD BYPRODUCTS ${shader_byproducts_dxil} COMMAND ShaderMake
             --config ${shader_config_file}
@@ -342,9 +351,10 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
             --project LibNTC
             --headerBlob
             --compiler ${SHADERMAKE_DXC_PATH}
-            --shaderModel 6_9
+            --shaderModel 6_10
             ${debug_option}
-            -I ${include_directory})
+            -I ${include_directory}
+            -I ${dxc_include_directory})
     endif()
 
     if (NTC_WITH_VULKAN)
@@ -375,6 +385,7 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
             -X "-capability spvCooperativeVectorNV"
             ${debug_option}
             -I ${include_directory}
+            -I ${dxc_include_directory}
             -D SPIRV)
     endif()
 

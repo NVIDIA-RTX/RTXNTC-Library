@@ -1460,7 +1460,7 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
 
             cuda::ReduceNetworkGrad(
                 numNetworkParams,
-                gradientSlices,
+                int(gradientSlices),
                 /* useFloatGradients = */ stableTraining,
                 m_weightGradients.DevicePtr());
         }
@@ -1483,7 +1483,7 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         if (m_currentStep == freezeLatentsStep)
         {
             cuda::FreezeQuantization(
-                m_featureGrid.GetTotalPixelCount(),
+                uint32_t(m_featureGrid.GetTotalPixelCount()),
                 m_latentShape.numFeatures,
                 m_featureGrid.GetBaseLatentsDevicePtr(0),
                 m_featureGrid.GetQuantizedLatentsDevicePtr(0)
@@ -1492,7 +1492,7 @@ Status TextureSet::RunCompressionSteps(CompressionStats* pOutStats)
         else if (m_currentStep < freezeLatentsStep)
         {
             cuda::OptimizeLatentGrid(
-                m_featureGrid.GetTotalPixelCount(),
+                uint32_t(m_featureGrid.GetTotalPixelCount()),
                 m_latentShape.numFeatures,
                 m_featureGrid.GetLatentStride(),
                 /* useFloatGradients = */ stableTraining,
@@ -1661,6 +1661,13 @@ void TextureSet::AbortCompression()
     m_networkState = TextureSetNetworkState::Empty;
 }
 
+void* TextureSet::GetOutputMipSliceDevicePointer(int mipLevel)
+{
+    half* outputPtr = m_textureDataOut.DevicePtr() ? m_textureDataOut.DevicePtr() : m_textureData.DevicePtr();
+    outputPtr += m_textureMipOffsets[mipLevel] * m_desc.channels;
+    return (void*)outputPtr;
+}
+
 Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useInt8Weights)
 {
     if (m_networkState != TextureSetNetworkState::TrainingInProgress &&
@@ -1819,7 +1826,7 @@ Status TextureSet::Decompress(DecompressionStats* pOutStats, bool useInt8Weights
         params.latentStride = m_featureGrid.GetLatentStride();
         params.positionScale = colorMip.positionScale;
         params.positionLod = colorMip.positionLod;
-        params.lossItemsPerChannel = lossItemsPerChannel;
+        params.lossItemsPerChannel = int(lossItemsPerChannel);
         params.experimentalKnob = m_experimentalKnob;
         params.highResLatents = m_featureGrid.GetQuantizedLatentsDevicePtr(neuralLod);
         params.lowResLatents = m_featureGrid.GetQuantizedLatentsDevicePtr(neuralLod + 1);

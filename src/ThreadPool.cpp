@@ -34,7 +34,14 @@ ThreadPool::~ThreadPool()
 {
     WaitForTasks();
 
-    m_terminate.store(true);
+    // Publish the termination flag under the mutex (even though it is atomic) so it is ordered
+    // against a worker evaluating the wait predicate. Otherwise notify_all() below can race ahead
+    // of a worker that has already read m_terminate == false and is about to block in
+    // m_forward.wait(), so the wakeup is lost and join() hangs forever.
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_terminate.store(true);
+    }
 
     m_forward.notify_all();
 

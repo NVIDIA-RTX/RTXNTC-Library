@@ -15,6 +15,7 @@
 
 #if !__SLANG__
 #define CoopVec vector
+#include <dx/linalg.h>
 #endif
 
 #include "Inference.hlsli"
@@ -199,36 +200,15 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
 
 #else
 
-    // See https://microsoft.github.io/hlsl-specs/proposals/0031-hlsl-vector-matrix-operations
-    // for the enum value definitions
+    using namespace dx::linalg;
     
-    const uint inputType = 20; // SINT8
-    const uint weightType = 20; // SINT8
-    const uint weightLayout = 2; // MUL_OPTIMAL
-    const uint biasType = 4; // SINT32
-    const uint stride = 0;
-    
-    CoopVec<int, OUT> accum;
-    __builtin_MatVecMulAdd(
-        accum,
-        false,
-        inputArray,
-        false,
-        inputType,
-        weightBuffer,
-        weightOffset,
-        weightType,
-        OUT,
-        IN,
-        weightLayout,
-        false,
-        stride,
-        weightBuffer,
-        biasOffset,
-        biasType
-    );
-    
-    outputArray = accum;
+    using MatrixTy = Matrix<ComponentType::I8, OUT, IN, MatrixUse::A, MatrixScope::Thread>;
+    MatrixTy weights = MatrixTy::template Load<MatrixLayout::MulOptimal>(weightBuffer, uint(weightOffset), 0u);
+    VectorRef<ComponentType::I32, OUT> biasRef = { weightBuffer, biasOffset };
+    InterpretedVector<uint32_t, IN/4, ComponentType::I8> inputVec = Convert<ComponentType::I8, ComponentType::F16>(inputArray);
+
+    outputArray = MultiplyAdd<int>(weights, inputVec, biasRef);
+
 #endif
 }
 
@@ -263,30 +243,14 @@ NTC_TEMPLATE_FN_2(void, NtcEvaluateLayerMatMulAdd_CoopVec_FP8, int, IN, int, OUT
 
 #else
 
-    const uint inputType = 21; // F8_E4M3
-    const uint weightType = 21; // F8_E4M3
-    const uint weightLayout = 2; // MATRIX_LAYOUT_MUL_OPTIMAL
-    const uint biasType = 8; // FLOAT16
-    const uint stride = 0;
-
-    __builtin_MatVecMulAdd(
-        outputArray,
-        false,
-        inputArray,
-        false,
-        inputType,
-        weightBuffer,
-        weightOffset,
-        weightType,
-        OUT,
-        IN,
-        weightLayout,
-        false,
-        stride,
-        weightBuffer,
-        biasOffset,
-        biasType
-    );
+    using namespace dx::linalg;
+    
+    using MatrixTy = Matrix<ComponentType::F8_E4M3FN, OUT, IN, MatrixUse::A, MatrixScope::Thread>;
+    MatrixTy weights = MatrixTy::template Load<MatrixLayout::MulOptimal>(weightBuffer, uint(weightOffset), 0u);
+    VectorRef<ComponentType::F16, OUT> biasRef = { weightBuffer, biasOffset };
+    InterpretedVector<uint32_t, IN/4, ComponentType::F8_E4M3FN> inputVec = Convert<ComponentType::F8_E4M3FN, ComponentType::F16>(inputArray);
+    
+    outputArray = MultiplyAdd<float16_t>(weights, inputVec, biasRef);
 
 #endif
 }
@@ -322,16 +286,17 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
     in CoopVec<float16_t, IN> inputArray,
     out CoopVec<float, OUT> outputArray)
 {
-    // Convert the inputs from float16_t to float, necessary for correct output at this time
 #if __SLANG__
+    // Convert the inputs from float16_t to float, necessary for correct output at this time
     CoopVec<float, IN> inputArrayFloat = CoopVec<float, IN>(inputArray);
-#else
-    CoopVec<float, IN> inputArrayFloat;
-    inputArrayFloat = inputArray;
-#endif
-
+        
     NtcEvaluateLayerMatMulAdd_CoopVec_Int8<float, IN, OUT>
         (weightBuffer, weightOffset, biasOffset, inputArrayFloat, outputArray);
+#else
+    NtcEvaluateLayerMatMulAdd_CoopVec_Int8<float16_t, IN, OUT>
+        (weightBuffer, weightOffset, biasOffset, inputArray, outputArray);
+#endif
+
     
     // Enforce the scale alignment to help the compiler optimize the code
     scaleOffset &= ~15;

@@ -21,6 +21,10 @@
 #include <limits>
 #include <libntc/shaders/BlockCompressConstants.h>
 
+#if defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+#include <intrin.h> // for _BitScanForward; ARM64 has no x86 _tzcnt_u32 intrinsic
+#endif
+
 // This file contains implementations for the public functions declared in ntc.h
 // that do not belong to any class.
 
@@ -477,7 +481,14 @@ static void ExtractBC7ModeAndPartition(uint32_t firstWord, uint32_t& outMode, ui
 {
     // Extract the mode and partition indices from the block
 #ifdef _MSC_VER
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+    // ARM64 has no _tzcnt_u32; emulate it (returns 32 for a zero input) via _BitScanForward.
+    unsigned long tzIndex;
+    uint32_t trailingZeros = _BitScanForward(&tzIndex, firstWord) ? uint32_t(tzIndex) : 32u;
+    outMode = std::min(7u, trailingZeros);
+#else
     outMode = std::min(7u, _tzcnt_u32(firstWord));
+#endif
 #else
     outMode = std::min(7, __builtin_ctz(firstWord));
 #endif

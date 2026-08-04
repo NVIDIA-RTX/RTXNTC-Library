@@ -91,6 +91,8 @@ public:
 
     void AbortCompression() override;
 
+    void* GetOutputMipSliceDevicePointer(int mipLevel) override;
+
     Status Decompress(DecompressionStats* pOutStats, bool useInt8Weights) override;
 
     Status SetMaskChannelIndex(int index, bool discardMaskedOutPixels) override;

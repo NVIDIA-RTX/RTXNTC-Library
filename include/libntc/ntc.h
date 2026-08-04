@@ -932,6 +932,9 @@ public:
     // Use ReadChannels to extract the decompressed data.
     virtual Status Decompress(DecompressionStats* pOutStats, bool useInt8Weights = false) = 0;
     
+    // Get a pointer to the buffer on the device where the given image mip level can be decompressed.
+    virtual void* GetOutputMipSliceDevicePointer(int mipLevel) = 0;
+
     // *** Misc ***
 
     // Sets the index of a channel that contains an alpha mask. Negative values mean no mask.

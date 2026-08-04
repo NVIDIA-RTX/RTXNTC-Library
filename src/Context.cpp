@@ -755,7 +755,7 @@ Status Context::MakeBlockCompressionComputePass(MakeBlockCompressionComputePassP
     constants.alphaThreshold = params.alphaThreshold;
     constants.modeMapWidthInBlocks = modeMapWidthInBlocks;
     constants.modeMapHeightInBlocks = modeMapHeightInBlocks;
-    constants.modeBufferByteOffset = params.modeBufferByteOffset;
+    constants.modeBufferByteOffset = uint32_t(params.modeBufferByteOffset);
     constants.modeMapOffsetX = params.modeMapOffsetInBlocks.x;
     constants.modeMapOffsetY = params.modeMapOffsetInBlocks.y;
 

@@ -34,8 +34,8 @@ project(
 # Version info
 
 set(NTC_VERSION_MAJOR 0)
-set(NTC_VERSION_MINOR 9)
-set(NTC_VERSION_POINT 2)
+set(NTC_VERSION_MINOR 10)
+set(NTC_VERSION_POINT 0)
 
 # Read Git branch name into NTC_VERSION_BRANCH
 execute_process(
@@ -82,7 +82,7 @@ if (NOT TARGET DirectX-Headers AND NTC_WITH_DX12)
     FetchContent_Declare(
         DirectX-Headers
         GIT_REPOSITORY https://github.com/microsoft/DirectX-Headers.git
-        GIT_TAG v1.717.0-preview
+        GIT_TAG v1.721.0-preview
     )
     FetchContent_MakeAvailable(DirectX-Headers)
 endif()
@@ -95,7 +95,7 @@ if (NOT TARGET ShaderMake AND NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NT
     FetchContent_Declare(
         ShaderMake
         GIT_REPOSITORY https://github.com/NVIDIAGameWorks/ShaderMake.git
-        GIT_TAG 18f5a344e7ca8fa65daaf079d07bc8ce38453e05
+        GIT_TAG 5daebdbef45088fc2369d441391ecab0eba25e54
     )
     FetchContent_MakeAvailable(ShaderMake)
 endif()

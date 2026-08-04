@@ -19,7 +19,7 @@ namespace ntc
 
 namespace json
 {
-    class Document;
+    struct Document;
 }
 
 // Helper class that manages the buffer views and compresses data during texture set saving.

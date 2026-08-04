@@ -84,7 +84,7 @@ static D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_DEST_INFO GetDX12ConvertLayerDestI
         info.DestDataType = D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8;
         break;
     case DataType::FP8:
-        info.DestDataType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT_E4M3;
+        info.DestDataType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT8_E4M3FN;
         break;
     case DataType::FP16:
         info.DestDataType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
@@ -324,49 +324,26 @@ void CoopVecWeightConverter::IsDX12CoopVecSupported(GraphicsResources const* res
     outSupported = false;
 
     // Get the general cooperative vector support tier
-    D3D12_FEATURE_DATA_D3D12_OPTIONS_EXPERIMENTAL experimentalOptions{};
-    if (resources->GetD3D12Device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS_EXPERIMENTAL,
-        &experimentalOptions, UINT(sizeof experimentalOptions)) != S_OK)
+    D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linalgSupport{};
+    if (resources->GetD3D12Device()->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT,
+        &linalgSupport, UINT(sizeof linalgSupport)) != S_OK)
         return;
 
-    if (experimentalOptions.CooperativeVectorTier < D3D12_COOPERATIVE_VECTOR_TIER_1_0)
+    if (linalgSupport.LinearAlgebraTier < D3D12_LINEAR_ALGEBRA_TIER_1_0)
         return;
 
-    // Get the format count
-    D3D12_FEATURE_DATA_COOPERATIVE_VECTOR coopVecData{};
-    if (resources->GetD3D12Device()->CheckFeatureSupport(D3D12_FEATURE_COOPERATIVE_VECTOR,
-        &coopVecData, UINT(sizeof coopVecData)) != S_OK)
+    D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT formatSupport{};
+    formatSupport.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_VECTOR_MATRIX_MULTIPLY;
+    formatSupport.ThreadVectorMatrixMultiply.VectorInputType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT8_E4M3FN;
+    formatSupport.ThreadVectorMatrixMultiply.MatrixInputType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT8_E4M3FN;
+    formatSupport.ThreadVectorMatrixMultiply.BiasInputType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+    formatSupport.ThreadVectorMatrixMultiply.VectorResultType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
+    
+    if (resources->GetD3D12Device()->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+        &formatSupport, UINT(sizeof formatSupport)) != S_OK)
         return;
     
-    // Get the supported format list
-    Vector<D3D12_COOPERATIVE_VECTOR_PROPERTIES_MUL> properties(coopVecData.MatrixVectorMulAddPropCount,
-        resources->GetAllocator());
-    coopVecData.pMatrixVectorMulAddProperties = properties.data();
-    coopVecData.OuterProductAccumulatePropCount = 0;
-    coopVecData.VectorAccumulatePropCount = 0;
-    if (resources->GetD3D12Device()->CheckFeatureSupport(D3D12_FEATURE_COOPERATIVE_VECTOR,
-        &coopVecData, UINT(sizeof coopVecData)) != S_OK)
-        return;
-
-    // Go over the properties and see if there are formats that we need in the list
-    bool int8LayerSupported = false;
-    bool fp8LayersSupported = false;
-    for (const auto& prop : properties)
-    {
-        if (prop.InputType == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32 &&
-            prop.InputInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8 &&
-            prop.MatrixInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8 &&
-            prop.OutputType == D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32)
-            int8LayerSupported = true;
-
-        if (prop.InputType == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16 &&
-            prop.InputInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT_E4M3 &&
-            prop.MatrixInterpretation == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT_E4M3 &&
-            prop.OutputType == D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16)
-            fp8LayersSupported = true;
-    }
-
-    outSupported = int8LayerSupported && fp8LayersSupported;
+    outSupported = formatSupport.ThreadVectorMatrixMultiply.SupportFlags != D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_NONE;
 }
 #endif
 

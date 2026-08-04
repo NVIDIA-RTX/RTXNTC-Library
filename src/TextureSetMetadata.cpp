@@ -694,7 +694,7 @@ Status TextureSetMetadata::LoadWeightsFromStream(json::Document const& document,
             int const expectedInputChannels = MlpDesc::GetLayerInputChannels(layerIndex);
             int const expectedOutputChannels = MlpDesc::GetLayerOutputChannels(layerIndex);
 
-            if (layer.inputChannels < expectedInputChannels || layer.outputChannels < expectedOutputChannels)
+            if (int(layer.inputChannels) < expectedInputChannels || int(layer.outputChannels) < expectedOutputChannels)
             {
                 // If the layer provided by the file is smaller than one that we expect, expand its weights.
                 // Read the weights from the file into a temporary buffer first.
@@ -1090,11 +1090,11 @@ bool TextureSetMetadata::ValidateMLP(json::Document const& document, json::MLP c
         int const expectedOutputChannels = MlpDesc::GetLayerOutputChannels(layerIndex);
         
         bool const supportedInputCount = allowSmallerInputs
-            ? layer.inputChannels <= expectedInputChannels
-            : layer.inputChannels == expectedInputChannels;
+            ? int(layer.inputChannels) <= expectedInputChannels
+            : int(layer.inputChannels) == expectedInputChannels;
         bool const supportedOutputCount = allowSmallerOutputs
-            ? layer.outputChannels <= expectedOutputChannels
-            : layer.outputChannels == expectedOutputChannels;
+            ? int(layer.outputChannels) <= expectedOutputChannels
+            : int(layer.outputChannels) == expectedOutputChannels;
 
         if (!supportedInputCount || !supportedOutputCount)
         {
