@@ -205,7 +205,7 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
     using MatrixTy = Matrix<ComponentType::I8, OUT, IN, MatrixUse::A, MatrixScope::Thread>;
     MatrixTy weights = MatrixTy::template Load<MatrixLayout::MulOptimal>(weightBuffer, uint(weightOffset), 0u);
     VectorRef<ComponentType::I32, OUT> biasRef = { weightBuffer, biasOffset };
-    InterpretedVector<uint32_t, IN/4, ComponentType::I8> inputVec = Convert<ComponentType::I8, ComponentType::F16>(inputArray);
+    InterpretedVector<uint32_t, IN/4, ComponentType::I8> inputVec = Convert<ComponentType::I8, ComponentType::F16>(round(inputArray));
 
     outputArray = MultiplyAdd<int>(weights, inputVec, biasRef);
 

@@ -339,7 +339,14 @@ void CoopVecWeightConverter::IsDX12CoopVecSupported(GraphicsResources const* res
     formatSupport.ThreadVectorMatrixMultiply.BiasInputType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
     formatSupport.ThreadVectorMatrixMultiply.VectorResultType = D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16;
     
-    if (resources->GetD3D12Device()->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+    // The 1.722 preview headers dropped the duplicated LINEAR_ALGEBRA from this feature's name, keeping its value
+#if D3D12_PREVIEW_SDK_VERSION >= 722
+    D3D12_FEATURE const matrixOperationSupport = D3D12_FEATURE_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT;
+#else
+    D3D12_FEATURE const matrixOperationSupport = D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT;
+#endif
+
+    if (resources->GetD3D12Device()->CheckFeatureSupport(matrixOperationSupport,
         &formatSupport, UINT(sizeof formatSupport)) != S_OK)
         return;
     

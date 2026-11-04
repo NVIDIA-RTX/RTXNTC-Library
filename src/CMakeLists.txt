@@ -386,7 +386,9 @@ if (NTC_WITH_PREBUILT_SHADERS AND (NTC_WITH_DX12 OR NTC_WITH_VULKAN))
             ${debug_option}
             -I ${include_directory}
             -I ${dxc_include_directory}
-            -D SPIRV)
+            -D SPIRV
+            # Without an explicit value, ShaderMake defines __SLANG__ as empty for Slang, which breaks '#if __SLANG__'
+            -D __SLANG__=1)
     endif()
 
     target_include_directories(libntc PRIVATE ${shader_output_dir})
