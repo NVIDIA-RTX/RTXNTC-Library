@@ -61,18 +61,32 @@ void EvaluateLayerINT8_SharedMem(
     [loop]
     for (uint col = 0; col < OUT; col += 4)
     {
-        int4 acc = s_Bias[col / 4];
-        
+        const float4 scales = s_Scale[col / 4];
+
+        // Two arithmetic chains per lane, so the dp4a instructions can
+        // interleave.
+        int4 accA = s_Bias[col / 4];
+        int4 accB = int4(0, 0, 0, 0);
+
         [unroll]
-        for (uint row4 = 0; row4 < IN / 4; row4++)
+        for (uint row4 = 0; row4 < IN / 4; row4 += 2)
         {
-            acc.x = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 0][row4], acc.x);
-            acc.y = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 1][row4], acc.y);
-            acc.z = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 2][row4], acc.z);
-            acc.w = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 3][row4], acc.w);
+            accA.x = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 0][row4], accA.x);
+            accA.y = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 1][row4], accA.y);
+            accA.z = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 2][row4], accA.z);
+            accA.w = dot4add_i8packed(inputArray[row4], s_MatrixB[col + 3][row4], accA.w);
+
+            // IN is a multiple of 16, so this is only false when IN/4 is odd.
+            if (row4 + 1 < IN / 4)
+            {
+                accB.x = dot4add_i8packed(inputArray[row4 + 1], s_MatrixB[col + 0][row4 + 1], accB.x);
+                accB.y = dot4add_i8packed(inputArray[row4 + 1], s_MatrixB[col + 1][row4 + 1], accB.y);
+                accB.z = dot4add_i8packed(inputArray[row4 + 1], s_MatrixB[col + 2][row4 + 1], accB.z);
+                accB.w = dot4add_i8packed(inputArray[row4 + 1], s_MatrixB[col + 3][row4 + 1], accB.w);
+            }
         }
 
-        float4 scales = s_Scale[col / 4];
+        int4 acc = accA + accB;
         float4 results = float4(acc) * scales;
 
         if (OUTPUT_LAYER)
